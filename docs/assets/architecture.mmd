@@ -1,0 +1,14 @@
+%% Fixhub architecture — renders at https://mermaid.live (kept in sync with docs/architecture.md)
+flowchart LR
+    GH[GitHub App<br/>issues:read contents:read<br/>PRs:write-scoped] --> GW[Event Gateway<br/>FastAPI /webhooks/github<br/>HMAC + idempotency]
+    GW --> Q[Queue<br/>Redis / in-memory]
+    Q --> ORCH[Orchestrator<br/>resumable state machine]
+    ORCH --> AG[Agent Worker<br/>bounded LLM tool loop<br/>max 12 iters]
+    AG --> SB[Sandbox<br/>Docker per task]
+    SB --> V[Verification<br/>repro → regression FAIL→PASS<br/>suite + lint]
+    V --> P[Proof of Fix]
+    P --> POL[Policy Engine]
+    POL --> PRP[PR Publisher<br/>VerifiedArtifact only]
+    PRP --> GH
+    RI[Repo Intel<br/>ast + regex index] <--> AG
+    MEM[Engineering Memory<br/>7 types, STALE on change] <--> AG

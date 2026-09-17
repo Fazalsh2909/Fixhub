@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install backend deps
+        run: pip install -r backend/requirements.txt
+      - name: Ruff check
+        run: python -m ruff check backend/app backend/tests
+      - name: Ruff format check
+        run: python -m ruff format --check backend/app backend/tests
+      - name: Mypy
+        run: python -m mypy backend/app
+      - name: Pytest
+        run: python -m pytest backend/tests/ -q
+      - name: Demo regression tests fail as designed
+        run: |
+          pip install fastapi httpx pytest PyJWT
+          python -m pytest demo/fastapi-jwt/tests/ -q || echo "jwt demo FAILs by design (bug present)"
+          python -m pytest demo/fastapi-pagination/tests/ -q || echo "pagination demo FAILs by design (bug present)"
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install
+        run: npm ci
+        working-directory: frontend
+      - name: Typecheck
+        run: npx tsc --noEmit
+        working-directory: frontend
+      - name: Unit tests
+        run: npm run test
+        working-directory: frontend
+      - name: Build
+        run: npm run build
+        working-directory: frontend
+
+  docker:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build ./backend -t fixhub-api:${{ github.sha }}
+      - name: Build frontend image
+        run: docker build ./frontend -t fixhub-web:${{ github.sha }}
+      - name: Compose config check
+        run: docker compose -f infra/docker-compose.yml -f infra/docker-compose.prod.yml config --quiet

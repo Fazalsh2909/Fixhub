@@ -1,0 +1,27 @@
+# Prod overlay: frontend + hardened api/worker, internal-only db/redis.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+services:
+  api:
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+    environment:
+      APP_ENV: production
+    ports: []  # only via frontend/caddy — do not expose directly
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 1G}
+  worker:
+    environment:
+      APP_ENV: production
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 2G}
+  frontend:
+    build: ../frontend
+    depends_on: [api]
+    ports: ["8080:80"]
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+  db:
+    ports: []  # internal only in prod
+  redis:
+    ports: []

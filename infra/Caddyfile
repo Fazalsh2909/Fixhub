@@ -1,0 +1,18 @@
+# Caddy reverse proxy with automatic HTTPS (VPS prod).
+# 1. Point DOMAIN A-record to your server. 2. `caddy run --config Caddyfile --adapter caddyfile`
+# Replace {$DOMAIN} or set env DOMAIN=yourdomain.com
+{$DOMAIN} {
+  # API + webhooks go to FastAPI; everything else to the Vite/nginx frontend.
+  handle /api/* {
+    reverse_proxy api:8000
+  }
+  handle /health* {
+    reverse_proxy api:8000
+  }
+  handle /webhooks/* {
+    reverse_proxy api:8000
+  }
+  handle {
+    reverse_proxy frontend:80
+  }
+}

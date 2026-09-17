@@ -1,0 +1,52 @@
+services:
+  api:
+    build: ../backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    env_file: [{path: ../backend/.env, required: false}]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://fixhub:${POSTGRES_PASSWORD:-changeme}@db:5432/fixhub
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+  worker:
+    build: ../backend
+    command: python -m app.agent.worker
+    env_file: [{path: ../backend/.env, required: false}]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://fixhub:${POSTGRES_PASSWORD:-changeme}@db:5432/fixhub
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fixhub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: fixhub
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fixhub -d fixhub"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+volumes:
+  pgdata:
+  redisdata:
