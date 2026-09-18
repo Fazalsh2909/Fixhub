@@ -17,9 +17,21 @@ def docker_available() -> bool:
     return shutil.which("docker") is not None
 
 
-def run_in_sandbox(workdir: Path, cmd: str, timeout: int | None = None) -> dict:
+def run_in_sandbox(
+    workdir: Path,
+    cmd: str,
+    timeout: int | None = None,
+    *,
+    require_isolation: bool = False,
+) -> dict:
     timeout = timeout or settings.sandbox_timeout_s
     if not docker_available():
+        if require_isolation:
+            return {
+                "ok": False,
+                "output": "Docker isolation is required for agent execution",
+                "sandbox": "unavailable",
+            }
         try:
             p = subprocess.run(
                 cmd,
@@ -56,7 +68,7 @@ def run_in_sandbox(workdir: Path, cmd: str, timeout: int | None = None) -> dict:
         "--pids-limit",
         "256",
         "--network",
-        "bridge",
+        "none",
         "-v",
         f"{workdir}:/work",
         "-v",
