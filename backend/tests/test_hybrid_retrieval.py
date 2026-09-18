@@ -19,11 +19,25 @@ def test_hybrid_paraphrase_beats_keyword_only():
     db.add(repo)
     db.commit()
     db.refresh(repo)
-    remember(db, repo.id, "repository", "Authentication uses JWT middleware for login", source_path="auth.py")
-    remember(db, repo.id, "repository", "Payments use Stripe for billing", source_path="pay.py")
+    remember(
+        db,
+        repo.id,
+        "repository",
+        "Authentication uses JWT middleware for login",
+        source_path="auth.py",
+    )
+    remember(
+        db,
+        repo.id,
+        "repository",
+        "Payments use Stripe for billing",
+        source_path="pay.py",
+    )
     db.commit()
     # paraphrase: no exact token "authentication", but semantic overlap via trigrams
-    hits = retrieve(db, repo.id, "sign-in token validation", embed_fn=HashEmbedding(dim=64).embed)
+    hits = retrieve(
+        db, repo.id, "sign-in token validation", embed_fn=HashEmbedding(dim=64).embed
+    )
     assert hits, "hybrid should return something on paraphrase"
     db.close()
 
@@ -34,7 +48,13 @@ def test_keyword_path_unchanged_without_embed_fn():
     db.add(repo)
     db.commit()
     db.refresh(repo)
-    remember(db, repo.id, "repository", "Authentication uses JWT middleware", source_path="a.py")
+    remember(
+        db,
+        repo.id,
+        "repository",
+        "Authentication uses JWT middleware",
+        source_path="a.py",
+    )
     remember(db, repo.id, "repository", "Payments use Stripe", source_path="b.py")
     db.commit()
     hits = retrieve(db, repo.id, "authentication JWT middleware")

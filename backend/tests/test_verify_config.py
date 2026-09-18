@@ -17,7 +17,9 @@ def test_demo_repo_skips_type_gate(tmp_path: Path):
 
 
 def test_override_file_respected(tmp_path: Path):
-    (tmp_path / "fixhub.verify.json").write_text('{"suite": null, "lint": null, "type": null}')
+    (tmp_path / "fixhub.verify.json").write_text(
+        '{"suite": null, "lint": null, "type": null}'
+    )
     cfg = detect_verification_config(tmp_path)
     assert cfg == {"suite": None, "lint": None, "type": None, "install": None}
 

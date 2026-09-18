@@ -21,8 +21,13 @@ class CountingProvider(LLMProvider):
         # record fake spend so the cap trips
         from app.metrics import record_llm_call
 
-        record_llm_call("gpt-4o-mini", {"prompt_tokens": 100000, "completion_tokens": 0}, 1)
-        return LLMResponse(text="loop", tool_calls=[{"name": "list_files", "arguments": '{"dir": "."}'}])
+        record_llm_call(
+            "gpt-4o-mini", {"prompt_tokens": 100000, "completion_tokens": 0}, 1
+        )
+        return LLMResponse(
+            text="loop",
+            tool_calls=[{"name": "list_files", "arguments": '{"dir": "."}'}],
+        )
 
 
 def test_cost_cap_aborts(tmp_path: Path):
