@@ -30,6 +30,78 @@ STATES = [
 MAX_ITERS = 12
 
 
+def _execute_tool(workdir: Path, name: str, args: dict) -> dict:
+    """Single tool dispatch (pure — safe for parallel read-only batch)."""
+    if name in ("run_command", "run_test"):
+        return run_command(workdir, args.get("cmd") or args.get("target", "pytest -q"))
+    if name == "edit_file":
+        from ..tools.registry import edit_file
+
+        return edit_file(
+            workdir,
+            args.get("path", ""),
+            args.get("old_string", ""),
+            args.get("new_string", ""),
+        )
+    if name == "create_file":
+        from ..tools.registry import create_file
+
+        return create_file(workdir, args.get("path", ""), args.get("content", ""))
+    if name == "search_code":
+        from ..intel.indexer import search_code
+
+        return {
+            "ok": True,
+            "output": str(search_code(workdir, args.get("pattern", ""))[:20]),
+        }
+    if name == "read_file":
+        from ..tools.registry import _resolve
+
+        p = _resolve(workdir, args.get("path", ""))
+        return (
+            {
+                "ok": p.exists(),
+                "output": p.read_text(errors="ignore")[:4000]
+                if p.exists()
+                else "not found",
+            }
+            if p
+            else {"ok": False, "output": "path escapes workdir"}
+        )
+    if name == "list_files":
+        from ..tools.registry import _resolve
+
+        base = _resolve(workdir, args.get("dir", "."))
+        return (
+            {
+                "ok": True,
+                "output": str(
+                    [
+                        str(x.relative_to(workdir))
+                        for x in base.rglob("*")
+                        if x.is_file()
+                    ][:100]
+                ),
+            }
+            if base and base.is_dir()
+            else {"ok": False, "output": "path escapes workdir"}
+        )
+    return {"ok": False, "output": "unknown tool"}
+
+
+_READ_ONLY = {"list_files", "read_file", "search_code"}
+
+
+def _run_batch(workdir: Path, calls: list[tuple[str, dict]]) -> list[dict]:
+    """Run one turn's tool calls. Read-only batches run in parallel; writes stay sequential."""
+    if len(calls) > 1 and all(name in _READ_ONLY for name, _ in calls):
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(4, len(calls))) as ex:
+            return list(ex.map(lambda nc: _execute_tool(workdir, nc[0], nc[1]), calls))
+    return [_execute_tool(workdir, name, args) for name, args in calls]
+
+
 def transition(db: Session, task: Task, state: str, message: str = "") -> None:
     assert state in STATES + [
         "FAILED",
@@ -86,11 +158,13 @@ def engineer_issue(db: Session, task: Task, workdir: Path, llm: LLMProvider) -> 
             )
         )
         db.commit()
-    # 1. reproduce (real execution, never fabricated)
+    # 1. reproduce (real execution, never fabricated; per-repo tolerant)
     transition(db, task, "REPRODUCING", "running reproduction")
-    repro = run_in_sandbox(
-        workdir, "pip install -q -r requirements.txt && python -m pytest tests/ -x -q"
-    )
+    from ..verify.pipeline import detect_verification_config
+
+    _cfg = detect_verification_config(workdir)
+    _repro_cmd = _cfg.get("suite") or "python -m pytest -q"
+    repro = run_in_sandbox(workdir, _repro_cmd)
     transition(
         db,
         task,
@@ -112,7 +186,28 @@ def engineer_issue(db: Session, task: Task, workdir: Path, llm: LLMProvider) -> 
         },
     ]
     loop_error: str | None = None
+    consecutive_failures = 0
+    try:
+        from ..metrics import snapshot as _metrics_snapshot
+
+        _cost_before = _metrics_snapshot()["est_cost_usd"]
+    except Exception:
+        _cost_before = 0.0
     for i in range(MAX_ITERS):
+        # Per-task cost cap: abort before another billable call.
+        try:
+            from ..config import settings as _s
+
+            from ..metrics import snapshot as _snap
+
+            _cap = float(getattr(_s, "agent_max_cost_usd", 0.0) or 0.0)
+            if _cap > 0 and (_snap()["est_cost_usd"] - _cost_before) >= _cap:
+                loop_error = f"cost cap reached (${_cap:.2f}) — stopping to avoid spend"
+                db.add(TaskEvent(task_id=task.id, stage="TOOL", message=loop_error))
+                db.commit()
+                break
+        except Exception:
+            pass
         try:
             resp = llm.tool_call(messages, tool_specs())
         except ProviderError as e:
@@ -145,72 +240,18 @@ def engineer_issue(db: Session, task: Task, workdir: Path, llm: LLMProvider) -> 
         if not native_calls:
             break
 
+        # Parse args once, then run batch (read-only parallel, writes sequential).
+        parsed: list[tuple[str, dict, dict]] = []
         for call, native in zip(valid_calls, native_calls):
-            name = call["name"]
             try:
                 args = json.loads(native["function"]["arguments"] or "{}")
             except (json.JSONDecodeError, TypeError):
                 args = {}
-            if name in ("run_command", "run_test"):
-                out = run_command(
-                    workdir, args.get("cmd") or args.get("target", "pytest -q")
-                )
-            elif name == "edit_file":
-                from ..tools.registry import edit_file
-
-                out = edit_file(
-                    workdir,
-                    args.get("path", ""),
-                    args.get("old_string", ""),
-                    args.get("new_string", ""),
-                )
-            elif name == "create_file":
-                from ..tools.registry import create_file
-
-                out = create_file(
-                    workdir, args.get("path", ""), args.get("content", "")
-                )
-            elif name == "search_code":
-                from ..intel.indexer import search_code
-
-                out = {
-                    "ok": True,
-                    "output": str(search_code(workdir, args.get("pattern", ""))[:20]),
-                }
-            elif name == "read_file":
-                from ..tools.registry import _resolve
-
-                p = _resolve(workdir, args.get("path", ""))
-                out = (
-                    {
-                        "ok": p.exists(),
-                        "output": p.read_text(errors="ignore")[:4000]
-                        if p.exists()
-                        else "not found",
-                    }
-                    if p
-                    else {"ok": False, "output": "path escapes workdir"}
-                )
-            elif name == "list_files":
-                from ..tools.registry import _resolve
-
-                base = _resolve(workdir, args.get("dir", "."))
-                out = (
-                    {
-                        "ok": True,
-                        "output": str(
-                            [
-                                str(x.relative_to(workdir))
-                                for x in base.rglob("*")
-                                if x.is_file()
-                            ][:100]
-                        ),
-                    }
-                    if base and base.is_dir()
-                    else {"ok": False, "output": "path escapes workdir"}
-                )
-            else:
-                out = {"ok": False, "output": "unknown tool"}
+            parsed.append(
+                (call["name"], args if isinstance(args, dict) else {}, native)
+            )
+        outs = _run_batch(workdir, [(n, a) for n, a, _ in parsed])
+        for (name, _args, native), out in zip(parsed, outs):
             db.add(
                 TaskEvent(
                     task_id=task.id,
@@ -230,6 +271,38 @@ def engineer_issue(db: Session, task: Task, workdir: Path, llm: LLMProvider) -> 
                     "role": "tool",
                     "tool_call_id": native["id"],
                     "content": str(out)[:4000],
+                }
+            )
+        # Stall detection + mid-loop reflection (no extra LLM call — context hint).
+        turn_failed = all(not o.get("ok") for o in outs) if outs else False
+        consecutive_failures = consecutive_failures + 1 if turn_failed else 0
+        if consecutive_failures >= 3:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Hint: your last 3 turns all failed. Stop guessing args. "
+                        'Use list_files {"dir": "."} then read_file, and only '
+                        "run pytest/ruff/mypy/git/ls/cat commands."
+                    ),
+                }
+            )
+            db.add(
+                TaskEvent(
+                    task_id=task.id, stage="HINT", message="stall: 3 failed turns"
+                )
+            )
+            db.commit()
+            consecutive_failures = 0
+        elif i == 5:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Reflection checkpoint (iter 6/12): summarize what you know, "
+                        "what file the bug is in, and your next single edit + test. "
+                        "Then do it — do not list more files."
+                    ),
                 }
             )
         log_event(logger, "agent_iter", task_id=task.id, iteration=i)

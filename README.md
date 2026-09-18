@@ -46,10 +46,10 @@ Details: [`docs/architecture.md`](docs/architecture.md) · Spec: [`docs/SPEC-fix
 | Layer | Choice |
 |---|---|
 | Backend | Python 3.11, FastAPI, SQLAlchemy 2.0, SQLite (dev) → Postgres 16 (prod), Redis queue |
-| Frontend | React 19 + TypeScript 5 + Vite 6 + Monaco, live polling, trace/tests/diff/proof tabs |
-| LLM | `LLMProvider` ABC → OpenAI-compatible `/chat/completions` (TokenRouter default, OpenAI supported via `LLM_PROVIDER=openai`); retries, `reasoning_content` fallback, usage/cost in `/metrics` |
+| Frontend | React 19 + TypeScript 5 + Vite 6 + Monaco, components/ (DirTree/Trace/Verification/Review), live polling |
+| LLM | `LLMProvider` ABC → OpenAI-compatible `/chat/completions` (TokenRouter default); retries + cost cap (`AGENT_MAX_COST_USD`), `reasoning_content` fallback, usage/cost in `/metrics` |
 | Sandbox | Docker per-task (cpu/mem/pids caps, scrubbed env, `--rm`), local-fallback with same interface |
-| Tests | pytest (74 backend), vitest (8 frontend), Playwright e2e, `demo/*` regression FAIL-by-design |
+| Tests | pytest (89 backend), vitest (8 frontend), Playwright e2e, `demo/*` regression FAIL-by-design |
 
 ## Quickstart
 
@@ -121,9 +121,9 @@ Env: copy `backend/.env.example` → `backend/.env`, set `TOKENROUTER_API_KEY` o
 
 ## Limitations (stated, not hidden)
 
-- Memory retrieval is keyword-overlap, not embeddings — cheap and explainable, weaker on paraphrase.
-- Verification scaffold runs suite+lint; type/build/scan/adversarial are recorded lanes to fill per repo.
-- Free-tier models rate-limit; budgets/retries/cached intel mitigate, paid models via `LLM_PROVIDER=openai`.
+- Memory retrieval is hybrid (rarity-weighted keywords + pluggable embeddings, `backend/app/memory/embeddings.py`) — pgvector is the documented prod path, not yet provisioned.
+- Verification is per-repo (`fixhub.verify.json` override or auto-detect); type/build/scan/adversarial run only when the repo opts in.
+- Free-tier models rate-limit; `AGENT_MAX_COST_USD` cap + retries + `Retry-After` backoff mitigate, paid models via `LLM_PROVIDER=openai`.
 
 ## Project structure
 

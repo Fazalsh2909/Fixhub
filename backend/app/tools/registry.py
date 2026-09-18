@@ -23,35 +23,40 @@ DENIED_SUBSTRINGS = ("rm -rf /", "mkfs", ":(){", "curl", "wget", "/etc/passwd", 
 
 
 def tool_specs() -> list[ToolSpec]:
+    allow = ", ".join(ALLOWED_PREFIXES)
     return [
         ToolSpec(
             "list_files",
-            "List files under a dir",
+            "List files under a dir (read-only, safe first step)",
             {"type": "object", "properties": {"dir": {"type": "string"}}},
         ),
         ToolSpec(
             "read_file",
-            "Read a file",
+            "Read a workdir-relative file (read-only, max 4KB shown)",
             {"type": "object", "properties": {"path": {"type": "string"}}},
         ),
         ToolSpec(
             "search_code",
-            "Regex search",
+            'Regex search over *.py (read-only). Example: {"pattern": "ExpiredSignatureError"}',
             {"type": "object", "properties": {"pattern": {"type": "string"}}},
         ),
         ToolSpec(
             "run_command",
-            "Run an allow-listed command in sandbox workdir",
+            f"Run an allow-listed command in sandbox workdir. Allowed prefixes: {allow}. "
+            'Examples: {"cmd": "python -m pytest -q"}, {"cmd": "ruff check ."}. '
+            "Anything else is rejected — do not guess other commands.",
             {"type": "object", "properties": {"cmd": {"type": "string"}}},
         ),
         ToolSpec(
             "run_test",
-            "Run focused test suite",
+            f"Alias for run_command with test focus. Same allow-list: {allow}. "
+            'Example: {"target": "pytest -q"} or {"cmd": "python -m pytest tests/ -x -q"}.',
             {"type": "object", "properties": {"target": {"type": "string"}}},
         ),
         ToolSpec(
             "edit_file",
-            "Replace old_string with new_string in a workdir-relative file",
+            "Replace old_string with new_string in a workdir-relative file. "
+            "Read the file first; old_string must match exactly once. .py edits are AST-gated.",
             {
                 "type": "object",
                 "properties": {
@@ -64,7 +69,7 @@ def tool_specs() -> list[ToolSpec]:
         ),
         ToolSpec(
             "create_file",
-            "Create a new workdir-relative file with content",
+            "Create a NEW workdir-relative file with content (fails if exists — use edit_file then)",
             {
                 "type": "object",
                 "properties": {

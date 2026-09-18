@@ -71,6 +71,13 @@ class Settings(BaseSettings):
     # Non-retryable provider errors (400/401/403) fail fast without retry.
     agent_max_retries: int = 2
     agent_retry_backoff_s: float = 5.0
+    # Per-task spend guard. 0 = unlimited (dev). Prod: e.g. 0.50.
+    # Enforced in orchestrator before each billable LLM call.
+    agent_max_cost_usd: float = 0.0
+    # Queue backend: redis (default when reachable) | memory (tests/demo).
+    # Prod path: set REDIS_URL to ElastiCache; SQS adapter plugs into queue.py
+    # via the same enqueue/dequeue/ack interface (see queue.py docstring).
+    queue_backend: str = "auto"
 
     def resolved_llm(self) -> tuple[str, str, str]:
         """Return (base_url, api_key, model) for the selected provider."""

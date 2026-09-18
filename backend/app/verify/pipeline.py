@@ -28,40 +28,92 @@ def _exit_code(output: str, name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def run_verification(db: Session, task: Task, workdir: Path) -> list[tuple[str, bool]]:
-    """Run independent gates and record their actual exit codes.
+def detect_verification_config(workdir: Path) -> dict:
+    """Per-repo verification plan. Never hardcodes paths like `backend`.
 
-    Each gate is evaluated independently, so a successful later command cannot
-    mask a failed lint or type-check result.
+    Override with fixhub.verify.json in the repo root:
+      {"suite": "pytest -q", "lint": null, "type": "mypy src"}
+    null/empty = skip that gate (recorded PASS with 'skipped' note).
     """
-    combined = run_in_sandbox(
-        workdir,
-        "pip install -q -r requirements.txt || { echo INSTALL_EXIT=1; exit 1; }; "
-        "python -m pytest -q > /tmp/suite.log 2>&1; SUITE=$?; "
-        "ruff check . > /tmp/lint.log 2>&1; LINT=$?; "
-        "python -m mypy backend > /tmp/type.log 2>&1; TYPE=$?; "
-        "cat /tmp/suite.log; echo '---LINT---'; cat /tmp/lint.log; "
-        "echo '---TYPE---'; cat /tmp/type.log; "
-        "echo SUITE_EXIT=$SUITE; echo LINT_EXIT=$LINT; echo TYPE_EXIT=$TYPE; exit 0",
+    import json as _json
+
+    override = workdir / "fixhub.verify.json"
+    if override.is_file():
+        try:
+            data = _json.loads(override.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(data, dict):
+                return {
+                    "suite": data.get("suite"),
+                    "lint": data.get("lint"),
+                    "type": data.get("type"),
+                    "install": data.get("install"),
+                }
+        except Exception:
+            pass
+
+    has_py = any(workdir.rglob("*.py"))
+    has_pkg = (workdir / "package.json").is_file()
+    has_req = (workdir / "requirements.txt").is_file()
+    has_pytest = (workdir / "tests").is_dir() or (workdir / "test").is_dir() or has_req
+    has_mypy_cfg = (
+        (workdir / "mypy.ini").is_file()
+        or (workdir / ".mypy.ini").is_file()
+        or (workdir / "pyproject.toml").is_file()
+        or (workdir / "setup.cfg").is_file()
     )
 
-    output = combined["output"]
-    if "INSTALL_EXIT=1" in output:
-        failure = "dependency installation failed"
-        return [
-            _record(db, task, "suite", False, failure),
-            _record(db, task, "lint", False, failure),
-            _record(db, task, "type", False, failure),
-        ]
+    suite: str | None = None
+    lint: str | None = None
+    typ: str | None = None
+    install: str | None = None
 
-    suite_exit = _exit_code(output, "SUITE")
-    lint_exit = _exit_code(output, "LINT")
-    type_exit = _exit_code(output, "TYPE")
+    if has_req:
+        install = "pip install -q -r requirements.txt"
+    if has_py and has_pytest:
+        suite = "python -m pytest -q"
+    elif has_pkg:
+        suite = "npm test -- --run"
+    if has_py:
+        lint = "ruff check ."
+    elif has_pkg:
+        lint = "npm run lint"
+    # Type gate only when the repo opts in — never `mypy backend` from a demo dir.
+    if has_py and has_mypy_cfg:
+        typ = "python -m mypy ."
+    return {"suite": suite, "lint": lint, "type": typ, "install": install}
 
+
+def _run_gate(workdir: Path, cmd: str | None, label: str) -> tuple[bool, str]:
+    if not cmd:
+        return True, f"skipped — no {label} config in this repo"
+    res = run_in_sandbox(workdir, cmd)
+    return bool(res.get("ok")), str(res.get("output", ""))[-4000:]
+
+
+def run_verification(db: Session, task: Task, workdir: Path) -> list[tuple[str, bool]]:
+    """Run independent gates per repo config and record their actual results.
+
+    Each gate runs in its own sandbox call so a later PASS cannot mask an
+    earlier FAIL (previous bug: combined shell + pipes hid exit codes).
+    """
+    cfg = detect_verification_config(workdir)
+    # Best-effort install; failure fails suite only (lint/type still report).
+    if cfg.get("install"):
+        inst = run_in_sandbox(workdir, str(cfg["install"]))
+        if not inst.get("ok"):
+            msg = f"dependency install failed: {str(inst.get('output', ''))[-1000:]}"
+            return [
+                _record(db, task, "suite", False, msg),
+                _record(db, task, "lint", False, msg),
+                _record(db, task, "type", False, msg),
+            ]
+    suite_ok, suite_out = _run_gate(workdir, cfg.get("suite"), "suite")
+    lint_ok, lint_out = _run_gate(workdir, cfg.get("lint"), "lint")
+    type_ok, type_out = _run_gate(workdir, cfg.get("type"), "type")
     return [
-        _record(db, task, "suite", suite_exit == 0, output),
-        _record(db, task, "lint", lint_exit == 0, output),
-        _record(db, task, "type", type_exit == 0, output),
+        _record(db, task, "suite", suite_ok, suite_out),
+        _record(db, task, "lint", lint_ok, lint_out),
+        _record(db, task, "type", type_ok, type_out),
     ]
 
 

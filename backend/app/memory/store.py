@@ -1,11 +1,18 @@
-"""Engineering memory store: 7 types, provenance, freshness."""
+"""Engineering memory store: 7 types, provenance, freshness.
+
+Retrieval is hybrid: rarity-weighted keyword overlap (IDF-like, explainable)
+fused with optional embedding cosine. Pass embed_fn=None (default) for pure
+keyword mode; pass HashEmbedding().embed or a hosted provider for semantic.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 
 from sqlalchemy.orm import Session
 
 from ..models import Memory
+from .embeddings import cosine_sim, hybrid_score, tokens
 
 TYPES = {
     "repository",
@@ -75,20 +82,66 @@ def snapshot_task(
     return remember(db, repo_id, "task", fact)
 
 
-def retrieve(db: Session, repo_id: int, query: str, limit: int = 8) -> list[Memory]:
-    """Selective retrieval: keyword overlap over ACTIVE+VERIFIED (STALE only if nothing else)."""
-    terms = {t.lower() for t in query.split() if len(t) > 2}
-    scored: list[tuple[int, Memory]] = []
-    for m in db.query(Memory).filter_by(repo_id=repo_id).all():
-        if m.status in ("INVALIDATED",):
-            continue
-        hay = m.fact.lower()
-        score = (
-            sum(1 for t in terms if t in hay)
-            + (2 if m.status == "VERIFIED" else 0)
-            - (3 if m.status == "STALE" else 0)
-        )
-        if score > 0 or not terms:
-            scored.append((score, m))
+def retrieve(
+    db: Session,
+    repo_id: int,
+    query: str,
+    limit: int = 8,
+    embed_fn: Callable[[list[str]], list[list[float]]] | None = None,
+    alpha: float = 0.6,
+) -> list[Memory]:
+    """Hybrid retrieval over ACTIVE+VERIFIED (STALE penalized, INVALIDATED skipped).
+
+    - keyword: rarity-weighted overlap (rare tokens like 'jwt' beat 'api').
+    - semantic (optional): cosine between query embedding and fact embedding,
+      fused via hybrid_score(). Fail-open: embedding errors fall back to keyword.
+    """
+    terms = tokens(query)
+    rows = db.query(Memory).filter_by(repo_id=repo_id).all()
+    rows = [m for m in rows if m.status != "INVALIDATED"]
+    if not rows:
+        return []
+
+    # IDF-like rarity: tokens in few memories count more.
+    doc_freq: dict[str, int] = {}
+    hays: list[set[str]] = []
+    for m in rows:
+        hay = tokens(m.fact)
+        hays.append(hay)
+        for t in hay:
+            doc_freq[t] = doc_freq.get(t, 0) + 1
+
+    kw_raw: list[float] = []
+    for hay in hays:
+        overlap = terms & hay
+        kw_raw.append(sum(1.0 / doc_freq[t] for t in overlap) if overlap else 0.0)
+    kw_max = max(kw_raw) if kw_raw else 0.0
+
+    sem_scores: list[float] = [0.0] * len(rows)
+    if embed_fn is not None and terms:
+        try:
+            vecs = embed_fn([query] + [m.fact for m in rows])
+            qv, fvs = vecs[0], vecs[1:]
+            sem_scores = [cosine_sim(qv, fv) for fv in fvs]
+        except Exception:
+            sem_scores = [0.0] * len(rows)
+
+    scored: list[tuple[float, Memory]] = []
+    for m, hay, raw, sem in zip(rows, hays, kw_raw, sem_scores):
+        kw_norm = (raw / kw_max) if kw_max > 0 else 0.0
+        if embed_fn is None:
+            score = raw
+        else:
+            score = hybrid_score(kw_norm, sem, alpha=alpha)
+        score += 2.0 if m.status == "VERIFIED" else 0.0
+        score -= 3.0 if m.status == "STALE" else 0.0
+        # Minimum evidence in pure-keyword mode: 1+ overlapping token,
+        # or empty query (list recent). Hybrid mode keeps semantic hits.
+        if embed_fn is None:
+            if score > 0 or not terms:
+                scored.append((score, m))
+        else:
+            if score > 0.01 or not terms:
+                scored.append((score, m))
     scored.sort(key=lambda x: -x[0])
     return [m for _, m in scored[:limit]]

@@ -2,6 +2,10 @@
 
 Redis is used in development/production. The in-memory backend remains available
 for tests and demos, where process-level durability is not expected.
+
+Prod path (SQS): implement the same 4 functions (enqueue/dequeue/ack/
+recover_processing) against SQS + DynamoDB lease table, select via
+QUEUE_BACKEND=sqs. Interface is stable so the worker needs no change.
 """
 
 from __future__ import annotations

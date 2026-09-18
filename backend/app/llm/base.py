@@ -29,6 +29,14 @@ class LLMProvider(ABC):
         self, messages: list[dict], tools: list[ToolSpec], **kwargs: object
     ) -> LLMResponse: ...
 
+    def generate_stream(self, messages: list[dict], **kwargs: object):  # type: ignore[no-untyped-def]
+        """SSE-ready streaming. Default: fall back to single generate().
+
+        Prod frontends consume this via GET /api/chat/stream (chunked).
+        Providers override with real token streaming when available.
+        """
+        yield self.generate(messages, **kwargs)
+
     def structured_output(
         self, messages: list[dict], schema: dict, **kwargs: object
     ) -> dict:

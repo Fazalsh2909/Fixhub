@@ -4,96 +4,14 @@
  */
 import Editor from '@monaco-editor/react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import DirTree from './components/DirTree';
+import ReviewPanel from './components/ReviewPanel';
+import TraceView from './components/TraceView';
+import VerificationView from './components/VerificationView';
 import { api, type ConnectedRepo, type GhStatus } from './lib/api';
 import { formatTaskLabel, isTerminalState, verificationSummary, type AutomationStatus, type Metrics, type TaskDetail, type TaskSummary } from './lib/tasks';
-import { buildTree, parentDirs, type DirNode } from './lib/files';
-
-const DEMO_CODE = `// Select a repo on the left, then chat: "list issues" / "fix #N".
-// Or press [Start Autonomous Fix] for the bundled JWT demo.
-// Fixes run in a Docker sandbox with real tests — review the diff,
-// then Approve & Commit. Nothing pushes to GitHub before approval.
-`;
-
-// OpenCode/Claude-Code style pipeline — mirrors backend/app/agent/orchestrator.py STATES.
-const PIPELINE = ['CREATED', 'ANALYZING', 'REPRODUCING', 'ROOT_CAUSE_FOUND', 'PLANNING', 'IMPLEMENTING', 'TESTING', 'VERIFYING', 'REVIEWING', 'READY_FOR_APPROVAL'];
-
-function languageFor(path: string): string {
-  const ext = path.split('.').pop()?.toLowerCase() ?? '';
-  if (ext === 'py') return 'python';
-  if (ext === 'ts' || ext === 'tsx') return 'typescript';
-  if (ext === 'js' || ext === 'jsx') return 'javascript';
-  if (ext === 'json') return 'json';
-  if (ext === 'md' || ext === 'markdown') return 'markdown';
-  if (ext === 'yml' || ext === 'yaml') return 'yaml';
-  if (ext === 'html' || ext === 'htm') return 'html';
-  if (ext === 'css') return 'css';
-  if (ext === 'sh') return 'shell';
-  if (ext === 'toml' || ext === 'ini' || ext === 'cfg') return 'ini';
-  return 'plaintext';
-}
-
-function stageColor(stage: string, dark: Record<string, string>): string {
-  const s = (stage || '').toUpperCase();
-  if (s === 'TOOL') return dark.accent;
-  if (['READY_FOR_APPROVAL', 'REVIEWING', 'COMMITTED', 'PUSHED', 'PR_CREATED'].includes(s)) return dark.green;
-  if (s === 'FAILED' || s === 'CANCELLED') return dark.red;
-  if (['VERIFYING', 'TESTING', 'DEBUGGING', 'REPRODUCING'].includes(s)) return dark.yellow;
-  return dark.muted;
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function DirTree(props: {
-  node: DirNode;
-  depth: number;
-  expanded: Set<string>;
-  onToggle: (dir: string) => void;
-  openPath: string;
-  onOpen: (path: string) => void;
-  dark: Record<string, string>;
-}): React.JSX.Element {
-  const { node, depth, expanded, onToggle, openPath, onOpen, dark } = props;
-  return (
-    <>
-      {node.dirs.map((d) => {
-        const isOpen = expanded.has(d.path);
-        return (
-          <div key={d.path}>
-            <div
-              onClick={() => onToggle(d.path)}
-              title={d.path}
-              style={{ padding: '3px 8px', paddingLeft: 8 + depth * 12, borderRadius: 4, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 600 }}
-            >
-              <span style={{ color: dark.muted, marginRight: 6, display: 'inline-block', width: 12 }}>{isOpen ? '▾' : '▸'}</span>
-              <span style={{ marginRight: 6 }}>📁</span>{d.name}
-            </div>
-            {isOpen && (
-              <DirTree node={d} depth={depth + 1} expanded={expanded} onToggle={onToggle} openPath={openPath} onOpen={onOpen} dark={dark} />
-            )}
-          </div>
-        );
-      })}
-      {node.files.map((f) => {
-        const name = f.path.split('/').pop() ?? f.path;
-        return (
-          <div key={f.path} onClick={() => onOpen(f.path)} title={`${f.path} · ${formatBytes(f.size)}`}
-            style={{ padding: '3px 8px', paddingLeft: 8 + depth * 12 + 18, borderRadius: 4, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', background: f.path === openPath ? '#1f6feb33' : 'transparent' }}>
-            <span style={{ color: dark.muted, marginRight: 6 }}>📄</span>{name}
-          </div>
-        );
-      })}
-    </>
-  );
-}
-
-const dark: Record<string, string> = {
-  bg: '#0d1117', panel: '#161b22', border: '#30363d', text: '#e6edf3',
-  muted: '#8b949e', accent: '#2f81f7', green: '#3fb950', red: '#f85149', yellow: '#d29922',
-};
+import { buildTree, parentDirs } from './lib/files';
+import { DEMO_CODE, dark, formatBytes, languageFor } from './theme';
 
 type ChatMsg = { role: 'user' | 'assistant'; content: string };
 
@@ -476,8 +394,6 @@ export default function App() {
   const diff = detail?.diff ?? '';
   const filteredFiles = repoFiles.filter((f) => f.path.toLowerCase().includes(explorerFilter.toLowerCase()));
   const dirty = fileContent !== savedContent;
-  const pipeIdx = detail ? PIPELINE.indexOf(detail.state) : -1;
-  const pipeDone = detail ? ['COMMITTED', 'PUSHED', 'PR_CREATED'].includes(detail.state) : false;
   const canReview = detail != null && (detail.state === 'REVIEWING' || detail.state === 'READY_FOR_APPROVAL') && diff.trim() !== '' && diff.trim() !== '(no files changed)';
   const connLabel = ghStatus
     ? ghStatus.app_configured
@@ -666,61 +582,10 @@ export default function App() {
               </div>
             )}
             {activeTab === 'trace' && (
-              <div role="status" style={{ fontSize: 12 }}>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 8 }}>
-                  {PIPELINE.map((s) => {
-                    const idx = PIPELINE.indexOf(s);
-                    const done = pipeDone || (pipeIdx >= 0 && idx < pipeIdx);
-                    const current = !pipeDone && idx === pipeIdx;
-                    return (
-                      <span key={s} title={s}
-                        style={{
-                          padding: '2px 8px', borderRadius: 10, fontSize: 11,
-                          border: `1px solid ${current ? dark.yellow : dark.border}`,
-                          background: done ? '#3fb95022' : current ? '#d2992222' : 'transparent',
-                          color: done ? dark.green : current ? dark.yellow : dark.muted,
-                        }}>
-                        {done ? '✓ ' : current ? '▶ ' : ''}{s}
-                      </span>
-                    );
-                  })}
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, color: dark.muted }}>
-                  <span>{events.length} step{events.length === 1 ? '' : 's'}</span>
-                  {running && <span><span style={{ color: dark.green }}>●</span> live — polling every 3s</span>}
-                  {!running && events.length > 0 && <span>· idle</span>}
-                  {detail && <span style={{ marginLeft: 'auto' }}>state: <strong style={{ color: stageColor(detail.state, dark) }}>{detail.state}</strong></span>}
-                </div>
-                {events.length === 0 && <div style={{ color: dark.muted }}>No trace yet — run the agent. Every tool call, test and state change lands here.</div>}
-                {events.map((e, i) => (
-                  <div key={i} style={{ display: 'flex', gap: 8, padding: '4px 6px', borderBottom: `1px solid ${dark.border}55`, alignItems: 'baseline' }}>
-                    <span style={{ color: dark.muted, minWidth: 28, textAlign: 'right' }}>{i + 1}</span>
-                    <span style={{
-                      minWidth: 110, textAlign: 'center', fontSize: 11, fontWeight: 700,
-                      color: stageColor(e.stage, dark), border: `1px solid ${stageColor(e.stage, dark)}55`,
-                      borderRadius: 4, padding: '1px 6px',
-                    }}>{e.stage}</span>
-                    <span style={{ whiteSpace: 'pre-wrap', flex: 1, wordBreak: 'break-word' }}>{e.message}</span>
-                    {e.created_at && (
-                      <span style={{ color: dark.muted, fontSize: 11, whiteSpace: 'nowrap' }}>
-                        {new Date(e.created_at).toLocaleTimeString()}
-                      </span>
-                    )}
-                  </div>
-                ))}
-                <div ref={traceEndRef} />
-              </div>
+              <TraceView events={events} state={detail?.state} running={running} traceEndRef={traceEndRef} dark={dark} />
             )}
             {activeTab === 'tests' && (
-              <div>
-                {verification.length === 0 && <div style={{ color: dark.muted }}>No verification runs yet.</div>}
-                {verification.map((v, i) => (
-                  <div key={i} style={{ border: `1px solid ${dark.border}`, borderRadius: 6, padding: 8, marginBottom: 8 }}>
-                    <div style={{ color: v.passed ? dark.green : dark.red, fontWeight: 600 }}>{v.passed ? 'PASS' : 'FAIL'} · {v.check}</div>
-                    <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, color: dark.muted }}>{v.output.slice(0, 1500)}</pre>
-                  </div>
-                ))}
-              </div>
+              <VerificationView verification={verification} dark={dark} />
             )}
             {activeTab === 'diff' && (
               <div>
@@ -750,47 +615,16 @@ export default function App() {
           </div>
         </main>
 
-        <aside style={{ width: 300, borderLeft: `1px solid ${dark.border}`, padding: 12, overflow: 'auto', background: dark.panel }}>
-          <h3 style={{ marginTop: 0 }}>Review</h3>
-          <p style={{ fontSize: 13, color: dark.muted }}>
-            {selectedRepo ? `Repo: ${selectedRepo}` : 'No repo selected.'}
-            {detail ? ` · Task #${detail.id} ${detail.state}` : ''}
-          </p>
-          <button onClick={runSelected} disabled={selectedId == null || running} style={{ width: '100%', background: dark.accent, color: '#fff', border: 0, borderRadius: 6, padding: '8px', cursor: 'pointer', marginBottom: 8 }}>
-            {running ? 'Running — polling task…' : 'Run agent on selected task'}
-          </button>
-          {canReview ? (
-            <>
-              <button onClick={approve} style={{ width: '100%', background: dark.green, color: '#fff', border: 0, borderRadius: 6, padding: '8px', cursor: 'pointer', marginBottom: 6 }}>
-                Approve & Commit
-              </button>
-              <button onClick={reject} style={{ width: '100%', background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '8px', cursor: 'pointer' }}>
-                Request changes
-              </button>
-            </>
-          ) : (
-            <div style={{ fontSize: 12, color: dark.muted }}>Approve & Commit unlocks when a REVIEWING diff exists. Nothing pushes before that.</div>
-          )}
-          {detail?.pr_url && (
-            <div style={{ marginBottom: 8 }}>
-              <a href={detail.pr_url} target="_blank" rel="noreferrer" style={{ color: dark.green, fontSize: 13, fontWeight: 600 }}>
-                Pull request #{detail.pr_number || ''} ↗
-              </a>
-            </div>
-          )}
-          <h4>Proof of Fix</h4>
-          <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, color: dark.muted }}>
-            {detail ? verificationSummary(verification) : 'No run yet.'}
-          </pre>
-          {detail && detail.approvals && detail.approvals.length > 0 && (
-            <>
-              <h4>Decisions</h4>
-              {detail.approvals.map((a, i) => (
-                <div key={i} style={{ fontSize: 12, color: dark.muted }}>[{a.decision}] {a.approver} {a.reason}</div>
-              ))}
-            </>
-          )}
-        </aside>
+        <ReviewPanel
+          detail={detail}
+          verification={verification}
+          running={running}
+          onRun={runSelected}
+          onApprove={approve}
+          onReject={reject}
+          canReview={canReview}
+          dark={dark}
+        />
       </div>
     </div>
   );
