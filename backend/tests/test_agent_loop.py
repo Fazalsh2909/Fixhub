@@ -5,7 +5,6 @@ from pathlib import Path
 from app.agent.orchestrator import _run_batch, engineer_issue
 from app.db import SessionLocal, init_db
 from app.llm.base import LLMProvider, LLMResponse
-from app.llm.openrouter import ProviderError
 from app.models import Repository, Task, TaskEvent
 from app.tools.registry import tool_specs
 
