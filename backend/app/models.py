@@ -194,3 +194,39 @@ class LlmProvider(Base):
     base_url_enc: Mapped[str] = mapped_column(Text, default="")
     api_key_enc: Mapped[str] = mapped_column(Text, default="")
     model: Mapped[str] = mapped_column(String(128), default="")
+
+
+class AgentSession(Base):
+    """Interactive coding session (OpenCode-style): persistent transcript +
+    bounded tool loop per message, editing the repo workdir directly."""
+
+    __tablename__ = "agent_sessions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    repo_id: Mapped[int | None] = mapped_column(
+        ForeignKey("repositories.id"), nullable=True, index=True
+    )
+    title: Mapped[str] = mapped_column(String(255), default="session")
+    state: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class AgentMessage(Base):
+    __tablename__ = "agent_messages"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("agent_sessions.id"), index=True)
+    role: Mapped[str] = mapped_column(String(16))  # user/assistant/tool
+    tool_name: Mapped[str] = mapped_column(String(64), default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    ok: Mapped[bool] = mapped_column(default=True)
+    # JSON: assistant rows keep {"tool_calls": [...]} so rebuilt transcripts
+    # carry the exact call ids the tool rows reference; tool rows keep
+    # {"tool_call_id": ...}. Ids are synthetic but stable per row.
+    extra: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_now
+    )

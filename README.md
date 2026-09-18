@@ -90,6 +90,7 @@ Env: copy `backend/.env.example` → `backend/.env`, set `TOKENROUTER_API_KEY` o
 | `POST /api/tasks/{id}/approve` | Approve & Commit — policy-gated push + PR (or local commit record) |
 | `POST /api/tasks/{id}/reject` | request changes → back to DEBUGGING |
 | `POST /api/chat` | coding assistant — plain-words work orders auto-run (`add dark mode`, `fix #N`, `run`, `status`) |
+| `POST /api/agent/sessions`, `POST /api/agent/sessions/{id}/message` | interactive coding agent — session transcript + bounded tool loop editing the workdir directly |
 | `GET /api/automation` | automation flags + provider/key readiness (no secrets) |
 | `GET /api/github/status` | App configured? installations? connected repos? (no secrets) |
 | `GET /api/github/repos?installation_id=` | live installation repo list |
@@ -131,7 +132,7 @@ Env: copy `backend/.env.example` → `backend/.env`, set `TOKENROUTER_API_KEY` o
 
 ```
 backend/app/ → main, config, db, metrics, logging, queue, github/ (webhook, api, app_auth, read_client, publisher), repo/ (workspace, clone_guard), intel/, memory/, tools/, llm/, agent/, sandbox/, verify/, policy/, eval/, chat/, review/
-frontend/src/ → App (VS Code shell), components/ (ActivityBar, DirTree, EditorTabs, Terminal, TraceView, PlanPanel, VerificationView, ReviewPanel, StatusBar), lib/api, lib/tasks (+tests)
+frontend/src/ → App (VS Code shell), components/ (ActivityBar, DirTree, EditorTabs, Terminal, AgentPanel, TraceView, PlanPanel, VerificationView, ReviewPanel, StatusBar), lib/api, lib/tasks (+tests)
 demo/fastapi-jwt/ → JWT 500-vs-401 bug · demo/fastapi-pagination/ → off-by-one bug
 infra/ → docker-compose.yml, sandbox.Dockerfile, main.tf (stub)
 e2e/ → Playwright specs · docs/ → SPEC, architecture, DEMO-RUN, EVAL

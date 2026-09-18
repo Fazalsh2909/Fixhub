@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import get_db, init_db
 from .automation import router as automation_router
+from .agent.api import router as agent_router
 from .chat.router import router as chat_router
 from .github.api import router as github_api_router
 from .github.webhook import router as webhook_router
@@ -87,6 +88,7 @@ def create_app() -> FastAPI:
     app.include_router(webhook_router)
     app.include_router(github_api_router)
     app.include_router(chat_router)
+    app.include_router(agent_router)
     app.include_router(review_router)
     app.include_router(automation_router)
     app.include_router(repo_files_router)

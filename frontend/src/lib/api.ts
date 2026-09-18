@@ -124,4 +124,47 @@ export const api = {
         results: { task_id: string; status: string; evidence: string; verified: boolean }[];
       }>
     ),
+  agentSessions: (repo: string) =>
+    fetch(`/api/agent/sessions?repo=${encodeURIComponent(repo)}`).then(
+      json<{ id: number; title: string; state: string }[]>
+    ),
+  agentCreate: (repo: string) =>
+    fetch("/api/agent/sessions", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ repo }),
+    }).then(json<{ id: number; title: string; state: string }>),
+  agentSession: (id: number) =>
+    fetch(`/api/agent/sessions/${id}`).then(json<AgentSessionDetail>),
+  agentMessage: (id: number, content: string, max_turns = 3) =>
+    fetch(`/api/agent/sessions/${id}/message`, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ content, max_turns }),
+    }).then(json<AgentTurn>),
+};
+
+export type AgentMessage = {
+  id: number;
+  role: 'user' | 'assistant' | 'tool';
+  tool: string;
+  args: Record<string, unknown>;
+  content: string;
+  ok: boolean;
+};
+
+export type AgentSessionDetail = {
+  id: number;
+  title: string;
+  state: string;
+  messages: AgentMessage[];
+};
+
+export type AgentTurn = {
+  session_id: number;
+  status: 'done' | 'paused' | 'failed';
+  error: string | null;
+  messages: AgentMessage[];
+  changed_files: string[];
+  tokens_used: number;
 };

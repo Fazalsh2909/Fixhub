@@ -7,6 +7,7 @@
 import Editor from '@monaco-editor/react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ActivityBar, { type LeftView } from './components/ActivityBar';
+import AgentPanel from './components/AgentPanel';
 import DirTree from './components/DirTree';
 import EditorTabs from './components/EditorTabs';
 import PlanPanel from './components/PlanPanel';
@@ -19,8 +20,7 @@ import { formatTaskLabel, isTerminalState, verificationSummary, type AutomationS
 import { buildTree, parentDirs } from './lib/files';
 import { DEMO_CODE, dark, formatBytes, languageFor } from './theme';
 
-type ChatMsg = { role: 'user' | 'assistant'; content: string };
-type RightTab = 'chat' | 'terminal' | 'agent';
+type RightTab = 'agent' | 'terminal' | 'tasks';
 
 export default function App() {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
@@ -29,7 +29,7 @@ export default function App() {
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState('');
   const [bottomTab, setBottomTab] = useState<'tests' | 'diff' | 'proof'>('tests');
-  const [rightTab, setRightTab] = useState<RightTab>('chat');
+  const [rightTab, setRightTab] = useState<RightTab>('agent');
   const [leftView, setLeftView] = useState<LeftView>('explorer');
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [provider, setProvider] = useState<{ provider: string; model: string; has_key: boolean } | null>(null);
@@ -44,12 +44,7 @@ export default function App() {
   const [taskTitle, setTaskTitle] = useState('');
   const [notice, setNotice] = useState('');
 
-  // Chat state
-  const [chat, setChat] = useState<ChatMsg[]>([
-    { role: 'assistant', content: 'Ready. Select a repo, then just tell me the work — "add dark mode", "fix the login redirect", "fix #N". I run it right away and you watch the agent panel.' },
-  ]);
-  const [chatInput, setChatInput] = useState('');
-  const [chatBusy, setChatBusy] = useState(false);
+  // Chat state lives in AgentPanel (session-based coding agent).
 
   // VS Code-like explorer + tabbed editor (same workdir the agent uses)
   const [repoFiles, setRepoFiles] = useState<{ path: string; size: number }[]>([]);
@@ -295,9 +290,9 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repoFiles]);
 
-  // Keep the agent trace pinned to the latest step while a run is live.
+  // Keep the tasks trace pinned to the latest step while a run is live.
   useEffect(() => {
-    if (rightTab === 'agent') traceEndRef.current?.scrollIntoView({ block: 'end' });
+    if (rightTab === 'tasks') traceEndRef.current?.scrollIntoView({ block: 'end' });
   }, [detail?.events.length, rightTab]);
 
   const saveOpenFile = useCallback(async () => {
@@ -335,34 +330,10 @@ export default function App() {
     return () => window.removeEventListener('keydown', h);
   }, [openPath]);
 
-  async function sendChat(text?: string) {
-    const message = (text ?? chatInput).trim();
-    if (!message || chatBusy) return;
-    setChatBusy(true);
-    setChat((c) => [...c, { role: 'user', content: message }]);
-    setChatInput('');
-    try {
-      const res = await api.chat(selectedRepo, message, selectedId, installationId || undefined);
-      setChat((c) => [...c, { role: 'assistant', content: res.reply }]);
-      if (res.task_id) {
-        setSelectedId(res.task_id);
-        await refreshTasks();
-        // Work orders start the agent immediately — follow it in the agent panel.
-        if (res.intent === 'agent_task' || res.intent === 'fix_issue' || res.intent === 'run_task') {
-          setRightTab('agent');
-          setRunning(true);
-        }
-      }
-    } catch (e) {
-      setChat((c) => [...c, { role: 'assistant', content: `Request failed: ${e instanceof Error ? e.message : 'backend offline?'}` }]);
-    }
-    setChatBusy(false);
-  }
-
   async function startFix() {
     setRunning(true);
     setRunError('');
-    setRightTab('agent');
+    setRightTab('tasks');
     try {
       const data = await api.trigger();
       if (data.error) {
@@ -385,7 +356,7 @@ export default function App() {
     if (selectedId == null) return;
     setRunning(true);
     setRunError('');
-    setRightTab('agent');
+    setRightTab('tasks');
     try {
       const res = await api.runTask(selectedId);
       const d = await api.task(selectedId);
@@ -403,7 +374,7 @@ export default function App() {
     setRunError('');
     try {
       const res = await api.approve(selectedId);
-      setChat((c) => [...c, { role: 'assistant', content: res.pr_url ? `Committed + PR opened: ${res.pr_url}` : `Approved on branch ${res.branch}. ${res.note ?? ''}` }]);
+      setNotice(res.pr_url ? `Committed + PR opened: ${res.pr_url}` : `Approved on branch ${res.branch}. ${res.note ?? ''}`);
       const d = await api.task(selectedId);
       setDetail(d);
     } catch (e) {
@@ -419,7 +390,7 @@ export default function App() {
       await api.reject(selectedId, reason);
       const d = await api.task(selectedId);
       setDetail(d);
-      setChat((c) => [...c, { role: 'assistant', content: `Sent back for rework: ${reason}` }]);
+      setNotice(`Sent back for rework: ${reason}`);
     } catch (e) {
       setRunError(e instanceof Error ? e.message : 'reject failed');
     }
@@ -463,7 +434,7 @@ export default function App() {
       await refreshTasks();
       setSelectedId(res.task_id);
       if (res.launched === 'started') {
-        setRightTab('agent');
+        setRightTab('tasks');
         setRunning(true);
       }
     } catch (e) {
@@ -689,48 +660,30 @@ export default function App() {
 
         <aside style={{ width: 380, minWidth: 380, borderLeft: `1px solid ${dark.border}`, background: dark.panel, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <div style={{ display: 'flex', borderBottom: `1px solid ${dark.border}` }}>
-            {(['chat', 'terminal', 'agent'] as const).map((t) => (
+            {(['agent', 'terminal', 'tasks'] as const).map((t) => (
               <button key={t} onClick={() => setRightTab(t)}
                 style={{
                   flex: 1, background: 'transparent', color: rightTab === t ? dark.text : dark.muted,
                   border: 0, borderBottom: `2px solid ${rightTab === t ? dark.accent : 'transparent'}`,
                   padding: '8px 4px', cursor: 'pointer', fontSize: 12, fontWeight: rightTab === t ? 700 : 400,
                 }}>
-                {t === 'agent' ? 'Claude Code' : t[0].toUpperCase() + t.slice(1)}
+                {t[0].toUpperCase() + t.slice(1)}
               </button>
             ))}
           </div>
           <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            {rightTab === 'chat' && (
-              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, padding: 8 }}>
-                <div style={{ flex: 1, overflow: 'auto', marginBottom: 8 }}>
-                  {chat.map((m, i) => (
-                    <div key={i} style={{ marginBottom: 6, fontSize: 13 }}>
-                      <span style={{ color: m.role === 'user' ? dark.accent : dark.green, fontWeight: 600 }}>{m.role === 'user' ? 'you' : 'fixhub'}: </span>
-                      <span style={{ whiteSpace: 'pre-wrap' }}>{m.content}</span>
-                    </div>
-                  ))}
-                  {selectedRepo === '' && (
-                    <div style={{ fontSize: 12, color: dark.muted }}>Tip: select a repo in the Source view first — chat is repo-scoped.</div>
-                  )}
-                </div>
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <input
-                    value={chatInput} onChange={(e) => setChatInput(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === 'Enter') sendChat(); }}
-                    placeholder={selectedRepo ? `Ask about ${selectedRepo}…` : 'Select a repo, then chat…'}
-                    style={{ flex: 1, background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 8 }}
-                  />
-                  <button onClick={() => sendChat()} disabled={chatBusy}>{chatBusy ? '…' : 'Send'}</button>
-                </div>
-                <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
-                  <button onClick={() => sendChat('list issues')}>List issues</button>
-                  <button onClick={runSelected} disabled={selectedId == null || running}>{running ? 'Running…' : 'Run agent'}</button>
-                </div>
-              </div>
+            {rightTab === 'agent' && (
+              <AgentPanel
+                repo={selectedRepo}
+                dark={dark}
+                onWorkdirChanged={() => {
+                  refreshFiles();
+                  if (openPath) openFile(openPath);
+                }}
+              />
             )}
             {rightTab === 'terminal' && <Terminal repo={selectedRepo} dark={dark} />}
-            {rightTab === 'agent' && (
+            {rightTab === 'tasks' && (
               <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, padding: 8 }}>
                 <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
                   <button onClick={runSelected} disabled={selectedId == null || running} style={{ flex: 1, background: dark.accent, color: '#fff', border: 0, borderRadius: 6, padding: '6px', cursor: 'pointer' }}>
