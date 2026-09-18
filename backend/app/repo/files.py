@@ -51,6 +51,11 @@ class SaveFileBody(BaseModel):
     content: str = ""
 
 
+class ExecBody(BaseModel):
+    full_name: str = ""
+    cmd: str = ""
+
+
 def resolve_workdir(repo: Repository) -> tuple[Path, str]:
     """Return (workdir, root_kind) using the same rule as the chat runner."""
     if repo.local_path:
@@ -168,3 +173,35 @@ def save_file(
         raise HTTPException(status_code=500, detail=f"write failed: {e}")
     log_event(logger, "repo_file_saved", repo=repo.full_name, path=rel, size=size)
     return {"status": "ok", "repo": repo.full_name, "path": rel, "size": size}
+
+
+@router.post("/exec")
+def exec_command(
+    body: ExecBody,
+    db: Session = Depends(get_db),
+    _auth: None = Depends(require_api_token),
+) -> dict:
+    """VS Code-like terminal: allow-listed commands only, same sandbox as the agent.
+
+    Same policy as agent tools (`tools.registry.run_command`): allowed prefixes
+    only, denied substrings rejected, Docker isolation required. Output capped.
+    """
+    from ..tools.registry import run_command
+
+    repo = _get_repo(db, body.full_name)
+    workdir, _ = resolve_workdir(repo)
+    if not workdir.is_dir():
+        raise HTTPException(
+            status_code=400, detail="repo workspace not found — clone it first"
+        )
+    cmd = (body.cmd or "").strip()[:500]
+    if not cmd:
+        raise HTTPException(status_code=400, detail="cmd required")
+    out = run_command(workdir, cmd, timeout=120)
+    log_event(logger, "repo_exec", repo=repo.full_name, ok=out.get("ok"))
+    return {
+        "repo": repo.full_name,
+        "cmd": cmd[:200],
+        "ok": bool(out.get("ok")),
+        "output": str(out.get("output", ""))[-4000:],
+    }

@@ -21,8 +21,10 @@ class Settings(BaseSettings):
     github_app_private_key_path: str = ""
     github_app_slug: str = ""
     # When True, any opened/reopened issue on a connected repo creates a task.
-    # Default False: require `fixhub-fix` label or `/fix` comment / chat trigger.
-    auto_trigger_on_issue: bool = False
+    # Default True: connected repos are stay-connected — the agent starts
+    # immediately (AUTO_RUN) without label ceremony. Every run costs LLM
+    # calls and is capped by AGENT_MAX_COST_USD; set false for manual triage.
+    auto_trigger_on_issue: bool = True
     # Automation: run the agent immediately when a task is created (chat fix,
     # chat instruction, Create button, webhook). Runs in a background thread;
     # the frontend polls the Agent Trace. Default True (Claude-code style).

@@ -1,11 +1,16 @@
-/** Fixhub debugger chatbot: connected repos + chat + live trace + in-app review.
+/** Fixhub — VS Code-style shell around the autonomous fix agent.
+ * Explorer + tabbed Monaco editor (same workdir the agent uses), right-side
+ * Chat / Terminal / Claude Code panel, bottom verification panel.
  * No fabricated results — every PASS comes from backend verification rows,
  * and nothing touches GitHub until you Approve & Commit a REVIEWING diff.
  */
 import Editor from '@monaco-editor/react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import ActivityBar, { type LeftView } from './components/ActivityBar';
 import DirTree from './components/DirTree';
-import ReviewPanel from './components/ReviewPanel';
+import EditorTabs from './components/EditorTabs';
+import StatusBar from './components/StatusBar';
+import Terminal from './components/Terminal';
 import TraceView from './components/TraceView';
 import VerificationView from './components/VerificationView';
 import { api, type ConnectedRepo, type GhStatus } from './lib/api';
@@ -14,6 +19,7 @@ import { buildTree, parentDirs } from './lib/files';
 import { DEMO_CODE, dark, formatBytes, languageFor } from './theme';
 
 type ChatMsg = { role: 'user' | 'assistant'; content: string };
+type RightTab = 'chat' | 'terminal' | 'agent';
 
 export default function App() {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
@@ -21,7 +27,9 @@ export default function App() {
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState('');
-  const [activeTab, setActiveTab] = useState<'chat' | 'trace' | 'tests' | 'diff' | 'proof'>('chat');
+  const [bottomTab, setBottomTab] = useState<'tests' | 'diff' | 'proof'>('tests');
+  const [rightTab, setRightTab] = useState<RightTab>('chat');
+  const [leftView, setLeftView] = useState<LeftView>('explorer');
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [provider, setProvider] = useState<{ provider: string; model: string; has_key: boolean } | null>(null);
   const [automation, setAutomation] = useState<AutomationStatus | null>(null);
@@ -37,17 +45,18 @@ export default function App() {
 
   // Chat state
   const [chat, setChat] = useState<ChatMsg[]>([
-    { role: 'assistant', content: 'Ready. Select a repo, then just tell me the work — "add dark mode", "fix the login redirect", "fix #N". I run it right away and you watch the trace.' },
+    { role: 'assistant', content: 'Ready. Select a repo, then just tell me the work — "add dark mode", "fix the login redirect", "fix #N". I run it right away and you watch the agent panel.' },
   ]);
   const [chatInput, setChatInput] = useState('');
   const [chatBusy, setChatBusy] = useState(false);
 
-  // VS Code-like explorer + editor (same workdir the agent uses)
+  // VS Code-like explorer + tabbed editor (same workdir the agent uses)
   const [repoFiles, setRepoFiles] = useState<{ path: string; size: number }[]>([]);
   const [filesRoot, setFilesRoot] = useState('');
   const [filesLoading, setFilesLoading] = useState(false);
   const [filesError, setFilesError] = useState('');
   const [explorerFilter, setExplorerFilter] = useState('');
+  const [openTabs, setOpenTabs] = useState<string[]>([]);
   const [openPath, setOpenPath] = useState('');
   const [fileContent, setFileContent] = useState(DEMO_CODE);
   const [savedContent, setSavedContent] = useState(DEMO_CODE);
@@ -57,6 +66,8 @@ export default function App() {
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set(['']));
+  const [cursor, setCursor] = useState({ line: 1, col: 1 });
+  const tabCache = useRef<Record<string, { content: string; saved: string; truncated: boolean }>>({});
   const traceEndRef = useRef<HTMLDivElement>(null);
 
   const refreshTasks = useCallback(async () => {
@@ -154,8 +165,10 @@ export default function App() {
 
   useEffect(() => { refreshFiles(); }, [refreshFiles]);
 
-  // Reset the open file when switching repos.
+  // Reset tabs when switching repos.
   useEffect(() => {
+    tabCache.current = {};
+    setOpenTabs([]);
     setOpenPath('');
     setFileContent(DEMO_CODE);
     setSavedContent(DEMO_CODE);
@@ -187,22 +200,25 @@ export default function App() {
     });
   }, []);
 
-  // Auto-open the first source file so the editor is never an empty shell.
-  useEffect(() => {
-    if (openPath || repoFiles.length === 0) return;
-    const first = repoFiles.find((f) => f.path.endsWith('.py')) ?? repoFiles[0];
-    if (first) openFile(first.path);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [repoFiles]);
-
-  // Keep the trace pinned to the latest step while a run is live.
-  useEffect(() => {
-    if (activeTab === 'trace') traceEndRef.current?.scrollIntoView({ block: 'end' });
-  }, [detail?.events.length, activeTab]);
+  function stashCurrent() {
+    if (openPath) tabCache.current[openPath] = { content: fileContent, saved: savedContent, truncated: fileTruncated };
+  }
 
   async function openFile(path: string) {
     if (!selectedRepo) return;
+    if (path !== openPath) stashCurrent();
     expandParentsOf(path);
+    setOpenTabs((tabs) => (tabs.includes(path) ? tabs : [...tabs, path]));
+    const cached = tabCache.current[path];
+    if (cached) {
+      setOpenPath(path);
+      setFileContent(cached.content);
+      setSavedContent(cached.saved);
+      setFileTruncated(cached.truncated);
+      setFileError('');
+      setSaveMsg('');
+      return;
+    }
     setOpenPath(path);
     setFileLoading(true);
     setFileError('');
@@ -212,12 +228,76 @@ export default function App() {
       setFileContent(f.content);
       setSavedContent(f.content);
       setFileTruncated(f.truncated);
+      tabCache.current[path] = { content: f.content, saved: f.content, truncated: f.truncated };
     } catch (e) {
       setFileError(e instanceof Error ? e.message : 'open failed');
     } finally {
       setFileLoading(false);
     }
   }
+
+  function selectTab(path: string) {
+    if (path === openPath) return;
+    stashCurrent();
+    const cached = tabCache.current[path];
+    setOpenPath(path);
+    expandParentsOf(path);
+    if (cached) {
+      setFileContent(cached.content);
+      setSavedContent(cached.saved);
+      setFileTruncated(cached.truncated);
+    }
+    setFileError('');
+    setSaveMsg('');
+  }
+
+  function closeTab(path: string) {
+    if (path === openPath) stashCurrent();
+    setOpenTabs((tabs) => {
+      const next = tabs.filter((t) => t !== path);
+      if (path === openPath) {
+        const idx = tabs.indexOf(path);
+        const neighbor = next[Math.min(idx, next.length - 1)] ?? '';
+        if (neighbor) {
+          const cached = tabCache.current[neighbor];
+          setOpenPath(neighbor);
+          if (cached) {
+            setFileContent(cached.content);
+            setSavedContent(cached.saved);
+            setFileTruncated(cached.truncated);
+          }
+        } else {
+          setOpenPath('');
+          setFileContent(DEMO_CODE);
+          setSavedContent(DEMO_CODE);
+          setFileTruncated(false);
+        }
+        setFileError('');
+        setSaveMsg('');
+      }
+      return next;
+    });
+    delete tabCache.current[path];
+  }
+
+  function isDirty(path: string): boolean {
+    if (path === openPath) return fileContent !== savedContent;
+    const c = tabCache.current[path];
+    return c ? c.content !== c.saved : false;
+  }
+
+  // Auto-open the first source file so the editor is never an empty shell.
+  useEffect(() => {
+    if (openPath || repoFiles.length === 0) return;
+    const first = repoFiles.find((f) => f.path.endsWith('.py')) ?? repoFiles[0];
+    if (first) openFile(first.path);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoFiles]);
+
+  // Keep the agent trace pinned to the latest step while a run is live.
+  useEffect(() => {
+    if (rightTab === 'agent') traceEndRef.current?.scrollIntoView({ block: 'end' });
+  }, [detail?.events.length, rightTab]);
 
   const saveOpenFile = useCallback(async () => {
     if (!selectedRepo || !openPath) return;
@@ -226,6 +306,7 @@ export default function App() {
     try {
       await api.saveFile(selectedRepo, openPath, fileContent);
       setSavedContent(fileContent);
+      tabCache.current[openPath] = { content: fileContent, saved: fileContent, truncated: fileTruncated };
       setSaveMsg(`Saved ${openPath}`);
       const r = await api.repoFiles(selectedRepo);
       setRepoFiles(r.files);
@@ -234,7 +315,7 @@ export default function App() {
     } finally {
       setSaving(false);
     }
-  }, [selectedRepo, openPath, fileContent]);
+  }, [selectedRepo, openPath, fileContent, fileTruncated]);
 
   const saveRef = useRef(saveOpenFile);
   saveRef.current = saveOpenFile;
@@ -265,9 +346,9 @@ export default function App() {
       if (res.task_id) {
         setSelectedId(res.task_id);
         await refreshTasks();
-        // Work orders start the agent immediately — follow it in the trace.
+        // Work orders start the agent immediately — follow it in the agent panel.
         if (res.intent === 'agent_task' || res.intent === 'fix_issue' || res.intent === 'run_task') {
-          setActiveTab('trace');
+          setRightTab('agent');
           setRunning(true);
         }
       }
@@ -280,7 +361,7 @@ export default function App() {
   async function startFix() {
     setRunning(true);
     setRunError('');
-    setActiveTab('trace');
+    setRightTab('agent');
     try {
       const data = await api.trigger();
       if (data.error) {
@@ -303,7 +384,7 @@ export default function App() {
     if (selectedId == null) return;
     setRunning(true);
     setRunError('');
-    setActiveTab('trace');
+    setRightTab('agent');
     try {
       const res = await api.runTask(selectedId);
       const d = await api.task(selectedId);
@@ -361,7 +442,7 @@ export default function App() {
     try {
       await api.ghConnect(fullName, installationId || undefined);
       setSelectedRepo(fullName);
-      setNotice(`Connected ${fullName}.`);
+      setNotice(`Connected ${fullName}. New issues on this repo now auto-start the agent.`);
       await refreshRepos();
     } catch (e) {
       setNotice(e instanceof Error ? e.message : 'connect failed');
@@ -375,13 +456,13 @@ export default function App() {
     try {
       const res = await api.createTask(selectedRepo, taskTitle.trim());
       setNotice(res.launched === 'started'
-        ? `Task #${res.task_id} created and running — watch the Agent Trace.`
-        : `Task #${res.task_id} created — Run it from Tasks, then review the diff.`);
+        ? `Task #${res.task_id} created and running — watch the agent panel.`
+        : `Task #${res.task_id} created — Run it from the Run view, then review the diff.`);
       setTaskTitle('');
       await refreshTasks();
       setSelectedId(res.task_id);
       if (res.launched === 'started') {
-        setActiveTab('trace');
+        setRightTab('agent');
         setRunning(true);
       }
     } catch (e) {
@@ -404,7 +485,7 @@ export default function App() {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: dark.bg, color: dark.text, fontFamily: 'system-ui' }}>
       <header style={{ display: 'flex', gap: 12, alignItems: 'center', padding: '8px 12px', borderBottom: `1px solid ${dark.border}`, background: dark.panel }}>
-        <strong>Fixhub debugger</strong>
+        <strong>Fixhub</strong>
         <span style={{ color: dark.muted, fontSize: 12 }}>{connLabel}</span>
         <span style={{ color: dark.muted, fontSize: 12 }}>model: {provider ? `${provider.provider}/${provider.model}${provider.has_key ? '' : ' (no key — verification-only)'}` : '…'}</span>
         {metrics && (
@@ -423,127 +504,148 @@ export default function App() {
       </header>
 
       <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-        <aside style={{ width: 300, borderRight: `1px solid ${dark.border}`, padding: 8, overflow: 'auto', background: dark.panel }}>
-          <div style={{ fontSize: 12, color: dark.muted }}>GITHUB INSTALLATION</div>
-          <input
-            value={installationId} onChange={(e) => setInstallationId(e.target.value)}
-            placeholder="installation id"
-            style={{ width: '100%', margin: '4px 0', background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6 }}
-          />
-          <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>REPOSITORIES</div>
-          {repos.length === 0 && <div style={{ color: dark.muted, fontSize: 13 }}>None yet — connect below or clone OSS.</div>}
-          {repos.map((r) => (
-            <div key={r.full_name} onClick={() => setSelectedRepo(r.full_name)}
-              style={{ padding: '4px 6px', borderRadius: 4, cursor: 'pointer', fontSize: 13, background: r.full_name === selectedRepo ? '#1f6feb33' : 'transparent' }}>
-              {r.full_name} {r.connected ? '●' : '○'}{r.has_workspace ? ' ⌂' : ''}
-              {!r.connected && (
-                <button onClick={(e) => { e.stopPropagation(); doConnect(r.full_name); }} style={{ marginLeft: 6, fontSize: 11 }}>connect</button>
+        <ActivityBar view={leftView} onChange={setLeftView} dark={dark} />
+
+        {leftView === 'explorer' && (
+          <div style={{ width: 248, minWidth: 248, borderRight: `1px solid ${dark.border}`, background: dark.panel, display: 'flex', flexDirection: 'column' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px', fontSize: 12, color: dark.muted }}>
+              <span style={{ fontWeight: 700 }}>EXPLORER</span>
+              {filesRoot && <span style={{ fontSize: 11 }}>· {filesRoot === 'demo' ? 'demo fallback' : 'workspace'} · {repoFiles.length}</span>}
+              <button onClick={refreshFiles} title="Refresh file tree" style={{ marginLeft: 'auto', background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 4, cursor: 'pointer', fontSize: 11 }}>↻</button>
+            </div>
+            <div style={{ padding: '0 8px 6px' }}>
+              <input
+                value={explorerFilter} onChange={(e) => setExplorerFilter(e.target.value)}
+                placeholder={selectedRepo ? 'Filter files…' : 'Select a repo first'}
+                disabled={!selectedRepo}
+                style={{ width: '100%', background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6, fontSize: 12 }}
+              />
+            </div>
+            <div style={{ flex: 1, overflow: 'auto', padding: '0 4px 8px' }}>
+              {!selectedRepo && <div style={{ color: dark.muted, fontSize: 12, padding: 8 }}>No repo selected — open the Source view (⑂) or clone OSS.</div>}
+              {selectedRepo && filesLoading && <div style={{ color: dark.muted, fontSize: 12, padding: 8 }}>Loading tree…</div>}
+              {filesError && <div style={{ color: dark.red, fontSize: 12, padding: 8 }}>{filesError}</div>}
+              {selectedRepo && !filesLoading && filteredFiles.length === 0 && !filesError && (
+                <div style={{ color: dark.muted, fontSize: 12, padding: 8 }}>{repoFiles.length === 0 ? 'Empty workdir — clone the repo first.' : 'No files match.'}</div>
+              )}
+              {explorerFilter ? (
+                filteredFiles.map((f) => (
+                  <div key={f.path} onClick={() => openFile(f.path)} title={`${f.path} · ${formatBytes(f.size)}`}
+                    style={{ padding: '3px 8px', borderRadius: 4, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', background: f.path === openPath ? '#1f6feb33' : 'transparent' }}>
+                    <span style={{ color: dark.muted, marginRight: 6 }}>📄</span>{f.path}
+                  </div>
+                ))
+              ) : (
+                <DirTree node={fileTree} depth={0} expanded={expanded} onToggle={toggleDir} openPath={openPath} onOpen={openFile} dark={dark} />
               )}
             </div>
-          ))}
-          <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>CLONE ANY OSS REPO</div>
-          <div style={{ display: 'flex', gap: 4 }}>
-            <input
-              value={cloneUrl} onChange={(e) => setCloneUrl(e.target.value)}
-              placeholder="https://github.com/owner/repo"
-              style={{ flex: 1, background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6 }}
-            />
-            <button onClick={doClone}>Clone</button>
-          </div>
-          <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>NEW TASK (no issue needed)</div>
-          <div style={{ display: 'flex', gap: 4 }}>
-            <input
-              value={taskTitle} onChange={(e) => setTaskTitle(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') doCreateTask(); }}
-              placeholder="e.g. fix login redirect loop"
-              style={{ flex: 1, background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6 }}
-            />
-            <button onClick={doCreateTask}>Create</button>
-          </div>
-          {notice && <div style={{ fontSize: 12, color: dark.yellow, marginTop: 4 }}>{notice}</div>}
-          <h4 style={{ margin: '12px 0 4px' }}>Tasks</h4>
-          {tasks.length === 0 && <div style={{ color: dark.muted, fontSize: 13 }}>No runs yet.</div>}
-          {tasks.map((t) => (
-            <div key={t.id} onClick={() => setSelectedId(t.id)}
-              style={{ padding: '4px 6px', borderRadius: 4, cursor: 'pointer', fontSize: 13, background: t.id === selectedId ? '#1f6feb33' : 'transparent' }}>
-              {formatTaskLabel(t)}
+            <div style={{ borderTop: `1px solid ${dark.border}`, padding: '6px 8px' }}>
+              <div style={{ fontSize: 12, color: dark.muted, marginBottom: 4 }}>OUTLINE</div>
+              <div style={{ fontSize: 12, color: dark.muted }}>TIMELINE</div>
             </div>
-          ))}
-        </aside>
+          </div>
+        )}
+
+        {leftView === 'source' && (
+          <aside style={{ width: 300, minWidth: 300, borderRight: `1px solid ${dark.border}`, padding: 8, overflow: 'auto', background: dark.panel }}>
+            <div style={{ fontSize: 12, color: dark.muted }}>SOURCE CONTROL</div>
+            <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>GITHUB INSTALLATION</div>
+            <input
+              value={installationId} onChange={(e) => setInstallationId(e.target.value)}
+              placeholder="installation id"
+              style={{ width: '100%', margin: '4px 0', background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6 }}
+            />
+            <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>REPOSITORIES</div>
+            {repos.length === 0 && <div style={{ color: dark.muted, fontSize: 13 }}>None yet — connect below or clone OSS.</div>}
+            {repos.map((r) => (
+              <div key={r.full_name} onClick={() => setSelectedRepo(r.full_name)}
+                style={{ padding: '4px 6px', borderRadius: 4, cursor: 'pointer', fontSize: 13, background: r.full_name === selectedRepo ? '#1f6feb33' : 'transparent' }}>
+                {r.full_name} {r.connected ? '●' : '○'}{r.has_workspace ? ' ⌂' : ''}
+                {!r.connected && (
+                  <button onClick={(e) => { e.stopPropagation(); doConnect(r.full_name); }} style={{ marginLeft: 6, fontSize: 11 }}>connect</button>
+                )}
+              </div>
+            ))}
+            <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>CLONE ANY OSS REPO</div>
+            <div style={{ display: 'flex', gap: 4 }}>
+              <input
+                value={cloneUrl} onChange={(e) => setCloneUrl(e.target.value)}
+                placeholder="https://github.com/owner/repo"
+                style={{ flex: 1, background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6 }}
+              />
+              <button onClick={doClone}>Clone</button>
+            </div>
+            {notice && <div style={{ fontSize: 12, color: dark.yellow, marginTop: 4 }}>{notice}</div>}
+          </aside>
+        )}
+
+        {leftView === 'run' && (
+          <aside style={{ width: 300, minWidth: 300, borderRight: `1px solid ${dark.border}`, padding: 8, overflow: 'auto', background: dark.panel }}>
+            <div style={{ fontSize: 12, color: dark.muted }}>RUN &amp; TASKS</div>
+            <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>NEW TASK (no issue needed)</div>
+            <div style={{ display: 'flex', gap: 4 }}>
+              <input
+                value={taskTitle} onChange={(e) => setTaskTitle(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') doCreateTask(); }}
+                placeholder="e.g. fix login redirect loop"
+                style={{ flex: 1, background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6 }}
+              />
+              <button onClick={doCreateTask}>Create</button>
+            </div>
+            {notice && <div style={{ fontSize: 12, color: dark.yellow, marginTop: 4 }}>{notice}</div>}
+            <h4 style={{ margin: '12px 0 4px' }}>Tasks</h4>
+            {tasks.length === 0 && <div style={{ color: dark.muted, fontSize: 13 }}>No runs yet — new GitHub issues on connected repos start one automatically.</div>}
+            {tasks.map((t) => (
+              <div key={t.id} onClick={() => setSelectedId(t.id)}
+                style={{ padding: '4px 6px', borderRadius: 4, cursor: 'pointer', fontSize: 13, background: t.id === selectedId ? '#1f6feb33' : 'transparent' }}>
+                {formatTaskLabel(t)}
+              </div>
+            ))}
+          </aside>
+        )}
 
         <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-          <div style={{ display: 'flex', height: '44%', minHeight: 240, borderBottom: `1px solid ${dark.border}` }}>
-            <div style={{ width: 248, minWidth: 248, borderRight: `1px solid ${dark.border}`, background: dark.panel, display: 'flex', flexDirection: 'column' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px', fontSize: 12, color: dark.muted }}>
-                <span style={{ fontWeight: 700 }}>EXPLORER</span>
-                {filesRoot && <span style={{ fontSize: 11 }}>· {filesRoot === 'demo' ? 'demo fallback' : 'workspace'} · {repoFiles.length}</span>}
-                <button onClick={refreshFiles} title="Refresh file tree" style={{ marginLeft: 'auto', background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 4, cursor: 'pointer', fontSize: 11 }}>↻</button>
-              </div>
-              <div style={{ padding: '0 8px 6px' }}>
-                <input
-                  value={explorerFilter} onChange={(e) => setExplorerFilter(e.target.value)}
-                  placeholder={selectedRepo ? 'Filter files…' : 'Select a repo first'}
-                  disabled={!selectedRepo}
-                  style={{ width: '100%', background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6, fontSize: 12 }}
-                />
-              </div>
-              <div style={{ flex: 1, overflow: 'auto', padding: '0 4px 8px' }}>
-                {!selectedRepo && <div style={{ color: dark.muted, fontSize: 12, padding: 8 }}>No repo selected — pick one on the left or clone OSS.</div>}
-                {selectedRepo && filesLoading && <div style={{ color: dark.muted, fontSize: 12, padding: 8 }}>Loading tree…</div>}
-                {filesError && <div style={{ color: dark.red, fontSize: 12, padding: 8 }}>{filesError}</div>}
-                {selectedRepo && !filesLoading && filteredFiles.length === 0 && !filesError && (
-                  <div style={{ color: dark.muted, fontSize: 12, padding: 8 }}>{repoFiles.length === 0 ? 'Empty workdir — clone the repo first.' : 'No files match.'}</div>
-                )}
-                {explorerFilter ? (
-                  filteredFiles.map((f) => (
-                    <div key={f.path} onClick={() => openFile(f.path)} title={`${f.path} · ${formatBytes(f.size)}`}
-                      style={{ padding: '3px 8px', borderRadius: 4, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', background: f.path === openPath ? '#1f6feb33' : 'transparent' }}>
-                      <span style={{ color: dark.muted, marginRight: 6 }}>📄</span>{f.path}
-                    </div>
-                  ))
-                ) : (
-                  <DirTree node={fileTree} depth={0} expanded={expanded} onToggle={toggleDir} openPath={openPath} onOpen={openFile} dark={dark} />
-                )}
-              </div>
+          <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+            <EditorTabs tabs={openTabs} active={openPath} isDirty={isDirty} onSelect={selectTab} onClose={closeTab} repo={selectedRepo} dark={dark} />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 10px', borderBottom: `1px solid ${dark.border}`, background: dark.panel, fontSize: 12 }}>
+              {!openPath && <span style={{ color: dark.muted }}>— click a file in the Explorer to view &amp; edit</span>}
+              {fileTruncated && <span style={{ color: dark.yellow }}>(truncated at 200KB)</span>}
+              <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+                {saveMsg && <span style={{ color: saveMsg.startsWith('Saved') ? dark.green : dark.red }}>{saveMsg}</span>}
+                <button onClick={() => openPath && openFile(openPath)} disabled={!openPath || fileLoading} style={{ background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}>Reload</button>
+                <button onClick={saveOpenFile} disabled={!openPath || !dirty || saving} title="Ctrl/Cmd+S"
+                  style={{ background: dirty ? dark.accent : 'transparent', color: dirty ? '#fff' : dark.muted, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '4px 12px', cursor: dirty && !saving ? 'pointer' : 'default' }}>
+                  {saving ? 'Saving…' : 'Save'}
+                </button>
+              </span>
             </div>
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 10px', borderBottom: `1px solid ${dark.border}`, background: dark.panel, fontSize: 12 }}>
-                <span style={{ color: dark.muted }}>{selectedRepo || 'no repo'}</span>
-                {openPath && <strong style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{openPath}{dirty ? ' ●' : ''}</strong>}
-                {!openPath && <span style={{ color: dark.muted }}>— click a file to view &amp; edit</span>}
-                {fileTruncated && <span style={{ color: dark.yellow }}>(truncated at 200KB)</span>}
-                <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
-                  {saveMsg && <span style={{ color: saveMsg.startsWith('Saved') ? dark.green : dark.red }}>{saveMsg}</span>}
-                  <button onClick={() => openPath && openFile(openPath)} disabled={!openPath || fileLoading} style={{ background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}>Reload</button>
-                  <button onClick={saveOpenFile} disabled={!openPath || !dirty || saving} title="Ctrl/Cmd+S"
-                    style={{ background: dirty ? dark.accent : 'transparent', color: dirty ? '#fff' : dark.muted, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '4px 12px', cursor: dirty && !saving ? 'pointer' : 'default' }}>
-                    {saving ? 'Saving…' : 'Save'}
-                  </button>
-                </span>
-              </div>
-              <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-                {fileLoading && <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: dark.muted, fontSize: 12, zIndex: 1 }}>Loading file…</div>}
-                {fileError && <div style={{ position: 'absolute', top: 8, left: 8, color: dark.red, fontSize: 12, zIndex: 1 }}>{fileError}</div>}
-                <Editor
-                  height="100%"
-                  language={openPath ? languageFor(openPath) : 'python'}
-                  value={fileContent}
-                  onChange={(v) => setFileContent(v ?? '')}
-                  theme="vs-dark"
-                  options={{ readOnly: !openPath, minimap: { enabled: false }, fontSize: 13, scrollBeyondLastLine: false, automaticLayout: true }}
-                  onMount={(editor, monaco) => {
-                    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveRef.current());
-                  }}
-                />
-              </div>
+            <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+              {fileLoading && <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: dark.muted, fontSize: 12, zIndex: 1 }}>Loading file…</div>}
+              {fileError && <div style={{ position: 'absolute', top: 8, left: 8, color: dark.red, fontSize: 12, zIndex: 1 }}>{fileError}</div>}
+              <Editor
+                height="100%"
+                language={openPath ? languageFor(openPath) : 'python'}
+                value={fileContent}
+                onChange={(v) => {
+                  const next = v ?? '';
+                  setFileContent(next);
+                  if (openPath) tabCache.current[openPath] = { content: next, saved: savedContent, truncated: fileTruncated };
+                }}
+                theme="vs-dark"
+                options={{ readOnly: !openPath, minimap: { enabled: false }, fontSize: 13, scrollBeyondLastLine: false, automaticLayout: true }}
+                onMount={(editor, monaco) => {
+                  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveRef.current());
+                  editor.onDidChangeCursorPosition((e) => setCursor({ line: e.position.lineNumber, col: e.position.column }));
+                }}
+              />
             </div>
           </div>
-          <div style={{ borderTop: `1px solid ${dark.border}`, padding: 8, overflow: 'auto', flex: 1, display: 'flex', flexDirection: 'column' }}>
+          <div style={{ height: '32%', minHeight: 180, borderTop: `1px solid ${dark.border}`, padding: 8, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
             <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
-              {(['chat', 'trace', 'tests', 'diff', 'proof'] as const).map((t) => (
-                <button key={t} onClick={() => setActiveTab(t)}
-                  style={{ background: activeTab === t ? dark.accent : 'transparent', color: activeTab === t ? '#fff' : dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}>
-                  {t === 'trace' ? 'Agent Trace' : t === 'tests' ? `Verification (${verificationSummary(verification)})` : t[0].toUpperCase() + t.slice(1)}
+              {(['tests', 'diff', 'proof'] as const).map((t) => (
+                <button key={t} onClick={() => setBottomTab(t)}
+                  style={{ background: bottomTab === t ? dark.accent : 'transparent', color: bottomTab === t ? '#fff' : dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}>
+                  {t === 'tests' ? `Verification (${verificationSummary(verification)})` : t[0].toUpperCase() + t.slice(1)}
                 </button>
               ))}
               {detail && (
@@ -553,41 +655,10 @@ export default function App() {
               )}
             </div>
             {runError && <pre style={{ color: dark.red, whiteSpace: 'pre-wrap' }}>{runError}</pre>}
-            {activeTab === 'chat' && (
-              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-                <div style={{ flex: 1, overflow: 'auto', marginBottom: 8 }}>
-                  {chat.map((m, i) => (
-                    <div key={i} style={{ marginBottom: 6, fontSize: 13 }}>
-                      <span style={{ color: m.role === 'user' ? dark.accent : dark.green, fontWeight: 600 }}>{m.role === 'user' ? 'you' : 'fixhub'}: </span>
-                      <span style={{ whiteSpace: 'pre-wrap' }}>{m.content}</span>
-                    </div>
-                  ))}
-                  {selectedRepo === '' && (
-                    <div style={{ fontSize: 12, color: dark.muted }}>Tip: select a repo on the left first — chat is repo-scoped.</div>
-                  )}
-                </div>
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <input
-                    value={chatInput} onChange={(e) => setChatInput(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === 'Enter') sendChat(); }}
-                    placeholder={selectedRepo ? `Tell me what to do in ${selectedRepo} — "add dark mode", "fix #N"…` : 'Select a repo, then chat…'}
-                    style={{ flex: 1, background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 8 }}
-                  />
-                  <button onClick={() => sendChat()} disabled={chatBusy}>{chatBusy ? '…' : 'Send'}</button>
-                </div>
-                <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
-                  <button onClick={() => sendChat('list issues')}>List issues</button>
-                  <button onClick={runSelected} disabled={selectedId == null || running}>{running ? 'Running…' : 'Run agent on task'}</button>
-                </div>
-              </div>
-            )}
-            {activeTab === 'trace' && (
-              <TraceView events={events} state={detail?.state} running={running} traceEndRef={traceEndRef} dark={dark} />
-            )}
-            {activeTab === 'tests' && (
+            {bottomTab === 'tests' && (
               <VerificationView verification={verification} dark={dark} />
             )}
-            {activeTab === 'diff' && (
+            {bottomTab === 'diff' && (
               <div>
                 {detail?.branch && <div style={{ fontSize: 12, color: dark.muted }}>branch: {detail.branch}</div>}
                 <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12 }}>
@@ -605,7 +676,7 @@ export default function App() {
                 )}
               </div>
             )}
-            {activeTab === 'proof' && (
+            {bottomTab === 'proof' && (
               <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12 }}>
                 {verification.length === 0
                   ? 'Proof of Fix appears after a run — built from real verification rows, never claimed.'
@@ -615,17 +686,93 @@ export default function App() {
           </div>
         </main>
 
-        <ReviewPanel
-          detail={detail}
-          verification={verification}
-          running={running}
-          onRun={runSelected}
-          onApprove={approve}
-          onReject={reject}
-          canReview={canReview}
-          dark={dark}
-        />
+        <aside style={{ width: 380, minWidth: 380, borderLeft: `1px solid ${dark.border}`, background: dark.panel, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+          <div style={{ display: 'flex', borderBottom: `1px solid ${dark.border}` }}>
+            {(['chat', 'terminal', 'agent'] as const).map((t) => (
+              <button key={t} onClick={() => setRightTab(t)}
+                style={{
+                  flex: 1, background: 'transparent', color: rightTab === t ? dark.text : dark.muted,
+                  border: 0, borderBottom: `2px solid ${rightTab === t ? dark.accent : 'transparent'}`,
+                  padding: '8px 4px', cursor: 'pointer', fontSize: 12, fontWeight: rightTab === t ? 700 : 400,
+                }}>
+                {t === 'agent' ? 'Claude Code' : t[0].toUpperCase() + t.slice(1)}
+              </button>
+            ))}
+          </div>
+          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+            {rightTab === 'chat' && (
+              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, padding: 8 }}>
+                <div style={{ flex: 1, overflow: 'auto', marginBottom: 8 }}>
+                  {chat.map((m, i) => (
+                    <div key={i} style={{ marginBottom: 6, fontSize: 13 }}>
+                      <span style={{ color: m.role === 'user' ? dark.accent : dark.green, fontWeight: 600 }}>{m.role === 'user' ? 'you' : 'fixhub'}: </span>
+                      <span style={{ whiteSpace: 'pre-wrap' }}>{m.content}</span>
+                    </div>
+                  ))}
+                  {selectedRepo === '' && (
+                    <div style={{ fontSize: 12, color: dark.muted }}>Tip: select a repo in the Source view first — chat is repo-scoped.</div>
+                  )}
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input
+                    value={chatInput} onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') sendChat(); }}
+                    placeholder={selectedRepo ? `Ask about ${selectedRepo}…` : 'Select a repo, then chat…'}
+                    style={{ flex: 1, background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 8 }}
+                  />
+                  <button onClick={() => sendChat()} disabled={chatBusy}>{chatBusy ? '…' : 'Send'}</button>
+                </div>
+                <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+                  <button onClick={() => sendChat('list issues')}>List issues</button>
+                  <button onClick={runSelected} disabled={selectedId == null || running}>{running ? 'Running…' : 'Run agent'}</button>
+                </div>
+              </div>
+            )}
+            {rightTab === 'terminal' && <Terminal repo={selectedRepo} dark={dark} />}
+            {rightTab === 'agent' && (
+              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, padding: 8 }}>
+                <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+                  <button onClick={runSelected} disabled={selectedId == null || running} style={{ flex: 1, background: dark.accent, color: '#fff', border: 0, borderRadius: 6, padding: '6px', cursor: 'pointer' }}>
+                    {running ? 'Running…' : 'Run agent on task'}
+                  </button>
+                </div>
+                {detail && (
+                  <div style={{ fontSize: 12, color: dark.muted, marginBottom: 6 }}>
+                    Task #{detail.id} · {detail.state}{detail.branch ? ` · ⑂ ${detail.branch}` : ''}
+                  </div>
+                )}
+                {canReview && (
+                  <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+                    <button onClick={approve} style={{ flex: 1, background: dark.green, color: '#fff', border: 0, borderRadius: 6, padding: '6px', cursor: 'pointer' }}>Approve & Commit</button>
+                    <button onClick={reject} style={{ flex: 1, background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '6px', cursor: 'pointer' }}>Request changes</button>
+                  </div>
+                )}
+                {detail?.pr_url && (
+                  <div style={{ marginBottom: 8 }}>
+                    <a href={detail.pr_url} target="_blank" rel="noreferrer" style={{ color: dark.green, fontSize: 13, fontWeight: 600 }}>
+                      Pull request #{detail.pr_number || ''} ↗
+                    </a>
+                  </div>
+                )}
+                <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
+                  <TraceView events={events} state={detail?.state} running={running} traceEndRef={traceEndRef} dark={dark} />
+                </div>
+              </div>
+            )}
+          </div>
+        </aside>
       </div>
+
+      <StatusBar
+        branch={detail?.branch ?? ''}
+        state={detail ? `Task #${detail.id} · ${detail.state}` : 'idle'}
+        model={provider ? `${provider.provider}/${provider.model}` : '…'}
+        tokens={metrics ? `${metrics.total_tokens} tokens · $${metrics.est_cost_usd}` : ''}
+        connected={ghStatus ? (ghStatus.app_configured ? `App ✓ · ${ghStatus.connected_repos}` : 'App not configured') : 'offline'}
+        language={openPath ? languageFor(openPath) : 'plaintext'}
+        cursor={cursor}
+        dark={dark}
+      />
     </div>
   );
 }

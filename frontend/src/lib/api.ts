@@ -111,6 +111,12 @@ export const api = {
       headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ full_name, path, content }),
     }).then(json<{ status: string; repo: string; path: string; size: number }>),
+  exec: (full_name: string, cmd: string) =>
+    fetch("/api/repos/exec", {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ full_name, cmd }),
+    }).then(json<{ repo: string; cmd: string; ok: boolean; output: string }>),
   eval: () =>
     fetch("/api/eval").then(
       json<{

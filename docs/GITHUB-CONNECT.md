@@ -19,7 +19,7 @@ GITHUB_APP_ID=123456
 GITHUB_APP_PRIVATE_KEY_PATH=/run/secrets/fixhub-app.pem   # or paste PEM into GITHUB_PRIVATE_KEY
 GITHUB_APP_SLUG=my-fixhub-debugger
 GITHUB_WEBHOOK_SECRET=<random 32+ chars>
-AUTO_TRIGGER_ON_ISSUE=false   # keep False until you trust the loop
+AUTO_TRIGGER_ON_ISSUE=true   # any opened/reopened issue on a connected repo starts the agent
 ```
 
 ## 3. Install + connect
@@ -37,9 +37,11 @@ AUTO_TRIGGER_ON_ISSUE=false   # keep False until you trust the loop
 - Chat: `list issues` → `fix #N` → **Run agent on task** → review **Diff** tab →
   **Approve & Commit** (opens a PR with Proof of Fix) or **Request changes**.
 - Any public repo: paste `https://github.com/<owner>/<repo>` into **CLONE ANY OSS REPO**.
-- Auto-catch: set `AUTO_TRIGGER_ON_ISSUE=true` so opened/reopened issues on
-  connected repos create tasks. Default off — label `fixhub-fix` or `/fix` comment
-  or chat keeps every run intentional.
+- Auto-catch (default on): opened/reopened issues on connected repos create
+  tasks and the agent starts immediately — no label or comment needed.
+  Set `AUTO_TRIGGER_ON_ISSUE=false` for manual triage (`fixhub-fix` label,
+  `/fix` comment, or chat only). Every auto-run is cost-capped and nothing
+  pushes to GitHub before Approve & Commit.
 
 ## Token lifecycle
 

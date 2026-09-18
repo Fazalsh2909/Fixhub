@@ -102,11 +102,12 @@ Env: copy `backend/.env.example` → `backend/.env`, set `TOKENROUTER_API_KEY` o
 ## Stay-connected flow
 
 1. Create + install the GitHub App ([guide](docs/GITHUB-CONNECT.md)), paste the
-   installation id into the left panel — header shows `App ✓`.
-2. Connect repos (or clone OSS via URL). Just tell the chat the work —
-   `add dark mode`, `fix the login redirect`, `fix #N` — the agent starts
-   immediately (`AUTO_RUN`, default on) and you watch the Agent Trace.
-3. Trace → Verification → **Diff** tab.
+   installation id into the Source view (⑂) — header shows `App ✓`.
+2. Connect repos (or clone OSS via URL). Any opened/reopened issue on a
+   connected repo auto-starts the agent (`AUTO_TRIGGER_ON_ISSUE`, default on) —
+   no label or instruction needed. Or just tell the chat: `add dark mode`,
+   `fix the login redirect`, `fix #N` — and watch the Claude Code panel.
+3. Agent Trace → Verification → **Diff** tab.
 4. **Approve & Commit** opens the PR with Proof of Fix; **Request changes** loops back.
    No installation attached (demo/clone)? Approval is recorded locally with the branch.
    Set `AUTO_PR_ON_VERIFIED=true` for hands-free PRs on verified runs
@@ -129,7 +130,7 @@ Env: copy `backend/.env.example` → `backend/.env`, set `TOKENROUTER_API_KEY` o
 
 ```
 backend/app/ → main, config, db, metrics, logging, queue, github/ (webhook, api, app_auth, read_client, publisher), repo/ (workspace, clone_guard), intel/, memory/, tools/, llm/, agent/, sandbox/, verify/, policy/, eval/, chat/, review/
-frontend/src/ → App (debugger chatbot + review), lib/api, lib/tasks (+tests)
+frontend/src/ → App (VS Code shell), components/ (ActivityBar, DirTree, EditorTabs, Terminal, TraceView, VerificationView, ReviewPanel, StatusBar), lib/api, lib/tasks (+tests)
 demo/fastapi-jwt/ → JWT 500-vs-401 bug · demo/fastapi-pagination/ → off-by-one bug
 infra/ → docker-compose.yml, sandbox.Dockerfile, main.tf (stub)
 e2e/ → Playwright specs · docs/ → SPEC, architecture, DEMO-RUN, EVAL
