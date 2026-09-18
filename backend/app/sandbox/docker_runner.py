@@ -68,7 +68,7 @@ def run_in_sandbox(
         "--pids-limit",
         "256",
         "--network",
-        "none",
+        "bridge",
         "-v",
         f"{workdir}:/work",
         "-v",
