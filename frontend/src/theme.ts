@@ -48,6 +48,8 @@ export function languageFor(path: string): string {
 export function stageColor(stage: string, theme: Record<string, string>): string {
   const s = (stage || '').toUpperCase();
   if (s === 'TOOL') return theme.accent;
+  if (s === 'SUBAGENT') return '#a371f7';
+  if (s === 'PLAN') return theme.green;
   if (['READY_FOR_APPROVAL', 'REVIEWING', 'COMMITTED', 'PUSHED', 'PR_CREATED'].includes(s))
     return theme.green;
   if (s === 'FAILED' || s === 'CANCELLED') return theme.red;

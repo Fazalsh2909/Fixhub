@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     # Per-task spend guard. 0 = unlimited (dev). Prod: e.g. 0.50.
     # Enforced in orchestrator before each billable LLM call.
     agent_max_cost_usd: float = 0.0
+    # Transcript budget per LLM call (chars, ~4 chars/token). Older tool
+    # output is truncated, oldest exchanges dropped — DB keeps the full record.
+    agent_context_budget_chars: int = 60000
+    # Explore-subagent turns. A runaway explorer is worse than a missing answer.
+    subagent_max_turns: int = 6
     # Queue backend: redis (default when reachable) | memory (tests/demo).
     # Prod path: set REDIS_URL to ElastiCache; SQS adapter plugs into queue.py
     # via the same enqueue/dequeue/ack interface (see queue.py docstring).

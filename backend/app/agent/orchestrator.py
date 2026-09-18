@@ -119,13 +119,50 @@ def transition(db: Session, task: Task, state: str, message: str = "") -> None:
 
 def _system_message(skills_ctx: str = "") -> str:
     base = (
-        "You are Fixhub, a careful engineer. Investigate with read/search tools, "
-        "then fix with edit_file (existing files) — never create_file over an "
-        "existing file. Verify with run_test. Never claim a fix without test evidence."
+        "You are Fixhub, a careful engineer. For multi-step work keep a plan with "
+        "write_todos (whole list each time, exactly one in_progress) and update it as you go. "
+        "To learn how the codebase works, hand a self-contained question to the task tool "
+        "(a read-only explorer; only its answer returns) instead of burning turns searching yourself. "
+        "Fix with edit_file (existing files) — never create_file over an existing file. "
+        "Verify with run_test. Never claim a fix without test evidence."
     )
     if skills_ctx.strip():
         return base + "\n\n" + skills_ctx.strip()
     return base
+
+
+def _run_special(
+    db: Session, task: Task, workdir: Path, llm: LLMProvider, name: str, args: dict
+) -> dict | None:
+    """Tools needing loop context (db/task/llm). None = not special, run normally."""
+    from ..config import settings as _settings
+
+    if name == "write_todos":
+        from .plan import write_todos
+
+        todos = args.get("todos", [])
+        return write_todos(db, task.id, todos if isinstance(todos, list) else [])
+    if name == "task":
+        from .subagent import explore
+
+        question = str(args.get("description", ""))[:2000]
+        if not question.strip():
+            return {"ok": False, "output": "description required"}
+        db.add(
+            TaskEvent(
+                task_id=task.id, stage="SUBAGENT", message=f"start :: {question[:300]}"
+            )
+        )
+        db.commit()
+        report = explore(workdir, question, llm, max_turns=_settings.subagent_max_turns)
+        db.add(
+            TaskEvent(
+                task_id=task.id, stage="SUBAGENT", message=f"done :: {report[:800]}"
+            )
+        )
+        db.commit()
+        return {"ok": True, "output": report[:4000]}
+    return None
 
 
 def engineer_issue(db: Session, task: Task, workdir: Path, llm: LLMProvider) -> dict:
@@ -208,8 +245,40 @@ def engineer_issue(db: Session, task: Task, workdir: Path, llm: LLMProvider) -> 
                 break
         except Exception:
             pass
+        # Per-turn context: budget the transcript, remind of git + plan.
+        # Base `messages` stays canonical; the call sees the budgeted view.
+        from .context import fit, git_reminder, strip_old_outputs
+        from .plan import plan_prompt
+
         try:
-            resp = llm.tool_call(messages, tool_specs())
+            _budget = int(
+                getattr(_settings, "agent_context_budget_chars", 60000) or 60000
+            )
+        except Exception:
+            _budget = 60000
+        refresh: list[str] = []
+        try:
+            _git = git_reminder(workdir)
+            if _git:
+                refresh.append(_git)
+        except Exception:
+            pass
+        try:
+            _plan = plan_prompt(db, task.id)
+            if _plan:
+                refresh.append(_plan)
+        except Exception:
+            pass
+        call_messages = strip_old_outputs(fit(messages, _budget))
+        if refresh:
+            call_messages = call_messages + [
+                {
+                    "role": "user",
+                    "content": "Context refresh:\n" + "\n\n".join(refresh)[:2000],
+                }
+            ]
+        try:
+            resp = llm.tool_call(call_messages, tool_specs())
         except ProviderError as e:
             loop_error = str(e)[:500]
             break
@@ -240,7 +309,9 @@ def engineer_issue(db: Session, task: Task, workdir: Path, llm: LLMProvider) -> 
         if not native_calls:
             break
 
-        # Parse args once, then run batch (read-only parallel, writes sequential).
+        # Parse args once. Special tools (task/write_todos) need loop context
+        # and run inline; plain tools batch (read-only parallel, writes sequential).
+        _SPECIAL = {"task", "write_todos"}
         parsed: list[tuple[str, dict, dict]] = []
         for call, native in zip(valid_calls, native_calls):
             try:
@@ -250,7 +321,19 @@ def engineer_issue(db: Session, task: Task, workdir: Path, llm: LLMProvider) -> 
             parsed.append(
                 (call["name"], args if isinstance(args, dict) else {}, native)
             )
-        outs = _run_batch(workdir, [(n, a) for n, a, _ in parsed])
+        plain = [(n, a) for n, a, _ in parsed if n not in _SPECIAL]
+        outs: list[dict] = []
+        plain_outs = _run_batch(workdir, plain) if plain else []
+        pi = 0
+        for name, args, _native in parsed:
+            if name in _SPECIAL:
+                outs.append(
+                    _run_special(db, task, workdir, llm, name, args)
+                    or {"ok": False, "output": "unknown tool"}
+                )
+            else:
+                outs.append(plain_outs[pi])
+                pi += 1
         for (name, _args, native), out in zip(parsed, outs):
             db.add(
                 TaskEvent(

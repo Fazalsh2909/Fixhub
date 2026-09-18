@@ -32,7 +32,8 @@ Proof assets (all real, captured 2026-09-17): [`docs/assets/ui-shell.png`](docs/
 GitHub App (issues read, contents read, PRs write-scoped)
   → Event Gateway (FastAPI /webhooks/github: raw-body HMAC, idempotent on X-GitHub-Delivery)
   → Queue (Redis / in-memory fallback) → Orchestrator (resumable state machine)
-  → Agent Worker (bounded LLM tool loop, max 12 iters) → Sandbox (Docker per task)
+  → Agent Worker (bounded tool loop, max 12 iters, agent-owned plan, read-only
+     explore subagent, budgeted transcript + git reminder) → Sandbox (Docker per task)
   → Verification (repro → regression FAIL→PASS → suite/lint) → Proof of Fix
   → Policy Engine → PR Publisher (VerifiedArtifact only, never default branch)
          ↕                    ↕
@@ -130,7 +131,7 @@ Env: copy `backend/.env.example` → `backend/.env`, set `TOKENROUTER_API_KEY` o
 
 ```
 backend/app/ → main, config, db, metrics, logging, queue, github/ (webhook, api, app_auth, read_client, publisher), repo/ (workspace, clone_guard), intel/, memory/, tools/, llm/, agent/, sandbox/, verify/, policy/, eval/, chat/, review/
-frontend/src/ → App (VS Code shell), components/ (ActivityBar, DirTree, EditorTabs, Terminal, TraceView, VerificationView, ReviewPanel, StatusBar), lib/api, lib/tasks (+tests)
+frontend/src/ → App (VS Code shell), components/ (ActivityBar, DirTree, EditorTabs, Terminal, TraceView, PlanPanel, VerificationView, ReviewPanel, StatusBar), lib/api, lib/tasks (+tests)
 demo/fastapi-jwt/ → JWT 500-vs-401 bug · demo/fastapi-pagination/ → off-by-one bug
 infra/ → docker-compose.yml, sandbox.Dockerfile, main.tf (stub)
 e2e/ → Playwright specs · docs/ → SPEC, architecture, DEMO-RUN, EVAL

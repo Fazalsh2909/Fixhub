@@ -79,6 +79,41 @@ def tool_specs() -> list[ToolSpec]:
                 "required": ["path", "content"],
             },
         ),
+        ToolSpec(
+            "task",
+            "Hand a self-contained exploration question to a read-only explorer with its own context "
+            "and get back its findings. Use this to learn how the codebase works (tracing behaviour, "
+            "locating implementations) so the search costs one answer instead of many tool turns. "
+            "It cannot see this conversation — include every detail it needs. It never edits.",
+            {
+                "type": "object",
+                "properties": {"description": {"type": "string"}},
+                "required": ["description"],
+            },
+        ),
+        ToolSpec(
+            "write_todos",
+            "Record the plan for a multi-step task. Send the WHOLE list every time. "
+            "Keep exactly one task in_progress and update it as you go.",
+            {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "activeForm": {"type": "string"},
+                                "status": {"type": "string"},
+                            },
+                            "required": ["content", "activeForm", "status"],
+                        },
+                    }
+                },
+                "required": ["todos"],
+            },
+        ),
     ]
 
 

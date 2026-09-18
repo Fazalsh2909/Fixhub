@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ActivityBar, { type LeftView } from './components/ActivityBar';
 import DirTree from './components/DirTree';
 import EditorTabs from './components/EditorTabs';
+import PlanPanel from './components/PlanPanel';
 import StatusBar from './components/StatusBar';
 import Terminal from './components/Terminal';
 import TraceView from './components/TraceView';
@@ -755,6 +756,7 @@ export default function App() {
                   </div>
                 )}
                 <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
+                  <PlanPanel events={events} dark={dark} />
                   <TraceView events={events} state={detail?.state} running={running} traceEndRef={traceEndRef} dark={dark} />
                 </div>
               </div>
