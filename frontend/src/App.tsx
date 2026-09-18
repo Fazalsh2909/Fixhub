@@ -487,7 +487,7 @@ export default function App() {
       <header style={{ display: 'flex', gap: 12, alignItems: 'center', padding: '8px 12px', borderBottom: `1px solid ${dark.border}`, background: dark.panel }}>
         <strong>Fixhub</strong>
         <span style={{ color: dark.muted, fontSize: 12 }}>{connLabel}</span>
-        <span style={{ color: dark.muted, fontSize: 12 }}>model: {provider ? `${provider.provider}/${provider.model}${provider.has_key ? '' : ' (no key — verification-only)'}` : '…'}</span>
+        <span style={{ color: dark.muted, fontSize: 12 }}>model: {provider ? `${provider.model}${provider.has_key ? '' : ' (no key — verification-only)'}` : '…'}</span>
         {metrics && (
           <span style={{ color: dark.muted, fontSize: 12 }}>
             · {metrics.total_tokens} tokens · ${metrics.est_cost_usd} · {metrics.tasks_verified}/{metrics.tasks_run} verified
@@ -766,7 +766,7 @@ export default function App() {
       <StatusBar
         branch={detail?.branch ?? ''}
         state={detail ? `Task #${detail.id} · ${detail.state}` : 'idle'}
-        model={provider ? `${provider.provider}/${provider.model}` : '…'}
+        model={provider ? `${provider.provider} · ${provider.model}` : '…'}
         tokens={metrics ? `${metrics.total_tokens} tokens · $${metrics.est_cost_usd}` : ''}
         connected={ghStatus ? (ghStatus.app_configured ? `App ✓ · ${ghStatus.connected_repos}` : 'App not configured') : 'offline'}
         language={openPath ? languageFor(openPath) : 'plaintext'}

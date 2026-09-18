@@ -54,7 +54,11 @@ class Settings(BaseSettings):
     # Model ids carry vendor prefix, e.g. minimax/minimax-m3. Key is sk-xt-...
     xkiro_base_url: str = "https://api.xkiro.com/v1"
     xkiro_api_key: str = ""
-    fixhub_model: str = "z-ai/glm-5.3-free"
+    # Model id (already vendor-prefixed, e.g. minimax/minimax-m3:free).
+    # NEXUS_MODEL is accepted as a fallback alias (old .env name) — FIXHUB_MODEL wins.
+    # NOTE: restart uvicorn after editing backend/.env; the running server keeps old values.
+    fixhub_model: str = ""
+    nexus_model: str = ""
     default_branch_guard: str = "main"
     sandbox_image: str = "python:3.11-slim"
     sandbox_timeout_s: int = 300
@@ -81,14 +85,21 @@ class Settings(BaseSettings):
     # via the same enqueue/dequeue/ack interface (see queue.py docstring).
     queue_backend: str = "auto"
 
+    def resolved_model(self) -> str:
+        """Model id to send. FIXHUB_MODEL > NEXUS_MODEL alias > built-in default."""
+        return (
+            self.fixhub_model.strip() or self.nexus_model.strip() or "z-ai/glm-5.3-free"
+        )
+
     def resolved_llm(self) -> tuple[str, str, str]:
         """Return (base_url, api_key, model) for the selected provider."""
+        model = self.resolved_model()
         if self.llm_provider in ("experiential", "explabs"):
-            return self.explabs_base_url, self.explabs_api_key, self.fixhub_model
+            return self.explabs_base_url, self.explabs_api_key, model
         if self.llm_provider == "bynara":
-            return self.bynara_base_url, self.bynara_api_key, self.fixhub_model
+            return self.bynara_base_url, self.bynara_api_key, model
         if self.llm_provider == "xkiro":
-            return self.xkiro_base_url, self.xkiro_api_key, self.fixhub_model
+            return self.xkiro_base_url, self.xkiro_api_key, model
         if self.llm_provider == "openai" or self.openai_api_key:
             if (
                 self.openai_api_key
@@ -96,10 +107,10 @@ class Settings(BaseSettings):
                 and not self.tokenrouter_api_key
             ):
                 # Auto-prefer OpenAI when only it is configured.
-                return self.openai_base_url, self.openai_api_key, self.fixhub_model
+                return self.openai_base_url, self.openai_api_key, model
             if self.llm_provider == "openai":
-                return self.openai_base_url, self.openai_api_key, self.fixhub_model
-        return self.tokenrouter_base_url, self.tokenrouter_api_key, self.fixhub_model
+                return self.openai_base_url, self.openai_api_key, model
+        return self.tokenrouter_base_url, self.tokenrouter_api_key, model
 
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
