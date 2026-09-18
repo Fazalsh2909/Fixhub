@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from ..llm.base import ToolSpec
+from ..sandbox.docker_runner import run_in_sandbox
 
 ALLOWED_PREFIXES = (
     "pytest",
@@ -134,15 +135,5 @@ def run_command(workdir: Path, cmd: str, timeout: int = 180) -> dict:
         return {"ok": False, "output": "denied by tool policy"}
     if not cmd.startswith(ALLOWED_PREFIXES):
         return {"ok": False, "output": f"command not allow-listed: {cmd[:80]}"}
-    try:
-        p = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return {"ok": p.returncode == 0, "output": (p.stdout + p.stderr)[-8000:]}
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "output": "timeout"}
+    # Agent commands must execute inside the isolated sandbox, never on the API host.
+    return run_in_sandbox(workdir, cmd, timeout=timeout, require_isolation=True)
