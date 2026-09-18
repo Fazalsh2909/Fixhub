@@ -1,27 +1,39 @@
-"""Queue worker: dequeues jobs, resumes task via orchestrator. Stub loop for scaffold."""
+"""Durable worker for autonomous Fixhub tasks."""
 
-from ..db import SessionLocal
-from ..queue import dequeue
+from __future__ import annotations
+
+import logging
+
+from ..automation import run_task_sync
+from ..db import init_db
+from ..queue import ack, backend, dequeue, recover_processing
+
+log = logging.getLogger("fixhub.worker")
 
 
 def main() -> None:
-    print("fixhub worker: waiting for jobs (Ctrl-C to stop)")
+    init_db()
+
+    recovered = recover_processing()
+    if recovered:
+        log.warning("requeued %d task(s) left by a previous worker", recovered)
+
+    log.info("fixhub worker started (backend=%s)", backend())
+
     while True:
         job = dequeue(timeout=5)
         if job is None:
             continue
-        print(f"got job: {job}")
-        db = SessionLocal()
-        try:
-            from ..models import Task
 
-            task = db.query(Task).filter_by(id=job["task_id"]).first()
-            if task:
-                print(
-                    f"task {task.id} state={task.state} (agent run wired in api/demo path; worker picks up queue jobs next)"
-                )
-        finally:
-            db.close()
+        task_id = int(job["task_id"])
+        try:
+            result = run_task_sync(task_id, force=False)
+            log.info("task %s completed: %s", task_id, result)
+            ack(job)
+        except Exception:
+            # Leave the Redis job in the processing list. A worker restart will
+            # recover it instead of silently losing the task.
+            log.exception("task %s failed; leaving job for recovery", task_id)
 
 
 if __name__ == "__main__":
