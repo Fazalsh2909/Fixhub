@@ -8,11 +8,18 @@ AgentMessage rows; only the recent slice is sent to the model.
 Edits apply directly to the repo workdir (like a local coding agent) through
 the same jailed tools + sandbox as the issue agent. GitHub stays gated:
 pushing a PR still requires the Approve flow on a verified task.
+
+What the UI renders per turn (the opencode feel): the assistant's thinking
+(reasoning_content when the provider exposes it), one row per tool call with
+its args, duration and — for edits — a diff preview, plus the agent-owned
+plan (write_todos) as a checklist. All of it rides on AgentMessage rows so
+any client (batched POST or the live SSE stream) sees the same timeline.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -25,6 +32,8 @@ SESSION_SYSTEM = """You are Fixhub's coding agent, working inside the user's rep
 Work like this: understand the request, investigate with list_files/read_file/search_code (or hand a self-contained question to the task explorer), make the smallest edit that does the job with edit_file, then verify by running the tests with run_command (e.g. {"cmd": "python -m pytest -q"}).
 
 Rules:
+- Think out loud briefly before acting — one or two sentences on what you will do and why.
+- For multi-step work keep a plan with write_todos (whole list each time, exactly one in_progress) and update it as you go.
 - Edits apply immediately — say what you changed and what the tests said.
 - Never claim a fix without running something that proves it.
 - Keep answers short. File paths with line numbers, not essays.
@@ -45,6 +54,8 @@ def _transcript(db: Session, session: AgentSession) -> list[dict]:
     )
     messages: list[dict] = [{"role": "system", "content": SESSION_SYSTEM}]
     for r in reversed(rows):
+        if r.role == "plan":
+            continue  # agent-owned plan lives outside the transcript; re-injected as context
         if r.role == "tool":
             try:
                 call_id = _json.loads(r.extra or "{}").get(
@@ -111,15 +122,38 @@ def _changed_files(workdir: Path) -> list[str]:
         return []
 
 
+def _run_batch_timed(
+    workdir: Path, calls: list[tuple[str, dict]]
+) -> list[tuple[dict, int]]:
+    """Same dispatch as orchestrator._run_batch, plus per-tool duration_ms."""
+    from .orchestrator import _READ_ONLY, _execute_tool
+
+    def _one(nc: tuple[str, dict]) -> tuple[dict, int]:
+        start = time.monotonic()
+        try:
+            out = _execute_tool(workdir, nc[0], nc[1])
+        except Exception as e:  # interactive turn must never die on one tool
+            out = {"ok": False, "output": f"tool crashed: {e}"}
+        return out, int((time.monotonic() - start) * 1000)
+
+    if len(calls) > 1 and all(name in _READ_ONLY for name, _ in calls):
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(4, len(calls))) as ex:
+            return list(ex.map(_one, calls))
+    return [_one(nc) for nc in calls]
+
+
 def message_dict(m) -> dict:
-    """API shape for one AgentMessage. Args come from extra (best-effort)."""
-    args: dict = {}
+    """API shape for one AgentMessage. Args/thinking/timing come from extra."""
     try:
         import json as _json
 
-        args = _json.loads(m.extra or "{}").get("arguments", {}) or {}
+        extra = _json.loads(m.extra or "{}") or {}
     except Exception:
-        args = {}
+        extra = {}
+    args = extra.get("arguments", {}) or {}
+    todos = extra.get("todos", []) if m.role == "plan" else []
     return {
         "id": m.id,
         "role": m.role,
@@ -127,7 +161,73 @@ def message_dict(m) -> dict:
         "args": args,
         "content": m.content,
         "ok": m.ok,
+        # Opencode-style timeline fields (best-effort; missing on old rows).
+        "thinking": extra.get("reasoning", "") or "",
+        "duration_ms": extra.get("duration_ms", 0) or 0,
+        "diff": extra.get("diff", "") or "",
+        "todos": todos,
     }
+
+
+def latest_plan(db: Session, session: AgentSession) -> list[dict]:
+    """Newest agent-owned plan for a session. [] when none written yet."""
+    row = (
+        db.query(AgentMessage)
+        .filter_by(session_id=session.id, role="plan")
+        .order_by(AgentMessage.id.desc())
+        .first()
+    )
+    if row is None:
+        return []
+    try:
+        import json as _json
+
+        todos = _json.loads(row.extra or "{}").get("todos", [])
+        return todos if isinstance(todos, list) else []
+    except Exception:
+        return []
+
+
+def save_plan(db: Session, session: AgentSession, todos: list[dict]) -> dict:
+    """Replace the session plan. Only the newest plan row is kept."""
+    from .plan import _validate, plan_prompt_text
+
+    if not isinstance(todos, list):
+        return {"ok": False, "output": "todos must be a list"}
+    err = _validate(todos)
+    if err:
+        return {"ok": False, "output": err}
+    db.query(AgentMessage).filter_by(session_id=session.id, role="plan").delete()
+    clean = [
+        {
+            "content": str(t.get("content", ""))[:200],
+            "activeForm": str(t.get("activeForm", t.get("content", "")))[:200],
+            "status": t.get("status", "pending"),
+        }
+        for t in todos
+    ]
+    prompt = plan_prompt_text(clean)
+    if clean:
+        db.add(
+            AgentMessage(
+                session_id=session.id,
+                role="plan",
+                content=prompt[:2000],
+                ok=True,
+                extra=json.dumps({"todos": clean}),
+            )
+        )
+    db.commit()
+    return {"ok": True, "output": prompt or "Todo list cleared."}
+
+
+def plan_block(db: Session, session: AgentSession) -> str:
+    todos = latest_plan(db, session)
+    if not todos:
+        return ""
+    from .plan import plan_prompt_text
+
+    return "Plan:\n" + plan_prompt_text(todos)
 
 
 def run_session_turn(
@@ -143,7 +243,6 @@ def run_session_turn(
     from ..metrics import record_tool_call
     from ..metrics import snapshot as _metrics_snapshot
     from .context import fit, git_reminder, strip_old_outputs
-    from .orchestrator import _run_batch
     from .subagent import explore
 
     new_rows: list[AgentMessage] = []
@@ -180,6 +279,11 @@ def run_session_turn(
                 call_messages = call_messages + [
                     {"role": "user", "content": "Context refresh:\n" + git[:1200]}
                 ]
+            plan = plan_block(db, session)
+            if plan:
+                call_messages = call_messages + [
+                    {"role": "user", "content": "Context refresh:\n" + plan[:1200]}
+                ]
             resp = llm.tool_call(call_messages, tool_specs())
         except ProviderError as e:
             error = str(e)[:500]
@@ -202,7 +306,9 @@ def run_session_turn(
                     "function": {"name": call["name"], "arguments": arg_str},
                 }
             )
-        assistant_row.extra = json.dumps({"tool_calls": native})
+        assistant_row.extra = json.dumps(
+            {"tool_calls": native, "reasoning": resp.reasoning or ""}
+        )
         db.commit()
         if not native:
             status = "done"
@@ -218,9 +324,10 @@ def run_session_turn(
                 (call["name"], args if isinstance(args, dict) else {}, nat["id"])
             )
         plain = [(n, a) for n, a, _ in parsed if n not in ("task", "write_todos")]
-        plain_outs = _run_batch(workdir, plain) if plain else []
+        timed = _run_batch_timed(workdir, plain) if plain else []
         pi = 0
         for name, args, tool_id in parsed:
+            duration_ms = 0
             if name == "task":
                 question = str(args.get("description", ""))[:2000]
                 if not question.strip():
@@ -230,19 +337,22 @@ def run_session_turn(
                         turns = int(getattr(_settings, "subagent_max_turns", 6) or 6)
                     except Exception:
                         turns = 6
+                    start = time.monotonic()
                     out = {
                         "ok": True,
                         "output": explore(workdir, question, llm, max_turns=turns)[
                             :4000
                         ],
                     }
+                    duration_ms = int((time.monotonic() - start) * 1000)
             elif name == "write_todos":
-                out = {
-                    "ok": False,
-                    "output": "plans belong to issue tasks — just do the work here",
-                }
+                start = time.monotonic()
+                out = save_plan(
+                    db, session, args.get("todos", []) if isinstance(args, dict) else []
+                )
+                duration_ms = int((time.monotonic() - start) * 1000)
             else:
-                out = plain_outs[pi]
+                out, duration_ms = timed[pi]
                 pi += 1
             try:
                 record_tool_call()
@@ -256,7 +366,14 @@ def run_session_turn(
                     str(out.get("output", ""))[:8000],
                     tool=name,
                     ok=bool(out.get("ok")),
-                    extra=json.dumps({"tool_call_id": tool_id, "arguments": args}),
+                    extra=json.dumps(
+                        {
+                            "tool_call_id": tool_id,
+                            "arguments": args,
+                            "duration_ms": duration_ms,
+                            "diff": str(out.get("diff", ""))[:4000],
+                        }
+                    ),
                 )
             )
         status = "paused"
@@ -270,4 +387,5 @@ def run_session_turn(
         "messages": [message_dict(m) for m in new_rows],
         "changed_files": _changed_files(workdir),
         "tokens_used": tokens_used,
+        "plan": latest_plan(db, session),
     }

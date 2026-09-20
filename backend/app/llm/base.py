@@ -18,6 +18,10 @@ class LLMResponse:
     text: str = ""
     tool_calls: list[dict] = field(default_factory=list)
     usage: dict = field(default_factory=dict)
+    # Reasoning/thinking trace when the provider exposes it
+    # (e.g. reasoning_content). Shown in the UI as a Thought block —
+    # never treated as the answer.
+    reasoning: str = ""
 
 
 class LLMProvider(ABC):

@@ -152,7 +152,8 @@ def edit_file(workdir: Path, path: str, old_string: str, new_string: str) -> dic
                 "output": f"edit rejected: result is not valid Python ({e})",
             }
     target.write_text(updated, encoding="utf-8")
-    return {"ok": True, "output": f"edited {path}"}
+    diff = _unified_diff(path, text, updated)
+    return {"ok": True, "output": f"edited {path}", "diff": diff}
 
 
 def create_file(workdir: Path, path: str, content: str) -> dict:
@@ -164,9 +165,26 @@ def create_file(workdir: Path, path: str, content: str) -> dict:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        return {"ok": True, "output": f"created {path}"}
+        diff = "\n".join(f"+{line}" for line in content.splitlines())[:4000]
+        return {"ok": True, "output": f"created {path}", "diff": diff}
     except OSError as e:
         return {"ok": False, "output": f"write failed: {e}"}
+
+
+def _unified_diff(path: str, before: str, after: str, max_chars: int = 4000) -> str:
+    """Small unified diff for UI display. Display-only — never parsed."""
+    import difflib
+
+    lines = list(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
+        )
+    )
+    return "\n".join(lines)[:max_chars]
 
 
 def run_command(workdir: Path, cmd: str, timeout: int = 180) -> dict:

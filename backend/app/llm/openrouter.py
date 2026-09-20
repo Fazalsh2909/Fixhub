@@ -144,10 +144,14 @@ class OpenRouterProvider(LLMProvider):
             record_llm_call(self.model, usage, 0)
         except Exception:
             pass
+        reasoning = msg.get("reasoning_content") or ""
+        if not isinstance(reasoning, str):
+            reasoning = str(reasoning)
         return LLMResponse(
             text=self._text_of(msg),
             tool_calls=calls,
             usage=usage,
+            reasoning=reasoning,
         )
 
 
