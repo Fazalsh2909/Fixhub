@@ -12,6 +12,8 @@ type Props = {
 };
 
 export default function DirTree({ node, depth, expanded, onToggle, openPath, onOpen, dark }: Props): React.JSX.Element {
+  void dark;
+  void formatBytes;
   return (
     <>
       {node.dirs.map((d) => {
@@ -20,11 +22,15 @@ export default function DirTree({ node, depth, expanded, onToggle, openPath, onO
           <div key={d.path}>
             <div
               onClick={() => onToggle(d.path)}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(d.path); } }}
+              tabIndex={0}
+              role="treeitem"
+              aria-expanded={isOpen}
               title={d.path}
-              style={{ padding: '3px 8px', paddingLeft: 8 + depth * 12, borderRadius: 4, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 600 }}
+              style={{ padding: '4px 8px', paddingLeft: 8 + depth * 12, borderRadius: 6, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 600, color: 'var(--fh-text-2)' }}
             >
-              <span style={{ color: dark.muted, marginRight: 6, display: 'inline-block', width: 12 }}>{isOpen ? '▾' : '▸'}</span>
-              <span style={{ marginRight: 6 }}>📁</span>{d.name}
+              <span style={{ color: 'var(--fh-muted)', marginRight: 6, display: 'inline-block', width: 12 }} aria-hidden="true">{isOpen ? '▾' : '▸'}</span>
+              <span style={{ marginRight: 6, color: 'var(--fh-info)' }} aria-hidden="true">▸</span>{d.name}
             </div>
             {isOpen && (
               <DirTree node={d} depth={depth + 1} expanded={expanded} onToggle={onToggle} openPath={openPath} onOpen={onOpen} dark={dark} />
@@ -34,10 +40,20 @@ export default function DirTree({ node, depth, expanded, onToggle, openPath, onO
       })}
       {node.files.map((f) => {
         const name = f.path.split('/').pop() ?? f.path;
+        const active = f.path === openPath;
+        const important = /test|spec|auth|jwt|middleware|verify|main\.py|App\.tsx/i.test(f.path);
         return (
-          <div key={f.path} onClick={() => onOpen(f.path)} title={`${f.path} · ${formatBytes(f.size)}`}
-            style={{ padding: '3px 8px', paddingLeft: 8 + depth * 12 + 18, borderRadius: 4, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', background: f.path === openPath ? '#1f6feb33' : 'transparent' }}>
-            <span style={{ color: dark.muted, marginRight: 6 }}>📄</span>{name}
+          <div
+            key={f.path}
+            onClick={() => onOpen(f.path)}
+            onKeyDown={(e) => { if (e.key === 'Enter') onOpen(f.path); }}
+            tabIndex={0}
+            role="treeitem"
+            aria-selected={active}
+            title={f.path}
+            style={{ padding: '4px 8px', paddingLeft: 8 + depth * 12 + 18, borderRadius: 6, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', background: active ? 'rgba(74,168,255,0.12)' : 'transparent', borderLeft: important ? '2px solid rgba(74,168,255,0.35)' : '2px solid transparent', color: active ? 'var(--fh-text)' : 'var(--fh-text-2)' }}
+          >
+            <span className="mono" style={{ color: active ? 'var(--fh-info)' : 'var(--fh-muted)', marginRight: 6 }} aria-hidden="true">{name.endsWith('.py') ? 'py' : name.endsWith('.tsx') || name.endsWith('.ts') ? 'ts' : '··'}</span>{name}
           </div>
         );
       })}

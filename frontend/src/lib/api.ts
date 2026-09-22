@@ -144,13 +144,19 @@ export const api = {
     }).then(json<AgentTurn>),
 };
 
+export type AgentTodo = { content: string; activeForm: string; status: string };
+
 export type AgentMessage = {
   id: number;
-  role: 'user' | 'assistant' | 'tool';
+  role: 'user' | 'assistant' | 'tool' | 'plan';
   tool: string;
   args: Record<string, unknown>;
   content: string;
   ok: boolean;
+  thinking?: string;
+  duration_ms?: number;
+  diff?: string;
+  todos?: AgentTodo[];
 };
 
 export type AgentSessionDetail = {
@@ -167,4 +173,73 @@ export type AgentTurn = {
   messages: AgentMessage[];
   changed_files: string[];
   tokens_used: number;
+  plan?: AgentTodo[];
 };
+
+export type StreamDone = {
+  status: 'done' | 'paused' | 'failed';
+  error: string | null;
+  changed_files: string[];
+  tokens_used: number;
+  plan?: AgentTodo[];
+};
+
+/** Live SSE stream of one bounded turn. Resolves on the `done` event. */
+export function streamAgentTurn(
+  id: number,
+  content: string,
+  maxTurns: number,
+  onRow: (m: AgentMessage) => void,
+  signal?: { cancelled: boolean },
+): Promise<StreamDone> {
+  return new Promise((resolve, reject) => {
+    const token =
+      typeof localStorage !== 'undefined'
+        ? localStorage.getItem('fixhub_api_token') || ''
+        : '';
+    const url =
+      `/api/agent/sessions/${id}/stream?content=${encodeURIComponent(content)}` +
+      `&max_turns=${maxTurns}` +
+      (token ? `&token=${encodeURIComponent(token)}` : '');
+    const es = new EventSource(url);
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (!settled) {
+        settled = true;
+        es.close();
+        fn();
+      }
+    };
+    es.addEventListener('message', (ev) => {
+      try {
+        onRow(JSON.parse((ev as MessageEvent).data) as AgentMessage);
+      } catch {
+        /* keep streaming on malformed rows */
+      }
+    });
+    es.addEventListener('done', (ev) => {
+      finish(() => {
+        try {
+          resolve(JSON.parse((ev as MessageEvent).data) as StreamDone);
+        } catch {
+          reject(new Error('bad stream finale'));
+        }
+      });
+    });
+    es.onerror = () => {
+      if (signal?.cancelled) {
+        finish(() => resolve({ status: 'paused', error: null, changed_files: [], tokens_used: 0 }));
+      } else {
+        finish(() => reject(new Error('agent stream failed — is the backend on :8001?')));
+      }
+    };
+    if (signal) {
+      const tick = window.setInterval(() => {
+        if (signal.cancelled) {
+          window.clearInterval(tick);
+          finish(() => resolve({ status: 'paused', error: null, changed_files: [], tokens_used: 0 }));
+        }
+      }, 200);
+    }
+  });
+}

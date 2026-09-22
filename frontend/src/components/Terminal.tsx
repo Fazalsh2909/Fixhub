@@ -33,7 +33,7 @@ export default function Terminal({ repo, dark }: { repo: string; dark: Record<st
           <div style={{ color: dark.muted }}>Sandboxed terminal — allow-listed only: pytest, ruff, mypy, tsc, git, ls, cat. Same Docker sandbox the agent uses.</div>
         )}
         {history.map((l, i) => (
-          <div key={i} style={{ marginBottom: 8 }}>
+          <div key={i} className="fh-rise" style={{ animationDelay: `${Math.min(i, 12) * 60}ms`, marginBottom: 8 }}>
             <div style={{ color: dark.green }}>$ {l.cmd}</div>
             <pre style={{ whiteSpace: 'pre-wrap', color: l.ok ? dark.text : dark.red, margin: '2px 0 0' }}>{l.output.slice(0, 3000)}</pre>
           </div>

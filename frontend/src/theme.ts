@@ -19,15 +19,19 @@ export const PIPELINE = [
 ];
 
 export const dark: Record<string, string> = {
-  bg: '#0d1117',
-  panel: '#161b22',
-  border: '#30363d',
-  text: '#e6edf3',
-  muted: '#8b949e',
-  accent: '#2f81f7',
+  bg: '#0a0d12',
+  panel: '#131a23',
+  border: '#28323f',
+  text: '#e8eef4',
+  muted: '#9aa7b4',
+  accent: '#4aa8ff',
   green: '#3fb950',
-  red: '#f85149',
-  yellow: '#d29922',
+  red: '#f05548',
+  yellow: '#d9a021',
+  // Restrained technical accent — plan/subagent lanes only.
+  violet: '#8b7ff0',
+  violetDim: 'rgba(139,127,240,0.25)',
+  glassBorder: '#ffffff14',
 };
 
 export function languageFor(path: string): string {

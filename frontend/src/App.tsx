@@ -1,26 +1,48 @@
-/** Fixhub — VS Code-style shell around the autonomous fix agent.
- * Explorer + tabbed Monaco editor (same workdir the agent uses), right-side
- * Chat / Terminal / Claude Code panel, bottom verification panel.
- * No fabricated results — every PASS comes from backend verification rows,
- * and nothing touches GitHub until you Approve & Commit a REVIEWING diff.
+/** FixHub — autonomous engineering IDE.
+ * VS Code-grade shell: activity bar + resizable left sidebar + center editor
+ * + resizable right Chat/Terminal/AI panel + resizable bottom panel.
+ * Every status derives from real backend state. No fake runs, no fake PASS.
  */
 import Editor from '@monaco-editor/react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ActivityBar, { type LeftView } from './components/ActivityBar';
-import AgentPanel from './components/AgentPanel';
-import DirTree from './components/DirTree';
 import EditorTabs from './components/EditorTabs';
+import IssueCard from './components/issue/IssueCard';
 import PlanPanel from './components/PlanPanel';
 import StatusBar from './components/StatusBar';
-import Terminal from './components/Terminal';
-import TraceView from './components/TraceView';
-import VerificationView from './components/VerificationView';
+import ActivityStream from './components/activity/ActivityStream';
+import DiffView from './components/diff/DiffView';
+import PrPanel from './components/github/PrPanel';
+import RepoIntel from './components/intel/RepoIntel';
+import TopBar from './components/layout/TopBar';
+import LeftSidebar, { type GhIssue } from './components/layout/LeftSidebar';
+import RightPanel, { type RightTab } from './components/layout/RightPanel';
+import BottomPanel, { type BottomTab } from './components/layout/BottomPanel';
+import Resizer from './components/layout/Resizer';
+import MemoryPanel from './components/memory/MemoryPanel';
+import TaskPipeline from './components/pipeline/TaskPipeline';
+import ProofPanel from './components/proof/ProofPanel';
+import SystemGraph from './components/system/SystemGraph';
+import { Badge, EmptyState, LoadingState } from './components/ui/ui';
+import VerificationCenter from './components/verify/VerificationCenter';
 import { api, type ConnectedRepo, type GhStatus } from './lib/api';
+import { diffStats, parseDiff } from './lib/diff';
+import { IDE_DEFAULTS, usePersistedState, useResize } from './lib/ide';
+import { derivePipeline } from './lib/pipeline';
 import { formatTaskLabel, isTerminalState, verificationSummary, type AutomationStatus, type Metrics, type TaskDetail, type TaskSummary } from './lib/tasks';
 import { buildTree, parentDirs } from './lib/files';
-import { DEMO_CODE, dark, formatBytes, languageFor } from './theme';
+import { DEMO_CODE, dark, languageFor } from './theme';
 
-type RightTab = 'agent' | 'terminal' | 'tasks';
+type CenterTab = 'editor' | 'issue' | 'diff' | 'proof' | 'intel' | 'task';
+
+const CENTER_TABS: { id: CenterTab; label: string }[] = [
+  { id: 'editor', label: 'Editor' },
+  { id: 'issue', label: 'Issue' },
+  { id: 'diff', label: 'Diff' },
+  { id: 'proof', label: 'Proof of Fix' },
+  { id: 'intel', label: 'Intel' },
+  { id: 'task', label: 'Task' },
+];
 
 export default function App() {
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
@@ -28,14 +50,21 @@ export default function App() {
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [running, setRunning] = useState(false);
   const [runError, setRunError] = useState('');
-  const [bottomTab, setBottomTab] = useState<'tests' | 'diff' | 'proof'>('tests');
-  const [rightTab, setRightTab] = useState<RightTab>('agent');
-  const [leftView, setLeftView] = useState<LeftView>('explorer');
+  // ---- persisted IDE state (survives reload, never conflicts with backend) ----
+  const [leftView, setLeftView] = usePersistedState<LeftView>('fh-ide-left-view', 'explorer');
+  const [rightTab, setRightTab] = usePersistedState<RightTab>('fh-ide-right-tab', 'engineer');
+  const [bottomTab, setBottomTab] = usePersistedState<BottomTab>('fh-ide-bottom-tab', 'verification');
+  const [centerTab, setCenterTab] = usePersistedState<CenterTab>('fh-ide-center-tab', 'editor');
+  const [leftWidth, setLeftWidth] = usePersistedState('fh-ide-left-w', IDE_DEFAULTS.leftWidth);
+  const [rightWidth, setRightWidth] = usePersistedState('fh-ide-right-w', IDE_DEFAULTS.rightWidth);
+  const [bottomHeight, setBottomHeight] = usePersistedState('fh-ide-bottom-h', IDE_DEFAULTS.bottomHeight);
+  const [leftCollapsed, setLeftCollapsed] = usePersistedState('fh-ide-left-collapsed', false);
+  const [rightCollapsed, setRightCollapsed] = usePersistedState('fh-ide-right-collapsed', false);
+  const [bottomCollapsed, setBottomCollapsed] = usePersistedState('fh-ide-bottom-collapsed', false);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [provider, setProvider] = useState<{ provider: string; model: string; has_key: boolean } | null>(null);
   const [automation, setAutomation] = useState<AutomationStatus | null>(null);
 
-  // GitHub connection state
   const [ghStatus, setGhStatus] = useState<GhStatus | null>(null);
   const [repos, setRepos] = useState<ConnectedRepo[]>([]);
   const [selectedRepo, setSelectedRepo] = useState('');
@@ -43,10 +72,10 @@ export default function App() {
   const [cloneUrl, setCloneUrl] = useState('');
   const [taskTitle, setTaskTitle] = useState('');
   const [notice, setNotice] = useState('');
+  const [issues, setIssues] = useState<GhIssue[]>([]);
+  const [issuesLoading, setIssuesLoading] = useState(false);
+  const [issuesError, setIssuesError] = useState('');
 
-  // Chat state lives in AgentPanel (session-based coding agent).
-
-  // VS Code-like explorer + tabbed editor (same workdir the agent uses)
   const [repoFiles, setRepoFiles] = useState<{ path: string; size: number }[]>([]);
   const [filesRoot, setFilesRoot] = useState('');
   const [filesLoading, setFilesLoading] = useState(false);
@@ -66,6 +95,11 @@ export default function App() {
   const tabCache = useRef<Record<string, { content: string; saved: string; truncated: boolean }>>({});
   const traceEndRef = useRef<HTMLDivElement>(null);
 
+  // ---- resizable surfaces (flex layout: center auto-adjusts) ----
+  const leftResize = useResize(leftWidth, setLeftWidth, { min: IDE_DEFAULTS.leftMin, max: IDE_DEFAULTS.leftMax, dir: 'x' });
+  const rightResize = useResize(rightWidth, setRightWidth, { min: IDE_DEFAULTS.rightMin, max: IDE_DEFAULTS.rightMax, dir: 'x', invert: true });
+  const bottomResize = useResize(bottomHeight, setBottomHeight, { min: IDE_DEFAULTS.bottomMin, max: IDE_DEFAULTS.bottomMax, dir: 'y', invert: true });
+
   const refreshTasks = useCallback(async () => {
     try {
       const list = await api.tasks();
@@ -78,8 +112,6 @@ export default function App() {
     try {
       const [s, c] = await Promise.all([api.ghStatus(), api.connected()]);
       setGhStatus(s);
-      // Merge live installation repos (from GitHub) with local inventory so
-      // install-time repos are visible + connectable before first connect.
       const merged = [...c.repositories];
       const byName = new Map(merged.map((r) => [r.full_name, r]));
       const inst = installationId.trim();
@@ -90,18 +122,12 @@ export default function App() {
             const local = byName.get(r.full_name);
             if (local) local.connected = local.connected || r.connected;
             else {
-              const row = {
-                id: 0,
-                full_name: r.full_name,
-                connected: r.connected,
-                clone_url: '',
-                has_workspace: false,
-              };
+              const row = { id: 0, full_name: r.full_name, connected: r.connected, clone_url: '', has_workspace: false };
               byName.set(r.full_name, row);
               merged.push(row);
             }
           }
-        } catch { /* bad id / expired token — local list still shows */ }
+        } catch { /* bad id / expired token */ }
       }
       setRepos(merged);
       if (s.installations.length > 0 && !installationId) {
@@ -119,7 +145,6 @@ export default function App() {
     api.automation().then(setAutomation).catch(() => {});
   }, []);
 
-  // Poll selected task while non-terminal or a run is in flight.
   useEffect(() => {
     if (selectedId == null) return;
     let stop = false;
@@ -142,7 +167,19 @@ export default function App() {
     return () => { stop = true; if (timer) window.clearInterval(timer); };
   }, [selectedId]);
 
-  // File tree for the selected repo — same workdir the agent edits.
+  // Live GitHub issues for the selected repo (localhost-safe poll fallback).
+  useEffect(() => {
+    if (!selectedRepo || !installationId.trim()) { setIssues([]); setIssuesError(''); return; }
+    let stop = false;
+    setIssuesLoading(true);
+    setIssuesError('');
+    api.ghIssues(selectedRepo, installationId.trim())
+      .then((r) => { if (!stop) setIssues(r.issues); })
+      .catch((e) => { if (!stop) { setIssues([]); setIssuesError(e instanceof Error ? e.message : 'issues failed'); } })
+      .finally(() => { if (!stop) setIssuesLoading(false); });
+    return () => { stop = true; };
+  }, [selectedRepo, installationId]);
+
   const refreshFiles = useCallback(async () => {
     if (!selectedRepo) { setRepoFiles([]); setFilesRoot(''); return; }
     setFilesLoading(true);
@@ -161,7 +198,6 @@ export default function App() {
 
   useEffect(() => { refreshFiles(); }, [refreshFiles]);
 
-  // Reset tabs when switching repos.
   useEffect(() => {
     tabCache.current = {};
     setOpenTabs([]);
@@ -282,18 +318,12 @@ export default function App() {
     return c ? c.content !== c.saved : false;
   }
 
-  // Auto-open the first source file so the editor is never an empty shell.
   useEffect(() => {
     if (openPath || repoFiles.length === 0) return;
     const first = repoFiles.find((f) => f.path.endsWith('.py')) ?? repoFiles[0];
     if (first) openFile(first.path);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repoFiles]);
-
-  // Keep the tasks trace pinned to the latest step while a run is live.
-  useEffect(() => {
-    if (rightTab === 'tasks') traceEndRef.current?.scrollIntoView({ block: 'end' });
-  }, [detail?.events.length, rightTab]);
 
   const saveOpenFile = useCallback(async () => {
     if (!selectedRepo || !openPath) return;
@@ -316,7 +346,6 @@ export default function App() {
   const saveRef = useRef(saveOpenFile);
   saveRef.current = saveOpenFile;
 
-  // Ctrl/Cmd+S saves the open file, VS Code style.
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
@@ -333,7 +362,8 @@ export default function App() {
   async function startFix() {
     setRunning(true);
     setRunError('');
-    setRightTab('tasks');
+    setRightTab('engineer');
+    if (rightCollapsed) setRightCollapsed(false);
     try {
       const data = await api.trigger();
       if (data.error) {
@@ -356,7 +386,7 @@ export default function App() {
     if (selectedId == null) return;
     setRunning(true);
     setRunError('');
-    setRightTab('tasks');
+    setRightTab('engineer');
     try {
       const res = await api.runTask(selectedId);
       const d = await api.task(selectedId);
@@ -377,6 +407,8 @@ export default function App() {
       setNotice(res.pr_url ? `Committed + PR opened: ${res.pr_url}` : `Approved on branch ${res.branch}. ${res.note ?? ''}`);
       const d = await api.task(selectedId);
       setDetail(d);
+      setBottomTab('proof');
+      if (bottomCollapsed) setBottomCollapsed(false);
     } catch (e) {
       setRunError(e instanceof Error ? e.message : 'approve failed');
     }
@@ -428,15 +460,29 @@ export default function App() {
     try {
       const res = await api.createTask(selectedRepo, taskTitle.trim());
       setNotice(res.launched === 'started'
-        ? `Task #${res.task_id} created and running — watch the agent panel.`
-        : `Task #${res.task_id} created — Run it from the Run view, then review the diff.`);
+        ? `Task #${res.task_id} created and running — watch the engineer panel.`
+        : `Task #${res.task_id} created — Run it from the engineer panel, then review the diff.`);
       setTaskTitle('');
       await refreshTasks();
       setSelectedId(res.task_id);
       if (res.launched === 'started') {
-        setRightTab('tasks');
+        setRightTab('engineer');
         setRunning(true);
       }
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : 'create failed');
+    }
+  }
+
+  async function fixIssue(n: number, title: string) {
+    if (!selectedRepo) { setNotice('Select a repo first.'); return; }
+    setNotice(`Creating fix task for #${n}…`);
+    try {
+      const res = await api.createTask(selectedRepo, `Fix #${n}: ${title}`);
+      setNotice(`Task #${res.task_id} created for issue #${n} — run it from the engineer panel.`);
+      await refreshTasks();
+      setSelectedId(res.task_id);
+      setLeftView('run');
     } catch (e) {
       setNotice(e instanceof Error ? e.message : 'create failed');
     }
@@ -445,289 +491,366 @@ export default function App() {
   const events = detail?.events ?? [];
   const verification = detail?.verification ?? [];
   const diff = detail?.diff ?? '';
-  const filteredFiles = repoFiles.filter((f) => f.path.toLowerCase().includes(explorerFilter.toLowerCase()));
   const dirty = fileContent !== savedContent;
   const canReview = detail != null && (detail.state === 'REVIEWING' || detail.state === 'READY_FOR_APPROVAL') && diff.trim() !== '' && diff.trim() !== '(no files changed)';
-  const connLabel = ghStatus
-    ? ghStatus.app_configured
-      ? `App ✓ · ${ghStatus.installations.length} install(s) · ${ghStatus.connected_repos} connected`
-      : 'App not configured — set GITHUB_APP_ID + key (see .env.example)'
-    : 'backend offline';
+  const pipe = useMemo(() => derivePipeline(detail, running), [detail, running]);
+
+  function toggleLeft(v: LeftView) {
+    if (v === leftView && !leftCollapsed) setLeftCollapsed(true);
+    else { setLeftView(v); setLeftCollapsed(false); }
+  }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', background: dark.bg, color: dark.text, fontFamily: 'system-ui' }}>
-      <header style={{ display: 'flex', gap: 12, alignItems: 'center', padding: '8px 12px', borderBottom: `1px solid ${dark.border}`, background: dark.panel }}>
-        <strong>Fixhub</strong>
-        <span style={{ color: dark.muted, fontSize: 12 }}>{connLabel}</span>
-        <span style={{ color: dark.muted, fontSize: 12 }}>model: {provider ? `${provider.model}${provider.has_key ? '' : ' (no key — verification-only)'}` : '…'}</span>
-        {metrics && (
-          <span style={{ color: dark.muted, fontSize: 12 }}>
-            · {metrics.total_tokens} tokens · ${metrics.est_cost_usd} · {metrics.tasks_verified}/{metrics.tasks_run} verified
-          </span>
-        )}
-        {automation && (
-          <span style={{ color: dark.muted, fontSize: 12 }} title={automation.llm_configured ? `LLM ready (${automation.provider}/${automation.model})` : 'No LLM key — verification-only mode'}>
-            · auto-run {automation.auto_run ? '✓' : 'off'} · PR {automation.auto_pr_on_verified ? 'auto' : 'manual'}
-          </span>
-        )}
-        <button onClick={startFix} disabled={running} style={{ marginLeft: 'auto', background: dark.accent, color: '#fff', border: 0, borderRadius: 6, padding: '6px 12px', cursor: running ? 'wait' : 'pointer' }}>
-          {running ? 'Fix running…' : 'Start Autonomous Fix (demo)'}
-        </button>
-      </header>
+    <div className="fh-shell">
+      <TopBar
+        repos={repos}
+        repo={selectedRepo}
+        onRepo={setSelectedRepo}
+        detail={detail}
+        tasks={tasks}
+        onTask={setSelectedId}
+        provider={provider}
+        metrics={metrics}
+        automation={automation}
+        running={running}
+        canReview={canReview}
+        onStart={startFix}
+        onApprove={approve}
+      />
 
-      <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
-        <ActivityBar view={leftView} onChange={setLeftView} dark={dark} />
+      {(runError || notice) && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '4px 12px', borderBottom: '1px solid var(--fh-border-subtle)', background: 'var(--fh-raised)', minHeight: 28, flexShrink: 0 }}>
+          {runError && <span role="alert" style={{ fontSize: 12, color: 'var(--fh-bad)' }} className="mono fh-ellipsis">{runError}</span>}
+          {notice && !runError && <span role="status" style={{ fontSize: 12, color: 'var(--fh-warn)' }} className="mono fh-ellipsis">{notice}</span>}
+          <button onClick={() => { setRunError(''); setNotice(''); }} aria-label="Dismiss" className="fh-btn" style={{ marginLeft: 'auto', background: 'transparent', border: 0, color: 'var(--fh-muted)', cursor: 'pointer' }}>×</button>
+        </div>
+      )}
 
-        {leftView === 'explorer' && (
-          <div style={{ width: 248, minWidth: 248, borderRight: `1px solid ${dark.border}`, background: dark.panel, display: 'flex', flexDirection: 'column' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 8px', fontSize: 12, color: dark.muted }}>
-              <span style={{ fontWeight: 700 }}>EXPLORER</span>
-              {filesRoot && <span style={{ fontSize: 11 }}>· {filesRoot === 'demo' ? 'demo fallback' : 'workspace'} · {repoFiles.length}</span>}
-              <button onClick={refreshFiles} title="Refresh file tree" style={{ marginLeft: 'auto', background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 4, cursor: 'pointer', fontSize: 11 }}>↻</button>
-            </div>
-            <div style={{ padding: '0 8px 6px' }}>
-              <input
-                value={explorerFilter} onChange={(e) => setExplorerFilter(e.target.value)}
-                placeholder={selectedRepo ? 'Filter files…' : 'Select a repo first'}
-                disabled={!selectedRepo}
-                style={{ width: '100%', background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6, fontSize: 12 }}
-              />
-            </div>
-            <div style={{ flex: 1, overflow: 'auto', padding: '0 4px 8px' }}>
-              {!selectedRepo && <div style={{ color: dark.muted, fontSize: 12, padding: 8 }}>No repo selected — open the Source view (⑂) or clone OSS.</div>}
-              {selectedRepo && filesLoading && <div style={{ color: dark.muted, fontSize: 12, padding: 8 }}>Loading tree…</div>}
-              {filesError && <div style={{ color: dark.red, fontSize: 12, padding: 8 }}>{filesError}</div>}
-              {selectedRepo && !filesLoading && filteredFiles.length === 0 && !filesError && (
-                <div style={{ color: dark.muted, fontSize: 12, padding: 8 }}>{repoFiles.length === 0 ? 'Empty workdir — clone the repo first.' : 'No files match.'}</div>
-              )}
-              {explorerFilter ? (
-                filteredFiles.map((f) => (
-                  <div key={f.path} onClick={() => openFile(f.path)} title={`${f.path} · ${formatBytes(f.size)}`}
-                    style={{ padding: '3px 8px', borderRadius: 4, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', background: f.path === openPath ? '#1f6feb33' : 'transparent' }}>
-                    <span style={{ color: dark.muted, marginRight: 6 }}>📄</span>{f.path}
-                  </div>
-                ))
-              ) : (
-                <DirTree node={fileTree} depth={0} expanded={expanded} onToggle={toggleDir} openPath={openPath} onOpen={openFile} dark={dark} />
-              )}
-            </div>
-            <div style={{ borderTop: `1px solid ${dark.border}`, padding: '6px 8px' }}>
-              <div style={{ fontSize: 12, color: dark.muted, marginBottom: 4 }}>OUTLINE</div>
-              <div style={{ fontSize: 12, color: dark.muted }}>TIMELINE</div>
-            </div>
-          </div>
-        )}
+      <div style={{ display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }}>
+        <ActivityBar view={leftView} onChange={toggleLeft} />
 
-        {leftView === 'source' && (
-          <aside style={{ width: 300, minWidth: 300, borderRight: `1px solid ${dark.border}`, padding: 8, overflow: 'auto', background: dark.panel }}>
-            <div style={{ fontSize: 12, color: dark.muted }}>SOURCE CONTROL</div>
-            <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>GITHUB INSTALLATION</div>
-            <input
-              value={installationId} onChange={(e) => setInstallationId(e.target.value)}
-              placeholder="installation id"
-              style={{ width: '100%', margin: '4px 0', background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6 }}
-            />
-            <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>REPOSITORIES</div>
-            {repos.length === 0 && <div style={{ color: dark.muted, fontSize: 13 }}>None yet — connect below or clone OSS.</div>}
-            {repos.map((r) => (
-              <div key={r.full_name} onClick={() => setSelectedRepo(r.full_name)}
-                style={{ padding: '4px 6px', borderRadius: 4, cursor: 'pointer', fontSize: 13, background: r.full_name === selectedRepo ? '#1f6feb33' : 'transparent' }}>
-                {r.full_name} {r.connected ? '●' : '○'}{r.has_workspace ? ' ⌂' : ''}
-                {!r.connected && (
-                  <button onClick={(e) => { e.stopPropagation(); doConnect(r.full_name); }} style={{ marginLeft: 6, fontSize: 11 }}>connect</button>
-                )}
-              </div>
-            ))}
-            <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>CLONE ANY OSS REPO</div>
-            <div style={{ display: 'flex', gap: 4 }}>
-              <input
-                value={cloneUrl} onChange={(e) => setCloneUrl(e.target.value)}
-                placeholder="https://github.com/owner/repo"
-                style={{ flex: 1, background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6 }}
-              />
-              <button onClick={doClone}>Clone</button>
-            </div>
-            {notice && <div style={{ fontSize: 12, color: dark.yellow, marginTop: 4 }}>{notice}</div>}
-          </aside>
-        )}
-
-        {leftView === 'run' && (
-          <aside style={{ width: 300, minWidth: 300, borderRight: `1px solid ${dark.border}`, padding: 8, overflow: 'auto', background: dark.panel }}>
-            <div style={{ fontSize: 12, color: dark.muted }}>RUN &amp; TASKS</div>
-            <div style={{ fontSize: 12, color: dark.muted, marginTop: 8 }}>NEW TASK (no issue needed)</div>
-            <div style={{ display: 'flex', gap: 4 }}>
-              <input
-                value={taskTitle} onChange={(e) => setTaskTitle(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') doCreateTask(); }}
-                placeholder="e.g. fix login redirect loop"
-                style={{ flex: 1, background: dark.bg, color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: 6 }}
-              />
-              <button onClick={doCreateTask}>Create</button>
-            </div>
-            {notice && <div style={{ fontSize: 12, color: dark.yellow, marginTop: 4 }}>{notice}</div>}
-            <h4 style={{ margin: '12px 0 4px' }}>Tasks</h4>
-            {tasks.length === 0 && <div style={{ color: dark.muted, fontSize: 13 }}>No runs yet — new GitHub issues on connected repos start one automatically.</div>}
-            {tasks.map((t) => (
-              <div key={t.id} onClick={() => setSelectedId(t.id)}
-                style={{ padding: '4px 6px', borderRadius: 4, cursor: 'pointer', fontSize: 13, background: t.id === selectedId ? '#1f6feb33' : 'transparent' }}>
-                {formatTaskLabel(t)}
-              </div>
-            ))}
-          </aside>
-        )}
-
-        <main style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-          <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-            <EditorTabs tabs={openTabs} active={openPath} isDirty={isDirty} onSelect={selectTab} onClose={closeTab} repo={selectedRepo} dark={dark} />
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 10px', borderBottom: `1px solid ${dark.border}`, background: dark.panel, fontSize: 12 }}>
-              {!openPath && <span style={{ color: dark.muted }}>— click a file in the Explorer to view &amp; edit</span>}
-              {fileTruncated && <span style={{ color: dark.yellow }}>(truncated at 200KB)</span>}
-              <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
-                {saveMsg && <span style={{ color: saveMsg.startsWith('Saved') ? dark.green : dark.red }}>{saveMsg}</span>}
-                <button onClick={() => openPath && openFile(openPath)} disabled={!openPath || fileLoading} style={{ background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}>Reload</button>
-                <button onClick={saveOpenFile} disabled={!openPath || !dirty || saving} title="Ctrl/Cmd+S"
-                  style={{ background: dirty ? dark.accent : 'transparent', color: dirty ? '#fff' : dark.muted, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '4px 12px', cursor: dirty && !saving ? 'pointer' : 'default' }}>
-                  {saving ? 'Saving…' : 'Save'}
-                </button>
+        {!leftCollapsed && (
+          <aside aria-label="Side bar" style={{ width: leftWidth, minWidth: leftWidth, maxWidth: leftWidth, borderRight: '1px solid var(--fh-border-subtle)', background: 'var(--fh-raised)', display: 'flex', flexDirection: 'column', minHeight: 0, flexShrink: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', padding: '6px 8px 0' }}>
+              <span style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+                <button onClick={() => setLeftCollapsed(true)} title="Collapse side bar" aria-label="Collapse side bar" className="fh-btn" style={{ background: 'transparent', border: 0, color: 'var(--fh-muted)', cursor: 'pointer', padding: '2px 6px' }}>◀</button>
               </span>
             </div>
-            <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
-              {fileLoading && <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: dark.muted, fontSize: 12, zIndex: 1 }}>Loading file…</div>}
-              {fileError && <div style={{ position: 'absolute', top: 8, left: 8, color: dark.red, fontSize: 12, zIndex: 1 }}>{fileError}</div>}
-              <Editor
-                height="100%"
-                language={openPath ? languageFor(openPath) : 'python'}
-                value={fileContent}
-                onChange={(v) => {
-                  const next = v ?? '';
-                  setFileContent(next);
-                  if (openPath) tabCache.current[openPath] = { content: next, saved: savedContent, truncated: fileTruncated };
-                }}
-                theme="vs-dark"
-                options={{ readOnly: !openPath, minimap: { enabled: false }, fontSize: 13, scrollBeyondLastLine: false, automaticLayout: true }}
-                onMount={(editor, monaco) => {
-                  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveRef.current());
-                  editor.onDidChangeCursorPosition((e) => setCursor({ line: e.position.lineNumber, col: e.position.column }));
-                }}
+            <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              <LeftSidebar
+                view={leftView}
+                repoFiles={repoFiles}
+                filesRoot={filesRoot}
+                filesLoading={filesLoading}
+                filesError={filesError}
+                explorerFilter={explorerFilter}
+                setExplorerFilter={setExplorerFilter}
+                expanded={expanded}
+                toggleDir={toggleDir}
+                openPath={openPath}
+                openTabs={openTabs}
+                openFile={(p) => { openFile(p); }}
+                refreshFiles={refreshFiles}
+                selectedRepo={selectedRepo}
+                isDirty={isDirty}
+                repos={repos}
+                ghStatus={ghStatus}
+                installationId={installationId}
+                setInstallationId={setInstallationId}
+                setSelectedRepo={setSelectedRepo}
+                doConnect={doConnect}
+                cloneUrl={cloneUrl}
+                setCloneUrl={setCloneUrl}
+                doClone={doClone}
+                notice={notice}
+                tasks={tasks}
+                selectedId={selectedId}
+                setSelectedId={setSelectedId}
+                taskTitle={taskTitle}
+                setTaskTitle={setTaskTitle}
+                doCreateTask={doCreateTask}
+                detail={detail}
+                running={running}
+                onRun={runSelected}
+                issues={issues}
+                issuesLoading={issuesLoading}
+                issuesError={issuesError}
+                onFixIssue={fixIssue}
+                provider={provider}
+                metrics={metrics}
+                automation={automation}
               />
             </div>
-          </div>
-          <div style={{ height: '32%', minHeight: 180, borderTop: `1px solid ${dark.border}`, padding: 8, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
-            <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
-              {(['tests', 'diff', 'proof'] as const).map((t) => (
-                <button key={t} onClick={() => setBottomTab(t)}
-                  style={{ background: bottomTab === t ? dark.accent : 'transparent', color: bottomTab === t ? '#fff' : dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }}>
-                  {t === 'tests' ? `Verification (${verificationSummary(verification)})` : t[0].toUpperCase() + t.slice(1)}
-                </button>
-              ))}
-              {detail && (
-                <span style={{ marginLeft: 'auto', fontSize: 12, color: detail.state === 'READY_FOR_APPROVAL' || detail.state === 'REVIEWING' ? dark.green : detail.state === 'FAILED' ? dark.red : dark.yellow }}>
-                  Task #{detail.id} · {detail.state}
-                </span>
-              )}
-            </div>
-            {runError && <pre style={{ color: dark.red, whiteSpace: 'pre-wrap' }}>{runError}</pre>}
-            {bottomTab === 'tests' && (
-              <VerificationView verification={verification} dark={dark} />
-            )}
-            {bottomTab === 'diff' && (
-              <div>
-                {detail?.branch && <div style={{ fontSize: 12, color: dark.muted }}>branch: {detail.branch}</div>}
-                <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12 }}>
-                  {diff ? diff.slice(0, 12000) : 'No diff yet — it appears after a verified run, for your review.'}
-                </pre>
-                {canReview && (
-                  <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                    <button onClick={approve} style={{ background: dark.green, color: '#fff', border: 0, borderRadius: 6, padding: '8px 14px', cursor: 'pointer' }}>
-                      Approve & Commit
-                    </button>
-                    <button onClick={reject} style={{ background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '8px 14px', cursor: 'pointer' }}>
-                      Request changes
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
-            {bottomTab === 'proof' && (
-              <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12 }}>
-                {verification.length === 0
-                  ? 'Proof of Fix appears after a run — built from real verification rows, never claimed.'
-                  : `PROOF OF FIX — Task #${detail?.id}\n${verification.map((v) => `${v.check}: ${v.passed ? 'PASS' : 'FAIL'}`).join('\n')}\nStatus: ${verification.every((v) => v.passed) ? 'VERIFIED — READY FOR PR' : 'NOT VERIFIED'}`}
-              </pre>
-            )}
-          </div>
-        </main>
+          </aside>
+        )}
 
-        <aside style={{ width: 380, minWidth: 380, borderLeft: `1px solid ${dark.border}`, background: dark.panel, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-          <div style={{ display: 'flex', borderBottom: `1px solid ${dark.border}` }}>
-            {(['agent', 'terminal', 'tasks'] as const).map((t) => (
-              <button key={t} onClick={() => setRightTab(t)}
+        {!leftCollapsed && (
+          <Resizer dir="x" label="Resize side bar" handleProps={leftResize.handleProps} active={leftResize.resizing} onReset={() => setLeftWidth(IDE_DEFAULTS.leftWidth)} />
+        )}
+
+        {/* Center column: pipeline strip + workspace + bottom panel */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, background: 'var(--fh-bg)' }}>
+          <PipelineStrip stages={pipe} detail={detail} running={running} />
+
+          <div role="tablist" aria-label="Workspace" style={{ display: 'flex', gap: 2, padding: '6px 10px 0', borderBottom: '1px solid var(--fh-border-subtle)', overflowX: 'auto', flexShrink: 0, alignItems: 'center', background: 'var(--fh-raised)' }}>
+            {CENTER_TABS.map((t) => (
+              <button
+                key={t.id}
+                role="tab"
+                aria-selected={centerTab === t.id}
+                onClick={() => setCenterTab(t.id)}
+                className="fh-btn"
                 style={{
-                  flex: 1, background: 'transparent', color: rightTab === t ? dark.text : dark.muted,
-                  border: 0, borderBottom: `2px solid ${rightTab === t ? dark.accent : 'transparent'}`,
-                  padding: '8px 4px', cursor: 'pointer', fontSize: 12, fontWeight: rightTab === t ? 700 : 400,
-                }}>
-                {t[0].toUpperCase() + t.slice(1)}
+                  background: centerTab === t.id ? 'var(--fh-bg)' : 'transparent',
+                  color: centerTab === t.id ? 'var(--fh-text)' : 'var(--fh-muted)',
+                  border: '1px solid var(--fh-border-subtle)',
+                  borderBottom: centerTab === t.id ? '2px solid var(--fh-info)' : '1px solid var(--fh-border-subtle)',
+                  borderRadius: '8px 8px 0 0',
+                  padding: '5px 11px',
+                  cursor: 'pointer',
+                  fontSize: 11.5,
+                  fontWeight: centerTab === t.id ? 800 : 500,
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {t.label}
               </button>
             ))}
+            <span style={{ marginLeft: 'auto', display: 'flex', gap: 4, flexShrink: 0 }}>
+              {leftCollapsed && <button onClick={() => setLeftCollapsed(false)} title="Show side bar" className="fh-btn" style={{ background: 'transparent', border: '1px solid var(--fh-border)', color: 'var(--fh-text-2)', borderRadius: 6, padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}>▤ bar</button>}
+              {rightCollapsed && <button onClick={() => setRightCollapsed(false)} title="Show AI panel" className="fh-btn" style={{ background: 'transparent', border: '1px solid var(--fh-border)', color: 'var(--fh-text-2)', borderRadius: 6, padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}>AI ▤</button>}
+              {bottomCollapsed && <button onClick={() => setBottomCollapsed(false)} title="Show bottom panel" className="fh-btn" style={{ background: 'transparent', border: '1px solid var(--fh-border)', color: 'var(--fh-text-2)', borderRadius: 6, padding: '2px 8px', cursor: 'pointer', fontSize: 11 }}>▤ panel</button>}
+            </span>
           </div>
+
           <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            {rightTab === 'agent' && (
-              <AgentPanel
-                repo={selectedRepo}
-                dark={dark}
-                onWorkdirChanged={() => {
-                  refreshFiles();
-                  if (openPath) openFile(openPath);
-                }}
-              />
-            )}
-            {rightTab === 'terminal' && <Terminal repo={selectedRepo} dark={dark} />}
-            {rightTab === 'tasks' && (
-              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, padding: 8 }}>
-                <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
-                  <button onClick={runSelected} disabled={selectedId == null || running} style={{ flex: 1, background: dark.accent, color: '#fff', border: 0, borderRadius: 6, padding: '6px', cursor: 'pointer' }}>
-                    {running ? 'Running…' : 'Run agent on task'}
-                  </button>
+            {centerTab === 'editor' && (
+              <>
+                <EditorTabs tabs={openTabs} active={openPath} isDirty={isDirty} onSelect={selectTab} onClose={closeTab} repo={selectedRepo} dark={dark} />
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 10px', borderBottom: '1px solid var(--fh-border-subtle)', background: 'var(--fh-raised)', fontSize: 12, flexShrink: 0 }}>
+                  {(() => {
+                    const files = parseDiff(diff);
+                    if (files.length === 0) {
+                      return !openPath ? <span style={{ color: 'var(--fh-muted)' }}>— click a file in the Explorer to view & edit</span> : null;
+                    }
+                    const st = diffStats(files);
+                    const current = files.find((f) => openPath && (openPath === f.path || openPath.endsWith(f.path)));
+                    return (
+                      <span className="mono" style={{ fontSize: 11, color: 'var(--fh-text-2)' }} title={`${st.files} files changed`}>
+                        {openPath || 'diff'} <span style={{ color: 'var(--fh-ok)' }}>+{current ? current.additions : st.additions}</span>{' '}
+                        <span style={{ color: 'var(--fh-bad)' }}>-{current ? current.deletions : st.deletions}</span>
+                        {!current && <span style={{ color: 'var(--fh-muted)' }}> · {st.files} files</span>}
+                      </span>
+                    );
+                  })()}
+                  {fileTruncated && <Badge kind="warn">truncated at 200KB</Badge>}
+                  {fileError && <span role="alert" style={{ color: 'var(--fh-bad)', fontSize: 12 }}>{fileError}</span>}
+                  <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+                    {saveMsg && <span role="status" style={{ color: saveMsg.startsWith('Saved') ? 'var(--fh-ok)' : 'var(--fh-bad)', fontSize: 11 }} className="mono">{saveMsg}</span>}
+                    <button onClick={() => openPath && openFile(openPath)} disabled={!openPath || fileLoading} className="fh-btn" style={{ background: 'transparent', color: 'var(--fh-text-2)', border: '1px solid var(--fh-border)', borderRadius: 7, padding: '4px 10px', cursor: 'pointer', fontSize: 11 }}>Reload</button>
+                    <button onClick={saveOpenFile} disabled={!openPath || !dirty || saving} title="Ctrl/Cmd+S"
+                      className="fh-btn"
+                      style={{ background: dirty ? 'var(--fh-info)' : 'transparent', color: dirty ? '#06121f' : 'var(--fh-muted)', border: '1px solid var(--fh-border)', borderRadius: 7, padding: '4px 12px', cursor: dirty && !saving ? 'pointer' : 'default', fontWeight: 700, fontSize: 11 }}>
+                      {saving ? 'Saving…' : 'Save'}
+                    </button>
+                  </span>
                 </div>
+                <div style={{ flex: 1, minHeight: 120, position: 'relative' }}>
+                  {fileLoading && (
+                    <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--fh-muted)', fontSize: 12, zIndex: 1, background: 'rgba(10,13,18,0.6)' }}>
+                      <LoadingState label={`Opening ${openPath}…`} />
+                    </div>
+                  )}
+                  <Editor
+                    height="100%"
+                    language={openPath ? languageFor(openPath) : 'python'}
+                    value={fileContent}
+                    onChange={(v) => {
+                      const next = v ?? '';
+                      setFileContent(next);
+                      if (openPath) tabCache.current[openPath] = { content: next, saved: savedContent, truncated: fileTruncated };
+                    }}
+                    theme="vs-dark"
+                    options={{ readOnly: !openPath, minimap: { enabled: false }, fontSize: 13, scrollBeyondLastLine: false, automaticLayout: true, padding: { top: 10 } }}
+                    onMount={(editor, monaco) => {
+                      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveRef.current());
+                      editor.onDidChangeCursorPosition((e) => setCursor({ line: e.position.lineNumber, col: e.position.column }));
+                    }}
+                  />
+                </div>
+              </>
+            )}
+            {centerTab === 'issue' && (
+              <div className="fh-scroll" style={{ flex: 1, padding: '10px 12px' }}>
+                <IssueCard detail={detail} running={running} />
                 {detail && (
-                  <div style={{ fontSize: 12, color: dark.muted, marginBottom: 6 }}>
-                    Task #{detail.id} · {detail.state}{detail.branch ? ` · ⑂ ${detail.branch}` : ''}
+                  <div style={{ marginTop: 10 }}>
+                    <PlanPanel events={events} dark={dark} />
+                    <ActivityStream events={events} running={running} />
                   </div>
                 )}
-                {canReview && (
-                  <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
-                    <button onClick={approve} style={{ flex: 1, background: dark.green, color: '#fff', border: 0, borderRadius: 6, padding: '6px', cursor: 'pointer' }}>Approve & Commit</button>
-                    <button onClick={reject} style={{ flex: 1, background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '6px', cursor: 'pointer' }}>Request changes</button>
-                  </div>
-                )}
-                {detail?.pr_url && (
-                  <div style={{ marginBottom: 8 }}>
-                    <a href={detail.pr_url} target="_blank" rel="noreferrer" style={{ color: dark.green, fontSize: 13, fontWeight: 600 }}>
-                      Pull request #{detail.pr_number || ''} ↗
-                    </a>
-                  </div>
-                )}
-                <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
-                  <PlanPanel events={events} dark={dark} />
-                  <TraceView events={events} state={detail?.state} running={running} traceEndRef={traceEndRef} dark={dark} />
+              </div>
+            )}
+            {centerTab === 'diff' && (
+              <div className="fh-scroll" style={{ flex: 1 }}>
+                <DiffView diff={diff} branch={detail?.branch ?? ''} />
+              </div>
+            )}
+            {centerTab === 'proof' && (
+              <div className="fh-scroll" style={{ flex: 1 }}>
+                <ProofPanel detail={detail} />
+                <div style={{ padding: '0 12px 12px' }}>
+                  <PrPanel detail={detail} running={running} canReview={canReview} onApprove={approve} onReject={reject} />
                 </div>
               </div>
             )}
+            {centerTab === 'intel' && (
+              <div className="fh-scroll" style={{ flex: 1 }}>
+                <RepoIntel files={repoFiles} repo={selectedRepo} />
+              </div>
+            )}
+            {centerTab === 'task' && (
+              <div className="fh-scroll" style={{ flex: 1, padding: '10px 12px', display: 'grid', gap: 10, alignContent: 'start' }}>
+                <TaskPipeline detail={detail} running={running} />
+                <SystemGraph detail={detail} running={running} />
+                {detail ? (
+                  <div className="mono" style={{ fontSize: 11, color: 'var(--fh-muted)' }}>
+                    {formatTaskLabel({ id: detail.id, title: detail.title, state: detail.state })} · {verificationSummary(verification)} · {detail.branch ? `⑂ ${detail.branch}` : 'no branch'}
+                  </div>
+                ) : (
+                  <EmptyState title="No task selected" body="Create one from Run view (left) or press Start Autonomous Fix." />
+                )}
+              </div>
+            )}
           </div>
-        </aside>
+
+          {!bottomCollapsed ? (
+            <div style={{ height: bottomHeight, minHeight: bottomHeight, maxHeight: bottomHeight, borderTop: '1px solid var(--fh-border-subtle)', display: 'flex', flexDirection: 'column', background: 'var(--fh-raised)', flexShrink: 0 }}>
+              <Resizer dir="y" label="Resize bottom panel" handleProps={bottomResize.handleProps} active={bottomResize.resizing} onReset={() => setBottomHeight(IDE_DEFAULTS.bottomHeight)} />
+              <BottomPanel
+                tab={bottomTab}
+                onTab={setBottomTab}
+                detail={detail}
+                running={running}
+                repo={selectedRepo}
+                dark={dark}
+                verification={verification}
+                events={events}
+                diff={diff}
+                canReview={canReview}
+                onApprove={approve}
+                onReject={reject}
+                onClose={() => setBottomCollapsed(true)}
+              />
+              <div ref={traceEndRef} />
+            </div>
+          ) : (
+            <div style={{ borderTop: '1px solid var(--fh-border-subtle)', background: 'var(--fh-raised)', padding: '4px 10px', display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>
+              <span className="mono" style={{ fontSize: 10.5, color: 'var(--fh-muted)' }}>PANEL COLLAPSED</span>
+              <button onClick={() => setBottomCollapsed(false)} className="fh-btn" style={{ background: 'transparent', border: '1px solid var(--fh-border)', color: 'var(--fh-text-2)', borderRadius: 6, padding: '2px 9px', cursor: 'pointer', fontSize: 11 }}>Restore Terminal / Verification / Diff</button>
+            </div>
+          )}
+        </div>
+
+        {!rightCollapsed && (
+          <Resizer dir="x" label="Resize AI panel" handleProps={rightResize.handleProps} active={rightResize.resizing} onReset={() => setRightWidth(IDE_DEFAULTS.rightWidth)} />
+        )}
+
+        {!rightCollapsed ? (
+          <aside aria-label="AI panel" style={{ width: rightWidth, minWidth: rightWidth, maxWidth: rightWidth, borderLeft: '1px solid var(--fh-border-subtle)', background: 'var(--fh-raised)', display: 'flex', flexDirection: 'column', minHeight: 0, flexShrink: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', padding: '6px 8px 0' }}>
+              <span className="mono" style={{ fontSize: 10, fontWeight: 800, letterSpacing: '0.1em', color: 'var(--fh-text-2)', paddingLeft: 2 }}>AI ENGINEER</span>
+              <span style={{ marginLeft: 'auto' }}>
+                <button onClick={() => setRightCollapsed(true)} title="Collapse AI panel" aria-label="Collapse AI panel" className="fh-btn" style={{ background: 'transparent', border: 0, color: 'var(--fh-muted)', cursor: 'pointer', padding: '2px 6px' }}>▶</button>
+              </span>
+            </div>
+            <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+              <RightPanel
+                tab={rightTab}
+                onTab={setRightTab}
+                detail={detail}
+                running={running}
+                repo={selectedRepo}
+                selectedId={selectedId}
+                installationId={installationId}
+                onRun={runSelected}
+                onWorkdirChanged={() => { refreshFiles(); if (openPath) openFile(openPath); }}
+                dark={dark}
+              />
+            </div>
+            <div style={{ borderTop: '1px solid var(--fh-border-subtle)', padding: 10, flexShrink: 0 }}>
+              {detail?.pr_url ? (
+                <a href={detail.pr_url} target="_blank" rel="noreferrer" style={{ color: 'var(--fh-ok)', fontSize: 13, fontWeight: 700 }}>
+                  Pull request #{detail.pr_number || ''} ↗
+                </a>
+              ) : canReview ? (
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <button onClick={approve} className="fh-btn" style={{ flex: 1, background: 'var(--fh-ok)', color: '#06110a', border: 0, borderRadius: 8, padding: '9px', fontWeight: 800, cursor: 'pointer' }}>Approve & Commit</button>
+                  <button onClick={reject} className="fh-btn" style={{ flex: 1, background: 'transparent', color: 'var(--fh-text)', border: '1px solid var(--fh-border)', borderRadius: 8, padding: '9px', cursor: 'pointer' }}>Request changes</button>
+                </div>
+              ) : (
+                <div style={{ fontSize: 11.5, color: 'var(--fh-muted)' }}>
+                  {detail ? `Task #${detail.id} · ${detail.state}${detail.branch ? ` · ⑂ ${detail.branch}` : ''}` : 'No task selected.'} — approval unlocks on a REVIEWING diff.
+                </div>
+              )}
+              <div className="mono" style={{ marginTop: 6, fontSize: 10.5, color: 'var(--fh-muted)' }}>
+                {formatTaskLabel({ id: detail?.id ?? 0, title: detail?.title ?? '—', state: detail?.state ?? 'idle' })} · {verificationSummary(verification)}
+              </div>
+            </div>
+          </aside>
+        ) : (
+          <div style={{ width: 36, borderLeft: '1px solid var(--fh-border-subtle)', background: 'var(--fh-raised)', display: 'flex', flexDirection: 'column', alignItems: 'center', paddingTop: 8, gap: 6, flexShrink: 0 }}>
+            <button onClick={() => setRightCollapsed(false)} title="Show AI panel (Chat / Terminal / Engineer)" className="fh-btn" style={{ background: 'transparent', border: '1px solid var(--fh-border)', color: 'var(--fh-text-2)', borderRadius: 8, padding: '6px 8px', cursor: 'pointer' }}>◀</button>
+            <span className="mono" style={{ writingMode: 'vertical-rl', fontSize: 10, letterSpacing: '0.15em', color: 'var(--fh-muted)' }}>AI PANEL</span>
+          </div>
+        )}
       </div>
 
       <StatusBar
         branch={detail?.branch ?? ''}
         state={detail ? `Task #${detail.id} · ${detail.state}` : 'idle'}
         model={provider ? `${provider.provider} · ${provider.model}` : '…'}
-        tokens={metrics ? `${metrics.total_tokens} tokens · $${metrics.est_cost_usd}` : ''}
+        tokens={metrics ? `${metrics.total_tokens} tok · $${metrics.est_cost_usd}` : ''}
         connected={ghStatus ? (ghStatus.app_configured ? `App ✓ · ${ghStatus.connected_repos}` : 'App not configured') : 'offline'}
         language={openPath ? languageFor(openPath) : 'plaintext'}
         cursor={cursor}
         dark={dark}
       />
+    </div>
+  );
+}
+
+/** Compact 10-stage strip: check = done, pulse = running, dim = pending, red = failed, amber = blocked. */
+function PipelineStrip({ stages, detail, running }: { stages: ReturnType<typeof derivePipeline>; detail: TaskDetail | null; running: boolean }) {
+  const labels: Record<string, string> = {
+    understand: 'Issue', investigate: 'Understand', reproduce: 'Reproduce', plan: 'Plan',
+    implement: 'Implement', test: 'Test', verify: 'Verify', proof: 'Proof', pr: 'PR',
+  };
+  return (
+    <div role="status" aria-label={detail ? `Pipeline for task ${detail.id}` : 'No active pipeline'} style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '6px 10px', borderBottom: '1px solid var(--fh-border-subtle)', background: 'var(--fh-raised)', overflowX: 'auto', flexShrink: 0, minHeight: 34 }}>
+      <span className="mono" style={{ fontSize: 9.5, fontWeight: 800, letterSpacing: '0.1em', color: 'var(--fh-muted)', flexShrink: 0 }}>FLOW</span>
+      {!detail && <span style={{ fontSize: 11.5, color: 'var(--fh-muted)' }}>No active task — pipeline binds to the selected run.</span>}
+      {stages.map((s, i) => {
+        const label = labels[s.id] ?? s.label;
+        const color = s.state === 'completed' ? 'var(--fh-ok)' : s.state === 'failed' ? 'var(--fh-bad)' : s.state === 'blocked' ? 'var(--fh-warn)' : s.state === 'running' ? 'var(--fh-info)' : 'var(--fh-muted)';
+        return (
+          <span key={s.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+            <span
+              title={`${label} — ${s.state}${s.detail ? ` · ${s.detail}` : ''}`}
+              className={s.state === 'running' && running ? 'fh-step-running' : ''}
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 10.5, fontWeight: s.state === 'running' ? 800 : 600,
+                color, border: `1px solid ${s.state === 'idle' ? 'var(--fh-border)' : color}`, borderRadius: 999, padding: '2px 9px',
+                background: s.state === 'completed' ? 'rgba(63,185,80,0.08)' : s.state === 'running' ? 'rgba(74,168,255,0.1)' : s.state === 'failed' ? 'rgba(240,85,72,0.08)' : 'transparent',
+                opacity: s.state === 'idle' ? 0.6 : 1, whiteSpace: 'nowrap',
+              }}
+            >
+              {s.state === 'completed' ? '✓' : s.state === 'failed' ? '✕' : s.state === 'running' ? <span className="fh-live-dot" /> : s.state === 'blocked' ? '◌' : '○'} {label}
+            </span>
+            {i < stages.length - 1 && <span aria-hidden="true" style={{ color: 'var(--fh-muted)', opacity: 0.5 }}>→</span>}
+          </span>
+        );
+      })}
     </div>
   );
 }

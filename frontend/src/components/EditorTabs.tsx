@@ -9,12 +9,13 @@ type Props = {
 };
 
 export default function EditorTabs({ tabs, active, isDirty, onSelect, onClose, repo, dark }: Props) {
+  void dark;
   const crumbs = active ? active.split('/') : [];
   return (
-    <div style={{ background: dark.panel, borderBottom: `1px solid ${dark.border}` }}>
-      <div style={{ display: 'flex', overflowX: 'auto' }}>
+    <div style={{ background: 'var(--fh-raised)', borderBottom: '1px solid var(--fh-border-subtle)' }}>
+      <div role="tablist" aria-label="Open editors" style={{ display: 'flex', overflowX: 'auto' }}>
         {tabs.length === 0 && (
-          <div style={{ padding: '6px 12px', fontSize: 12, color: dark.muted }}>No open editors</div>
+          <div style={{ padding: '7px 12px', fontSize: 12, color: 'var(--fh-muted)' }}>No open editors</div>
         )}
         {tabs.map((t) => {
           const name = t.split('/').pop() ?? t;
@@ -22,38 +23,44 @@ export default function EditorTabs({ tabs, active, isDirty, onSelect, onClose, r
           return (
             <div
               key={t}
+              role="tab"
+              aria-selected={selected}
               onClick={() => onSelect(t)}
+              onKeyDown={(e) => { if (e.key === 'Enter') onSelect(t); }}
+              tabIndex={0}
               title={t}
+              className="fh-fade"
               style={{
-                display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', fontSize: 12,
-                cursor: 'pointer', whiteSpace: 'nowrap', borderRight: `1px solid ${dark.border}`,
-                background: selected ? dark.bg : 'transparent',
-                borderTop: `2px solid ${selected ? dark.accent : 'transparent'}`,
-                color: selected ? dark.text : dark.muted,
+                display: 'flex', alignItems: 'center', gap: 6, padding: '7px 10px', fontSize: 12,
+                cursor: 'pointer', whiteSpace: 'nowrap', borderRight: '1px solid var(--fh-border-subtle)',
+                background: selected ? 'var(--fh-bg)' : 'transparent',
+                borderTop: `2px solid ${selected ? 'var(--fh-info)' : 'transparent'}`,
+                color: selected ? 'var(--fh-text)' : 'var(--fh-muted)',
               }}
             >
-              <span>{name}</span>
-              <span style={{ color: isDirty(t) ? dark.yellow : dark.muted, minWidth: 14, textAlign: 'center' }}>{isDirty(t) ? '●' : ''}</span>
-              <span
+              <span className="mono">{name}</span>
+              <span aria-label={isDirty(t) ? 'unsaved changes' : undefined} style={{ color: isDirty(t) ? 'var(--fh-warn)' : 'transparent', minWidth: 10, textAlign: 'center' }}>●</span>
+              <button
                 onClick={(e) => { e.stopPropagation(); onClose(t); }}
-                title="Close"
-                style={{ cursor: 'pointer', padding: '0 4px', borderRadius: 4 }}
+                title={`Close ${name}`}
+                aria-label={`Close ${name}`}
+                style={{ cursor: 'pointer', padding: '0 4px', borderRadius: 4, background: 'transparent', border: 0, color: 'var(--fh-muted)' }}
               >
                 ×
-              </span>
+              </button>
             </div>
           );
         })}
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 12px', fontSize: 11, color: dark.muted }}>
-        <span>{repo || 'no repo'}</span>
+      <nav aria-label="Breadcrumb" style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 12px', fontSize: 11, color: 'var(--fh-muted)' }}>
+        <span className="mono">{repo || 'no repo'}</span>
         {crumbs.map((c, i) => (
           <span key={i} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <span>›</span>
-            <span style={{ color: i === crumbs.length - 1 ? dark.text : dark.muted }}>{c}</span>
+            <span aria-hidden="true">›</span>
+            <span className="mono" style={{ color: i === crumbs.length - 1 ? 'var(--fh-text)' : 'var(--fh-muted)' }}>{c}</span>
           </span>
         ))}
-      </div>
+      </nav>
     </div>
   );
 }

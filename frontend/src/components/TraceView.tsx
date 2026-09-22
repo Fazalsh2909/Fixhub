@@ -19,7 +19,8 @@ function EventRow({ e, i, dark }: { e: TaskEvent; i: number; dark: Record<string
   const shown = !long || open ? e.message : e.message.slice(0, COLLAPSE_AT) + '…';
   const nested = e.stage === 'SUBAGENT';
   return (
-    <div style={{
+    <div className="fh-rise" style={{
+      animationDelay: `${Math.min(i, 12) * 60}ms`,
       display: 'flex', gap: 8, padding: '4px 6px',
       borderBottom: `1px solid ${dark.border}55`, alignItems: 'baseline',
       marginLeft: nested ? 16 : 0,
@@ -60,7 +61,7 @@ export default function TraceView({ events, state, running, traceEndRef, dark }:
           const done = pipeDone || (pipeIdx >= 0 && idx < pipeIdx);
           const current = !pipeDone && idx === pipeIdx;
           return (
-            <span key={s} title={s}
+            <span key={s} title={s} className={current ? 'fh-step-current' : ''}
               style={{
                 padding: '2px 8px', borderRadius: 10, fontSize: 11,
                 border: `1px solid ${current ? dark.yellow : dark.border}`,
@@ -74,7 +75,7 @@ export default function TraceView({ events, state, running, traceEndRef, dark }:
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, color: dark.muted }}>
         <span>{events.length} step{events.length === 1 ? '' : 's'}</span>
-        {running && <span><span style={{ color: dark.green }}>●</span> live — polling every 3s</span>}
+        {running && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><span className="fh-live-dot" style={{ color: dark.green }} /> live — polling every 3s</span>}
         {!running && events.length > 0 && <span>· idle</span>}
         {state && <span style={{ marginLeft: 'auto' }}>state: <strong style={{ color: stageColor(state, dark) }}>{state}</strong></span>}
       </div>

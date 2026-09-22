@@ -18,8 +18,11 @@ export default function PlanPanel({ events, dark }: { events: TaskEvent[]; dark:
   if (todos.length === 0) return null;
   const done = todos.filter((t) => t.done).length;
   return (
-    <div style={{ border: `1px solid ${dark.border}`, borderRadius: 6, padding: 8, marginBottom: 8, background: `${dark.green}11` }}>
+    <div className="fh-pop" style={{ border: `1px solid ${dark.border}`, borderRadius: 8, padding: 8, marginBottom: 8, background: `${dark.green}11` }}>
       <div style={{ fontSize: 11, color: dark.muted, marginBottom: 4 }}>PLAN · {done}/{todos.length} done</div>
+      <div style={{ height: 4, borderRadius: 2, background: `${dark.border}66`, overflow: 'hidden', marginBottom: 6 }}>
+        <div className="fh-progress-fill" style={{ height: '100%', width: `${todos.length ? (done / todos.length) * 100 : 0}%`, borderRadius: 2, background: 'linear-gradient(90deg, #3fb950, #a371f7)' }} />
+      </div>
       {todos.map((t, i) => (
         <div key={i} style={{ fontSize: 12, color: t.done ? dark.muted : t.active ? dark.green : dark.text, textDecoration: t.done ? 'line-through' : 'none' }}>
           <span style={{ marginRight: 6 }}>{t.active ? '▶' : t.mark}</span>{t.content}
