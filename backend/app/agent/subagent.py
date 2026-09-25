@@ -47,8 +47,20 @@ def read_only_specs() -> list:
     return [s for s in tool_specs() if s.name not in WITHHELD]
 
 
-def explore(workdir: Path, question: str, llm: LLMProvider, max_turns: int = 6) -> str:
-    """Run a fresh agent on one question. Return only its final answer."""
+def explore(
+    workdir: Path,
+    question: str,
+    llm: LLMProvider,
+    max_turns: int = 6,
+    llm_state: dict | None = None,
+) -> str:
+    """Run a fresh agent on one question. Return only its final answer.
+
+    llm_state is the task's shared {"calls": int} counter (see
+    orchestrator.engineer_issue): each turn increments it, and the
+    AGENT_MAX_LLM_CALLS budget stops the explorer early with a partial
+    report instead of burning turns the task cannot afford.
+    """
     from ..llm.openrouter import ProviderError
     from ..agent.orchestrator import _execute_tool
 
@@ -57,9 +69,24 @@ def explore(workdir: Path, question: str, llm: LLMProvider, max_turns: int = 6) 
         {"role": "user", "content": (question or "")[:2000]},
     ]
     specs = read_only_specs()
+    try:
+        from ..config import settings as _s
+
+        _max_calls = int(getattr(_s, "agent_max_llm_calls", 0) or 0)
+    except Exception:
+        _max_calls = 0
     report: str | None = None
     for i in range(max(1, max_turns)):
+        if (
+            llm_state is not None
+            and _max_calls > 0
+            and int(llm_state.get("calls", 0)) >= _max_calls
+        ):
+            note = "(stopped early: llm call budget reached.)"
+            return f"{note}\n\n{report}" if report else f"{note} Nothing gathered."
         try:
+            if llm_state is not None:
+                llm_state["calls"] = int(llm_state.get("calls", 0)) + 1
             resp = llm.tool_call(messages, specs)
         except ProviderError as e:
             note = f"(subagent provider error: {e}. Partial findings follow.)"

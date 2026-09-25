@@ -154,6 +154,15 @@ def message_dict(m) -> dict:
         extra = {}
     args = extra.get("arguments", {}) or {}
     todos = extra.get("todos", []) if m.role == "plan" else []
+    # Engineering-event summary derived from the row itself (never private
+    # reasoning): what the assistant said or which tool ran and whether it
+    # worked. Old rows may still carry a `reasoning` blob — it is not served.
+    if m.role == "assistant":
+        summary = (m.content or "")[:160]
+    elif m.role == "tool":
+        summary = f"{m.tool_name} {'ok' if m.ok else 'failed'}"
+    else:
+        summary = ""
     return {
         "id": m.id,
         "role": m.role,
@@ -162,7 +171,10 @@ def message_dict(m) -> dict:
         "content": m.content,
         "ok": m.ok,
         # Opencode-style timeline fields (best-effort; missing on old rows).
-        "thinking": extra.get("reasoning", "") or "",
+        # `thinking` is intentionally always "" — private reasoning is never
+        # exposed (Phase 12). Kept as a key for one release for client compat.
+        "thinking": "",
+        "summary": summary,
         "duration_ms": extra.get("duration_ms", 0) or 0,
         "diff": extra.get("diff", "") or "",
         "todos": todos,
@@ -306,9 +318,12 @@ def run_session_turn(
                     "function": {"name": call["name"], "arguments": arg_str},
                 }
             )
-        assistant_row.extra = json.dumps(
-            {"tool_calls": native, "reasoning": resp.reasoning or ""}
-        )
+        # Phase 12: private chain-of-thought is never persisted. Only the
+        # assistant's user-facing content and tool-call pairings are stored;
+        # the UI renders WHAT the system did (tool rows + plan), not private
+        # reasoning. `thinking` stays present-but-empty in message_dict for
+        # one release so existing clients don't break on a missing key.
+        assistant_row.extra = json.dumps({"tool_calls": native})
         db.commit()
         if not native:
             status = "done"

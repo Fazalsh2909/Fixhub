@@ -21,13 +21,51 @@ export type ConnectedRepo = {
   has_workspace: boolean;
 };
 
+export type GhInstallation = { login: string; installation_id: string };
+
 export type GhStatus = {
   app_configured: boolean;
   app_slug: string;
-  installations: { login: string; installation_id: string }[];
+  installations: GhInstallation[];
   connected_repos: number;
   auto_trigger_on_issue: boolean;
 };
+
+/** Pick the installation that owns a repo (login match, case-insensitive).
+ * The UI otherwise defaults to installations[0], which may be a stale/demo
+ * id — every ISSUES poll then fails (403/503) even though the user owns the
+ * repo under another installation. Returns null when nothing matches. */
+export function pickInstallationForRepo(
+  installations: GhInstallation[],
+  repoFullName: string
+): string | null {
+  const owner = repoFullName.split('/')[0]?.toLowerCase().trim();
+  if (!owner) return null;
+  const hit = installations.find((i) => i.login.toLowerCase() === owner);
+  return hit ? hit.installation_id : null;
+}
+
+/** Test/demo fixture repos that must never appear in Source Control or
+ * the Tasks list (mirrors backend/models.py TEST_REPO_PREFIXES). */
+const TEST_REPO_PREFIXES = [
+  'demo/',
+  'acme/',
+  'test/',
+  'e2e/',
+  'iso/',
+  'dbg/',
+  'pub/',
+  'p0',
+  'p03/',
+  'p04/',
+  'p05/',
+  'p06/',
+];
+
+export function isTestRepo(fullName: string): boolean {
+  const n = (fullName || '').trim().toLowerCase();
+  return TEST_REPO_PREFIXES.some((p) => n.startsWith(p));
+}
 
 export const api = {
   health: () => fetch("/health").then(json<{ status: string; model: string; provider: string }>),
@@ -73,6 +111,14 @@ export const api = {
       headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ repo, message, task_id, installation_id }),
     }).then(json<{ reply: string; task_id: number | null; intent: string }>),
+  chatHistory: (repo: string, task_id?: number | null) =>
+    fetch(
+      `/api/chat/history?repo=${encodeURIComponent(repo)}${task_id ? `&task_id=${task_id}` : ''}`,
+    ).then(
+      json<{
+        messages: { role: string; content: string; created_at: string | null }[];
+      }>,
+    ),
   ghStatus: () => fetch("/api/github/status").then(json<GhStatus>),
   connected: () => fetch("/api/github/connected").then(json<{ repositories: ConnectedRepo[] }>),
   ghRepos: (installation_id: string) =>
@@ -153,7 +199,10 @@ export type AgentMessage = {
   args: Record<string, unknown>;
   content: string;
   ok: boolean;
+  /** Always "" — private model reasoning is never exposed (backend Phase 12). Kept for compat. */
   thinking?: string;
+  /** Short engineering-event summary: what the system did + evidence. */
+  summary?: string;
   duration_ms?: number;
   diff?: string;
   todos?: AgentTodo[];

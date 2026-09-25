@@ -1,10 +1,15 @@
-"""Hybrid repo indexer: files + symbols (stdlib ast for py, regex for ts/js). Incremental-ready."""
+"""Hybrid repo indexer: files + symbols (stdlib ast for py, regex for ts/js). Incremental-ready.
+
+P0-3: sensitive files (secrets, keys, env) are never indexed — neither their
+names-as-symbols nor their contents enter the agent's retrieval surface."""
 
 from __future__ import annotations
 
 import ast
 import re
 from pathlib import Path
+
+from ..repo.sensitive import is_sensitive
 
 LANGS = {
     ".py": "python",
@@ -30,10 +35,13 @@ def index_repo(root: Path, commit_sha: str = "") -> tuple[list[dict], list[dict]
             or "__pycache__" in p.parts
         ):
             continue
+        rel = str(p.relative_to(root))
+        if is_sensitive(rel):
+            continue
         lang = LANGS.get(p.suffix, "")
         files.append(
             {
-                "path": str(p.relative_to(root)),
+                "path": rel,
                 "language": lang,
                 "commit_sha": commit_sha,
             }
@@ -97,6 +105,9 @@ def search_code(root: Path, pattern: str, include: str = "*.py") -> list[dict]:
     for p in root.rglob("*"):
         if not p.is_file() or not fnmatch.fnmatch(p.name, include):
             continue
+        rel = str(p.relative_to(root))
+        if is_sensitive(rel):
+            continue
         try:
             for i, line in enumerate(
                 p.read_text(encoding="utf-8", errors="ignore").splitlines(), 1
@@ -104,7 +115,7 @@ def search_code(root: Path, pattern: str, include: str = "*.py") -> list[dict]:
                 if rx.search(line):
                     out.append(
                         {
-                            "file": str(p.relative_to(root)),
+                            "file": rel,
                             "line": i,
                             "text": line.strip()[:300],
                         }

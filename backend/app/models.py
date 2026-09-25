@@ -16,6 +16,31 @@ def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
+# Test/demo fixture prefixes that must never appear in Source Control or
+# the Tasks list. Tests write rows like demo/*, acme/*, test/* directly
+# into the live DB (see backend/tests/conftest.py isolation); the API
+# filters them by default so real repos stay findable.
+TEST_REPO_PREFIXES = (
+    "demo/",
+    "acme/",
+    "test/",
+    "e2e/",
+    "iso/",
+    "dbg/",
+    "pub/",
+    "p0",
+    "p03/",
+    "p04/",
+    "p05/",
+    "p06/",
+)
+
+
+def is_test_repo_name(full_name: str) -> bool:
+    name = (full_name or "").strip().lower()
+    return any(name.startswith(p) for p in TEST_REPO_PREFIXES)
+
+
 class Repository(Base):
     __tablename__ = "repositories"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -79,6 +104,10 @@ class Task(Base):
     issue_number: Mapped[int] = mapped_column(Integer, default=0)
     title: Mapped[str] = mapped_column(String(512), default="")
     state: Mapped[str] = mapped_column(String(32), default="CREATED", index=True)
+    # P0-1 isolated workspace: per-task working directory + the base commit
+    # the workspace was created from. Empty = not yet provisioned (legacy rows).
+    workspace_path: Mapped[str] = mapped_column(String(1024), default="")
+    base_sha: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_now
     )
@@ -93,6 +122,9 @@ class TaskEvent(Base):
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), index=True)
     stage: Mapped[str] = mapped_column(String(64))
     message: Mapped[str] = mapped_column(Text, default="")
+    # Phase 9: explicit transition audit. Nullable so legacy rows stay valid.
+    prev_state: Mapped[str] = mapped_column(String(32), default="")
+    reason: Mapped[str] = mapped_column(String(1024), default="")
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_now
     )
@@ -140,7 +172,27 @@ class VerificationRun(Base):
         String(64)
     )  # repro/regression/suite/lint/type/build/scan/adversarial/review
     passed: Mapped[bool] = mapped_column(default=False)
+    # P0-5 structured semantics. `passed` is kept in sync (True iff PASS)
+    # for back-compat readers; `status` is authoritative.
+    # PASS | FAIL | SKIPPED | NOT_RUN | ERROR
+    status: Mapped[str] = mapped_column(String(16), default="")
+    # Required gates decide VERIFIED. Optional gates (e.g. unconfigured
+    # typecheck) can only downgrade to VERIFIED_WITH_LIMITATIONS.
+    required: Mapped[bool] = mapped_column(default=True)
     output: Mapped[str] = mapped_column(Text, default="")
+    # Attribution architecture (baseline comparison). `phase` distinguishes
+    # the pre-patch baseline snapshot (BASELINE) from post-patch gates
+    # (AFTER); `signature` holds ;-joined normalized failure signatures;
+    # `attribution` classifies the failure (NONE when passing); duration_ms
+    # measures the gate wall-clock. See verify/signatures.py.
+    # phase: BASELINE | AFTER
+    phase: Mapped[str] = mapped_column(String(16), default="AFTER")
+    signature: Mapped[str] = mapped_column(Text, default="")
+    # NONE | TASK_FAILURE | BASELINE_FAILURE | ENVIRONMENT_FAILURE |
+    # DEPENDENCY_FAILURE | INFRASTRUCTURE_FAILURE | TIMEOUT |
+    # CONFIGURATION_FAILURE | UNRELATED_REPOSITORY_FAILURE | UNKNOWN
+    attribution: Mapped[str] = mapped_column(String(32), default="NONE")
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Patch(Base):
@@ -157,6 +209,8 @@ class PullRequest(Base):
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), index=True)
     url: Mapped[str] = mapped_column(String(1024), default="")
     number: Mapped[int] = mapped_column(Integer, default=0)
+    # Verified remote commit SHA (Phase 7/8). Empty = local-only record.
+    commit_sha: Mapped[str] = mapped_column(String(64), default="")
 
 
 class ChatMessage(Base):
@@ -207,6 +261,9 @@ class AgentSession(Base):
     )
     title: Mapped[str] = mapped_column(String(255), default="session")
     state: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    # P0-1 isolated workspace for file-modifying sessions. Empty until first
+    # tool turn provisions it (lazy, so read-only sessions cost nothing).
+    workspace_path: Mapped[str] = mapped_column(String(1024), default="")
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=_now
     )

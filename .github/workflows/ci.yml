@@ -22,11 +22,6 @@ jobs:
         run: python -m mypy backend/app
       - name: Pytest
         run: python -m pytest backend/tests/ -q
-      - name: Demo regression tests fail as designed
-        run: |
-          pip install fastapi httpx pytest PyJWT
-          python -m pytest demo/fastapi-jwt/tests/ -q || echo "jwt demo FAILs by design (bug present)"
-          python -m pytest demo/fastapi-pagination/tests/ -q || echo "pagination demo FAILs by design (bug present)"
 
   frontend:
     runs-on: ubuntu-latest

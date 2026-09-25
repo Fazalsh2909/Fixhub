@@ -71,9 +71,17 @@ def test_stall_hint_recorded(tmp_path: Path):
     orig = orch.run_in_sandbox
     orch.run_in_sandbox = lambda *a, **k: {"ok": False, "output": "repro fail"}
     try:
-        engineer_issue(db, task, tmp_path, StallProvider())
+        result = engineer_issue(db, task, tmp_path, StallProvider())
     finally:
         orch.run_in_sandbox = orig
-    hints = db.query(TaskEvent).filter_by(task_id=task.id, stage="HINT").all()
-    assert hints, "expected stall HINT after 3 failed turns"
+    # Identical-failure breaker supersedes the old stall hint: 3x the same
+    # denied turn stops the loop (FAILED, non-retryable) instead of hinting
+    # and burning the remaining 9 iters.
+    assert result.get("retryable") is False
+    db.refresh(task)
+    assert task.state == "FAILED"
+    tools = db.query(TaskEvent).filter_by(task_id=task.id, stage="TOOL").count()
+    assert tools == 3, f"breaker must stop after 3 identical turns, got {tools}"
+    hints = db.query(TaskEvent).filter_by(task_id=task.id, stage="BREAKER").all()
+    assert hints, "expected BREAKER event after 3 identical failed turns"
     db.close()

@@ -1,32 +1,18 @@
 import type { TaskDetail, TaskEvent, VerificationRow } from './tasks';
 
 /**
- * User-facing engineering pipeline (9 stages) mapped from backend STATES.
- * Backend: CREATED→ANALYZING→REPRODUCING→ROOT_CAUSE_FOUND→PLANNING→IMPLEMENTING
- *   →TESTING→DEBUGGING→VERIFYING→REVIEWING→READY_FOR_APPROVAL→COMMITTED→PUSHED→PR_CREATED
+ * Simple user-facing pipeline: the agent works, FixHub publishes.
+ * New states: RUNNING → COMPLETED / FAILED / BLOCKED.
+ * Legacy backend states map onto the same 4 nodes for history.
  */
-export type PipeStageId =
-  | 'understand'
-  | 'investigate'
-  | 'reproduce'
-  | 'plan'
-  | 'implement'
-  | 'test'
-  | 'verify'
-  | 'proof'
-  | 'pr';
+export type PipeStageId = 'working' | 'changes' | 'commit' | 'pr';
 
 export type StageState = 'idle' | 'running' | 'completed' | 'failed' | 'blocked';
 
 export const PIPELINE_STAGES: { id: PipeStageId; label: string; short: string }[] = [
-  { id: 'understand', label: 'UNDERSTAND', short: 'UND' },
-  { id: 'investigate', label: 'INVESTIGATE', short: 'INV' },
-  { id: 'reproduce', label: 'REPRODUCE', short: 'REP' },
-  { id: 'plan', label: 'PLAN', short: 'PLN' },
-  { id: 'implement', label: 'IMPLEMENT', short: 'IMP' },
-  { id: 'test', label: 'TEST', short: 'TST' },
-  { id: 'verify', label: 'VERIFY', short: 'VER' },
-  { id: 'proof', label: 'PROOF', short: 'PRF' },
+  { id: 'working', label: 'WORKING', short: 'WRK' },
+  { id: 'changes', label: 'CHANGES', short: 'CHG' },
+  { id: 'commit', label: 'COMMIT', short: 'CMT' },
   { id: 'pr', label: 'PR', short: 'PR' },
 ];
 
@@ -49,33 +35,37 @@ const BACKEND_ORDER = [
 
 function stageIndexFor(backendState: string): number {
   switch (backendState) {
+    case 'RUNNING':
+      return 0;
+    case 'COMPLETED':
+      return 4; // all done (handled below with evidence)
+    case 'FAILED':
+    case 'BLOCKED':
+    case 'CANCELLED':
+      return -2;
+    // Legacy states (history only — the simple path never writes these).
     case 'CREATED':
       return -1;
     case 'ANALYZING':
-      return 0;
     case 'REPRODUCING':
-      return 2;
     case 'ROOT_CAUSE_FOUND':
-      return 1;
     case 'PLANNING':
-      return 3;
     case 'IMPLEMENTING':
-      return 4;
     case 'TESTING':
     case 'DEBUGGING':
-      return 5;
+      return 0;
     case 'VERIFYING':
-      return 6;
     case 'REVIEWING':
     case 'READY_FOR_APPROVAL':
-      return 7;
+      return 1;
+    case 'APPROVED':
+    case 'BRANCH_CREATED':
     case 'COMMITTED':
+      return 2;
     case 'PUSHED':
+    case 'PR_CREATING':
     case 'PR_CREATED':
-      return 8;
-    case 'FAILED':
-    case 'CANCELLED':
-      return -2;
+      return 3;
     default:
       return -1;
   }
@@ -97,53 +87,49 @@ export function derivePipeline(
   const hasStageEvent = (needle: string[]) =>
     events.some((e) => needle.some((n) => `${e.stage} ${e.message}`.toUpperCase().includes(n)));
 
-  const currentIdx = stageIndexFor(state);
-  const backendIdx = BACKEND_ORDER.indexOf(state);
+  const hasAgentActivity = hasStageEvent(['AGENT', 'TOOL', 'EDIT', 'RUN']);
+  const hasCommit = hasStageEvent(['COMMIT', 'BRANCH', 'PUSH']) || !!detail?.branch;
+  const hasPR = !!detail?.pr_url || state === 'PR_CREATED';
+
+  if (!detail || !state) {
+    return PIPELINE_STAGES.map((s) => ({ ...s, state: 'idle' as StageState, detail: undefined }));
+  }
 
   return PIPELINE_STAGES.map((s, i) => {
     let st: StageState = 'idle';
     let note: string | undefined;
 
-    if (failed) {
-      // Failure localizes to where evidence points: failed gate → verify, else current.
-      if (i < Math.max(0, currentIdx)) st = 'completed';
-      else if (i === Math.max(0, currentIdx)) {
+    if (failed || state === 'BLOCKED') {
+      if (s.id === 'working') {
         st = 'failed';
-        note = hasFailGate ? 'gate failed — see Verification' : state;
+        note = state;
       } else st = 'blocked';
       return { ...s, state: st, detail: note };
     }
-
-    if (i < currentIdx || (currentIdx === 8 && i <= 8 && (state === 'PR_CREATED' || !!detail?.pr_url))) {
-      st = 'completed';
-    } else if (i === currentIdx) {
-      st = running && !['READY_FOR_APPROVAL', 'REVIEWING'].includes(state) ? 'running' : 'running';
-      if (s.id === 'verify' && verification.length > 0) {
-        note = `${verification.filter((v) => v.passed).length}/${verification.length} gates`;
-      }
+    if (state === 'COMPLETED') {
+      // Evidence-driven: only mark what actually happened.
+      if (s.id === 'working') st = 'completed';
+      else if (s.id === 'changes') st = hasDiff ? 'completed' : 'idle';
+      else if (s.id === 'commit') st = hasCommit || hasPR || !!detail?.branch ? 'completed' : hasDiff ? 'running' : 'idle';
+      else if (s.id === 'pr') st = hasPR ? 'completed' : 'idle';
+      if (s.id === 'changes' && !hasDiff) note = 'no changes';
+      return { ...s, state: st, detail: note };
     }
-
-    // Evidence upgrades (real data only):
-    if (s.id === 'reproduce' && hasStageEvent(['REPRO', 'FAIL'])) st = st === 'idle' ? 'completed' : st;
-    if (s.id === 'plan' && hasStageEvent(['PLAN'])) st = st === 'idle' ? 'completed' : st;
-    if (s.id === 'implement' && hasDiff) st = 'completed';
-    if (s.id === 'test' && verification.some((v) => v.check.toLowerCase().includes('suite'))) {
-      const suite = verification.find((v) => v.check.toLowerCase().includes('suite'));
-      if (suite && !suite.passed) st = 'failed';
-      else if (st === 'idle' && backendIdx > BACKEND_ORDER.indexOf('TESTING')) st = 'completed';
+    // RUNNING (or legacy active states): agent works, publish follows.
+    if (s.id === 'working') {
+      st = 'running';
+      if (hasAgentActivity) note = 'agent working';
+    } else if (s.id === 'changes') {
+      st = hasDiff ? 'completed' : 'idle';
+    } else if (s.id === 'commit') {
+      st = hasCommit || hasPR ? 'completed' : 'idle';
+    } else if (s.id === 'pr') {
+      st = hasPR ? 'completed' : 'idle';
     }
-    if (s.id === 'verify') {
-      if (verified) st = 'completed';
-      else if (hasFailGate && (state === 'DEBUGGING' || state === 'VERIFYING' || state === 'FAILED')) st = 'failed';
-    }
-    if (s.id === 'proof' && verified && hasDiff) st = 'completed';
-    if (s.id === 'pr') {
-      if (detail?.pr_url) st = 'completed';
-      else if (state === 'READY_FOR_APPROVAL' || state === 'REVIEWING') {
-        st = 'running';
-        note = 'waiting for approval';
-      }
-    }
+    void verification;
+    void hasFailGate;
+    void verified;
+    void running;
     return { ...s, state: st, detail: note };
   });
 }

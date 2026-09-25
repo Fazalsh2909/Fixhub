@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .db import get_db, init_db
+from .db import SessionLocal, get_db, init_db
 from .automation import router as automation_router
 from .agent.api import router as agent_router
 from .chat.router import router as chat_router
@@ -54,7 +53,37 @@ def _rate_limited(ip: str) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.validate_prod()
-    init_db()
+    if settings.is_prod:
+        # Production schema evolution goes through Alembic, never bare
+        # create_all (Phase 16). Dev/test keep create_all (+ _ensure_columns).
+        try:
+            from alembic import command as _alembic_command
+            from alembic.config import Config as _AlembicConfig
+
+            cfg = _AlembicConfig()
+            cfg.set_main_option("script_location", "alembic")
+            _alembic_command.upgrade(cfg, "head")
+        except Exception as e:
+            logger.error(f"alembic upgrade failed, falling back to init_db: {e}")
+            init_db()
+    else:
+        init_db()
+    # Background threads die with the process: any task left mid-loop states
+    # (ANALYZING..VERIFYING) has no owner anymore — mark it FAILED (audited)
+    # instead of leaving it stuck forever. Re-running provisions a clean
+    # workspace, so nothing is lost.
+    try:
+        from .automation import recover_interrupted_tasks
+
+        db = SessionLocal()
+        try:
+            recovered = recover_interrupted_tasks(db)
+            if recovered:
+                logger.warning(f"recovered {recovered} interrupted task(s) as FAILED")
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"interrupted-task recovery failed: {e}")
     yield
 
 
@@ -124,9 +153,13 @@ def create_app() -> FastAPI:
             from .queue import backend as queue_backend
 
             checks["queue"] = queue_backend()
+            if settings.is_prod and checks["queue"] == "memory":
+                checks["queue"] = "memory (DEGRADED — Redis unreachable, not durable)"
         except Exception:
             checks["queue"] = "unknown"
-        ok = checks.get("database") == "ok"
+        ok = checks.get("database") == "ok" and not str(
+            checks.get("queue", "")
+        ).startswith("memory (DEGRADED")
         return {"status": "ready" if ok else "degraded", "checks": checks}
 
     @app.get("/metrics")
@@ -145,10 +178,47 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/api/tasks")
-    def list_tasks(db: Session = Depends(get_db)) -> list[dict]:
+    def list_tasks(
+        repo: str = "", include_test: bool = False, db: Session = Depends(get_db)
+    ) -> list[dict]:
+        # Phase 10: optional repo scoping at the SQL level so one repo's
+        # tasks are never mixed into another's view. Empty = all (dev).
+        # Test/demo fixtures (demo/*, acme/*, test/*, ...) are hidden by
+        # default so the UI never drowns in pytest rows. Pass
+        # ?include_test=true to see them, or ?repo=demo/... explicitly.
+        from .models import Repository as _Repo
+        from .models import is_test_repo_name as _is_test
+
+        q = db.query(Task).order_by(Task.id.desc())
+        if repo.strip():
+            r = db.query(_Repo).filter_by(full_name=repo.strip()).first()
+            q = q.filter_by(repo_id=r.id if r else -1)
+            rows = q.limit(50).all()
+        else:
+            rows = q.limit(200).all()
+            if not include_test:
+                filtered: list = []
+                repo_cache: dict[int, str] = {}
+                for t in rows:
+                    name = repo_cache.get(t.repo_id)
+                    if name is None:
+                        rr = db.query(_Repo).filter_by(id=t.repo_id).first()
+                        name = rr.full_name if rr else ""
+                        repo_cache[t.repo_id] = name
+                    if not _is_test(name):
+                        filtered.append(t)
+                    if len(filtered) >= 50:
+                        break
+                rows = filtered
         return [
-            {"id": t.id, "title": t.title, "state": t.state, "issue": t.issue_number}
-            for t in db.query(Task).order_by(Task.id.desc()).limit(50)
+            {
+                "id": t.id,
+                "title": t.title,
+                "state": t.state,
+                "issue": t.issue_number,
+                "repo_id": t.repo_id,
+            }
+            for t in rows
         ]
 
     @app.get("/api/tasks/{task_id}")
@@ -193,17 +263,27 @@ def create_app() -> FastAPI:
             "events": [
                 {
                     "stage": e.stage,
-                    "message": e.message,
+                    "message": (e.message or ""),
                     "created_at": e.created_at.isoformat() if e.created_at else None,
                 }
                 for e in events
             ],
             "verification": [
-                {"check": r.check, "passed": r.passed, "output": r.output[:2000]}
+                {
+                    "check": r.check,
+                    "passed": r.passed,
+                    "status": r.status or ("PASS" if r.passed else "FAIL"),
+                    "required": bool(r.required),
+                    "output": (r.output or "")[:2000],
+                    "phase": r.phase or "AFTER",
+                    "attribution": r.attribution or "NONE",
+                    "signature": (r.signature or "").split(";") if r.signature else [],
+                    "duration_ms": int(r.duration_ms or 0),
+                }
                 for r in runs
             ],
-            "diff": patch.diff if patch else "",
-            "branch": patch.branch if patch else "",
+            "diff": (patch.diff if patch else "") or "",
+            "branch": (patch.branch if patch else "") or "",
             "pr_url": pr.url if pr else "",
             "pr_number": pr.number if pr else 0,
             "approvals": [
@@ -225,100 +305,18 @@ def create_app() -> FastAPI:
         request: Request = None,  # type: ignore[assignment]
         _auth: None = Depends(require_api_token),
     ):
-        """Demo mode: no GitHub needed. Runs real pytest repro on demo repo."""
-        client_ip = request.client.host if request and request.client else "unknown"
-        if _rate_limited(client_ip):
-            return JSONResponse(
-                status_code=429,
-                content={"error": "rate limited — try again in a minute"},
-            )
+        """Demo mode removed: demo/ fixtures were deleted per user request.
 
-        from .agent.orchestrator import engineer_issue
-        from .llm.openrouter import provider_from_settings
-        from .metrics import record_task
-        from .models import Repository
-
-        repo = db.query(Repository).filter_by(full_name="demo/fastapi-jwt").first()
-        if repo is None:
-            repo = Repository(full_name="demo/fastapi-jwt")
-            db.add(repo)
-            db.commit()
-            db.refresh(repo)
-        issue_text = (
-            body.issue if body else "Expired authentication tokens return HTTP 500"
+        Kept as a 410 so old UI builds fail loudly instead of silently
+        creating demo/fastapi-jwt rows that pollute Source Control.
+        Clone a real repo and POST /api/tasks instead.
+        """
+        return JSONResponse(
+            status_code=410,
+            content={
+                "error": "demo mode removed — clone a real repo and POST /api/tasks"
+            },
         )
-        task = Task(
-            repo_id=repo.id, issue_number=142, title=issue_text, state="CREATED"
-        )
-        db.add(task)
-        db.commit()
-        db.refresh(task)
-        _, api_key, _ = settings.resolved_llm()
-        if not api_key:
-            # deterministic fallback so demo works with zero keys: run real verification only
-            from .models import TaskEvent
-            from .verify.pipeline import run_verification
-
-            db.add(
-                TaskEvent(
-                    task_id=task.id,
-                    stage="ANALYZING",
-                    message="demo mode, no LLM key — verification-only path",
-                )
-            )
-            db.commit()
-            workdir = Path(__file__).resolve().parents[2] / "demo" / "fastapi-jwt"
-            results = run_verification(db, task, workdir)
-            verified = all(ok for _, ok in results)
-            task.state = "READY_FOR_APPROVAL" if verified else "DEBUGGING"
-            db.commit()
-            record_task(verified)
-            from .verify.pipeline import build_proof as _proof
-
-            return {
-                "task_id": task.id,
-                "verified": verified,
-                "mode": "verification-only (no LLM key)",
-                "proof": _proof(
-                    task,
-                    results,
-                    "(no files changed)",
-                    "regression test FAILED (expired JWT -> HTTP 500)",
-                    "FAIL (see verification rows)",
-                ),
-            }
-        result = engineer_issue(
-            db,
-            task,
-            Path(__file__).resolve().parents[2] / "demo" / "fastapi-jwt",
-            provider_from_settings(),
-        )
-        record_task(bool(result.get("verified")))
-        # Proof of Fix from real evidence: verification rows + edited files (TOOL events).
-        from .models import TaskEvent
-        from .verify.pipeline import build_proof
-
-        edited = sorted(
-            {
-                m.split("edited ", 1)[1].split(" ::")[0]
-                for (m,) in db.query(TaskEvent.message)
-                .filter(
-                    TaskEvent.task_id == task.id,
-                    TaskEvent.stage == "TOOL",
-                    TaskEvent.message.like("edit_file ok=True%"),
-                )
-                .all()
-                if "edited " in m
-            }
-        )
-        proof = build_proof(
-            task,
-            result.get("results", []),
-            diff="\n".join(edited) or "(no files changed)",
-            before="regression test FAILED (expired JWT -> HTTP 500)",
-            after="PASS" if result.get("verified") else "FAIL (see verification rows)",
-        )
-        return {"task_id": task.id, "proof": proof, **result}
 
     return app
 

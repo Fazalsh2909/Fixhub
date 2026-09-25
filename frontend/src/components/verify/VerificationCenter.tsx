@@ -1,12 +1,13 @@
 import { useState } from 'react';
 import type { VerificationRow } from '../../lib/tasks';
+import { attributionLabel } from '../../lib/tasks';
 import { Badge, FailureState } from '../ui/ui';
 
 /**
  * Verification Gates — mockup-style gate cards (Regression / Tests / Lint /
  * Types / Build / Security). Each card animates independently from its real
- * row. Evidence line is parsed from the actual gate output — gate durations
- * are NOT shown because the backend does not expose them (no invented 1m24s).
+ * row. Evidence line is parsed from the actual gate output; durations come
+ * from the backend when exposed.
  */
 const GATE_META: Record<string, { label: string; hint: string }> = {
   suite: { label: 'Tests', hint: 'pytest / npm test in sandbox' },
@@ -73,12 +74,14 @@ export default function VerificationCenter({ verification }: { verification: Ver
         </span>
       </div>
       <div style={{ fontSize: 11, color: 'var(--fh-muted)', marginBottom: 8 }}>
-        Each gate ran in isolation — a later PASS cannot mask an earlier FAIL. Durations are not shown: the API exposes results, not timings.
+        Each gate ran in isolation — a later PASS cannot mask an earlier FAIL. Failures marked pre-existing also failed before the patch; only failures caused by the change send the agent back to debugging.
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 8 }}>
         {verification.map((v, i) => {
           const m = metaFor(v.check);
           const isOpen = !!open[i];
+          const attr = attributionLabel(v.attribution);
+          const needsDebug = !v.passed && (!attr || attr === 'caused by change');
           return (
             <div
               key={i}
@@ -109,10 +112,14 @@ export default function VerificationCenter({ verification }: { verification: Ver
                 <span className="mono" style={{ fontSize: 11, fontWeight: 800 }}>{m.label}</span>
               </div>
               <div style={{ marginTop: 7 }}>
-                <Badge kind={v.passed ? 'ok' : 'bad'}>{v.passed ? 'Passed' : 'Failed'}</Badge>
+                <Badge kind={v.passed ? 'ok' : 'bad'}>{v.passed ? 'Passed' : 'Failed'}</Badge>{' '}
+                {attr && <Badge kind="warn">{attr}</Badge>}
               </div>
               <div className="mono" style={{ marginTop: 6, fontSize: 10.5, color: 'var(--fh-muted)' }} title={m.hint}>
                 {gateEvidence(v.output)}
+                {typeof v.duration_ms === 'number' && v.duration_ms > 0 && (
+                  <> · {(v.duration_ms / 1000).toFixed(1)}s</>
+                )}
               </div>
               <button
                 onClick={() => setOpen((o) => ({ ...o, [i]: !o[i] }))}
@@ -132,7 +139,11 @@ export default function VerificationCenter({ verification }: { verification: Ver
                     <FailureState
                       title={`${m.label} failed`}
                       reason={v.output.slice(0, 900)}
-                      next="Agent returned to DEBUGGING — fix the gate, then re-verify."
+                      next={
+                        needsDebug
+                          ? 'Agent returned to DEBUGGING — fix the gate, then re-verify.'
+                          : 'Recorded as pre-existing/environment — not auto-debugged.'
+                      }
                     />
                   </div>
                 )

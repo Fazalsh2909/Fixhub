@@ -164,6 +164,57 @@ class CreateTaskBody(BaseModel):
     title: str = ""
 
 
+def _start_simple_run(
+    db: Session,
+    repo: Repository,
+    issue_number: int,
+    title: str,
+    trigger: str,
+    instruction_body: str = "",
+) -> Task:
+    """Create a RUNNING issue run with its instruction stored alongside.
+
+    Every entry point (chat, custom task, webhook, from-issue) uses this so
+    the agent always receives the full instruction text — never just a title.
+    """
+    task = Task(
+        repo_id=repo.id,
+        issue_number=issue_number,
+        title=(title or "")[:500],
+        state="RUNNING",
+    )
+    db.add(task)
+    db.flush()
+    if (instruction_body or "").strip():
+        db.add(
+            ChatMessage(
+                task_id=task.id,
+                repo_id=repo.id,
+                role="user",
+                content=instruction_body.strip()[:4000],
+            )
+        )
+    db.add(TaskEvent(task_id=task.id, stage="RUNNING", message=f"trigger={trigger}"))
+    try:
+        from ..memory.store import snapshot_task
+
+        snapshot_task(db, repo.id, task.id, task.title, "RUNNING", f"trigger={trigger}")
+    except Exception:
+        pass
+    db.commit()
+    enqueue(
+        {
+            "run_id": task.id,
+            "task_id": task.id,
+            "repository": repo.full_name,
+            "repo": repo.full_name,
+            "issue_number": issue_number,
+            "issue": issue_number,
+        }
+    )
+    return task
+
+
 @router.post("/tasks")
 def create_task(
     body: CreateTaskBody,
@@ -180,18 +231,7 @@ def create_task(
             status_code=404,
             detail="repo not known — connect or clone it first",
         )
-    task = Task(repo_id=repo.id, issue_number=0, title=title[:500], state="CREATED")
-    db.add(task)
-    db.flush()
-    db.add(TaskEvent(task_id=task.id, stage="CREATED", message="trigger=custom"))
-    try:
-        from ..memory.store import snapshot_task
-
-        snapshot_task(db, repo.id, task.id, task.title, "CREATED", "trigger=custom")
-    except Exception:
-        pass
-    db.commit()
-    enqueue({"task_id": task.id, "repo": repo.full_name, "issue": 0})
+    task = _start_simple_run(db, repo, 0, title, "custom", title)
     launched = launch_task(task.id) if settings.auto_run else "disabled"
     log_event(logger, "custom_task", task_id=task.id, repo=repo.full_name)
     return {
@@ -202,14 +242,51 @@ def create_task(
     }
 
 
+@router.get("/chat/history")
+def chat_history(
+    repo: str = "", task_id: int | None = None, db: Session = Depends(get_db)
+) -> dict:
+    """Phase 14: persisted conversation for the active repo/session.
+
+    Scoped (never global): task_id wins when given, else the repo's
+    task-agnostic rows. Capped at 50, ascending. The frontend restores this
+    on reload instead of keeping a second ephemeral history.
+    """
+    q = db.query(ChatMessage).order_by(ChatMessage.id.asc())
+    if task_id:
+        t = db.query(Task).filter_by(id=task_id).first()
+        if t is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        q = q.filter(ChatMessage.task_id == task_id)
+    elif repo.strip():
+        r = db.query(Repository).filter_by(full_name=repo.strip()).first()
+        if r is None:
+            raise HTTPException(status_code=404, detail="repo not known")
+        q = q.filter(ChatMessage.repo_id == r.id, ChatMessage.task_id.is_(None))
+    else:
+        raise HTTPException(status_code=400, detail="repo or task_id required")
+    rows = q.limit(50).all()
+    return {
+        "messages": [
+            {
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in rows
+        ]
+    }
+
+
 def resolve_workdir(repo: Repository) -> Path:
     if repo.local_path:
         p = Path(repo.local_path)
         if p.is_dir():
             return p
-    # fall back to bundled demo (repo root, not backend/ — router.py is one
-    # level deeper than main.py, hence parents[3]).
-    return Path(__file__).resolve().parents[3] / "demo" / "fastapi-jwt"
+    raise HTTPException(
+        status_code=400,
+        detail=f"repo workspace not found for {repo.full_name} — clone it first",
+    )
 
 
 @router.post("/chat")
@@ -446,7 +523,21 @@ def _llm_chat_answer(
         context = _repo_context_block(db, repo, user_text)
         history: list[dict] = []
         try:
-            rows = db.query(ChatMessage).order_by(ChatMessage.id.desc()).limit(11).all()
+            # Phase 11: history is scoped to this repo/session. A session in
+            # Repo A must never see chat rows from Repo B (the old code read
+            # the latest 11 rows globally).
+            q = db.query(ChatMessage).order_by(ChatMessage.id.desc())
+            if body.task_id:
+                q = q.filter(
+                    (ChatMessage.task_id == body.task_id)
+                    | (
+                        (ChatMessage.repo_id == (repo.id if repo else None))
+                        & (ChatMessage.task_id.is_(None))
+                    )
+                )
+            elif repo is not None:
+                q = q.filter(ChatMessage.repo_id == repo.id)
+            rows = q.limit(11).all()
             for m in reversed(rows):
                 role = "assistant" if m.role == "assistant" else "user"
                 # Skip the just-saved current user message — it's in user_text.
@@ -560,18 +651,7 @@ def _handle_agent_task(
             "Tell me what to do — e.g. `edit login.py to ...`, `add dark mode`.",
             None,
         )
-    task = Task(repo_id=repo.id, issue_number=0, title=instruction, state="CREATED")
-    db.add(task)
-    db.flush()
-    db.add(TaskEvent(task_id=task.id, stage="CREATED", message="trigger=chat-agent"))
-    try:
-        from ..memory.store import snapshot_task
-
-        snapshot_task(db, repo.id, task.id, task.title, "CREATED", "trigger=chat-agent")
-    except Exception:
-        pass
-    db.commit()
-    enqueue({"task_id": task.id, "repo": repo.full_name, "issue": 0})
+    task = _start_simple_run(db, repo, 0, instruction, "chat-agent", body.message)
     launched = launch_task(task.id) if settings.auto_run else "disabled"
     log_event(logger, "chat_agent_task", task_id=task.id, repo=repo.full_name)
     if launched == "started":
@@ -626,8 +706,18 @@ def _handle_intent(
     if kind == "fix_issue":
         if repo is None:
             return ("Select a repo first (left panel), then ask e.g. `fix #12`.", None)
+        if (
+            repo.installation_id
+            and body.installation_id
+            and repo.installation_id != body.installation_id
+        ):
+            return (
+                "That installation does not own the selected repo — refusing.",
+                None,
+            )
         issue_no = intent["issue_number"]
         title = f"issue #{issue_no}"
+        issue_body = ""
         if body.installation_id:
             try:
                 from ..github.app_auth import get_installation_token
@@ -637,24 +727,22 @@ def _handle_intent(
                 issue = client.get_issue(repo.full_name, issue_no)
                 if isinstance(issue, dict):
                     title = issue.get("title", title)
+                    issue_body = issue.get("body", "") or ""
+                    try:
+                        comments = client.get_issue_comments(repo.full_name, issue_no)
+                    except Exception:
+                        comments = []
+                    for c in (comments or [])[:5]:
+                        if isinstance(c, dict) and (c.get("body") or "").strip():
+                            issue_body += (
+                                f"\n\nComment by {c.get('user', {}).get('login', '')}: "
+                                f"{c.get('body', '').strip()[:1000]}"
+                            )
             except Exception as e:
                 return (f"Couldn't fetch issue #{issue_no}: {e}", None)
-        task = Task(
-            repo_id=repo.id, issue_number=issue_no, title=title, state="CREATED"
+        task = _start_simple_run(
+            db, repo, issue_no, title, "chat", issue_body or body.message
         )
-        db.add(task)
-        db.flush()
-        db.add(TaskEvent(task_id=task.id, stage="CREATED", message="trigger=chat"))
-        try:
-            from ..memory.store import snapshot_task
-
-            snapshot_task(
-                db, repo.id, task.id, task.title, "CREATED", f"issue #{issue_no}"
-            )
-        except Exception:
-            pass
-        db.commit()
-        enqueue({"task_id": task.id, "repo": repo.full_name, "issue": issue_no})
         launched = launch_task(task.id) if settings.auto_run else "disabled"
         log_event(logger, "chat_fix_task", task_id=task.id, repo=repo.full_name)
         if launched == "started":
@@ -1011,16 +1099,24 @@ def run_task(
     db: Session = Depends(get_db),
     _auth: None = Depends(require_api_token),
 ) -> dict:
-    """Run the autonomous loop for a chat/webhook task on its resolved workdir."""
-    from ..automation import run_task_sync
+    """Run the autonomous loop for a chat/webhook task on its resolved workdir.
+
+    Holds the run slot for the whole synchronous execution: a second trigger
+    (background or sync) gets 409 instead of interleaving two runs on one
+    task row — the state machine rejects that loudly (VERIFYING→… collisions).
+    """
+    from ..automation import release, run_task_sync, try_acquire
 
     _ = db  # session is owned by run_task_sync (also safe for background threads)
-    if is_running(task_id):
+    if not try_acquire(task_id):
         raise HTTPException(
             status_code=409,
             detail="agent already running on this task — watch the Agent Trace",
         )
-    result = run_task_sync(task_id, force=True)
+    try:
+        result = run_task_sync(task_id, force=True)
+    finally:
+        release(task_id)
     if "status_code" in result and "error" in result:
         raise HTTPException(
             status_code=int(result["status_code"]), detail=str(result["error"])

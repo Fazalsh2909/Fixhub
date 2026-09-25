@@ -20,3 +20,9 @@ Consequences: free-tier rate limits → budgets/retries/backoff; never depend on
 Date: 2026-09-04. Status: accepted.
 Context: keep dev cost zero, prod AWS-ready.
 Decision: same models both DBs; SQLite for demo/tests, Postgres in compose/prod.
+
+# ADR-005: Attribution-based verification (baseline comparison, not exit codes)
+Date: 2026-09-23. Status: accepted.
+Context: every required-gate FAIL (even byte-identical to the pre-patch baseline, e.g. MCP stdio ExceptionGroup, asyncpg stub errors) sent the agent back to DEBUGGING; 2/8-gate runs burned full loops with zero progress.
+Decision: snapshot a BASELINE verification phase pre-patch; normalize gate outputs to failure signatures (pytest node + error type, mypy file + code); attribute each AFTER failure as TASK/BASELINE/ENV/DEP/INFRA/TIMEOUT/CONFIG/UNRELATED/UNKNOWN deterministically (no LLM verdicts); route to DEBUGGING only on new task-attributed failures; publish accepts VERIFIED and VERIFIED_WITH_LIMITATIONS with documented limitations.
+Consequences: verification costs ~2x sandbox time per attempt (bounded by fail-fast single attempt); VerificationRun gains phase/signature/attribution/duration_ms via additive migration 0004; legacy rows without baseline keep exact old semantics.

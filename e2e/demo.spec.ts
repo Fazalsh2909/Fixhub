@@ -29,17 +29,3 @@ test('chat on the right shows the real empty state', async ({ page }) => {
   await page.getByRole('tab', { name: 'Chat' }).click();
   await expect(page.getByText(/AI Engineer chat/).first()).toBeVisible();
 });
-
-test('demo autonomous fix shows real verification', async ({ page }) => {
-  test.setTimeout(600000);
-  await page.goto('http://localhost:5174');
-  await expect(page.getByText('FixHub').first()).toBeVisible({ timeout: 30000 });
-  await expect(page.getByRole('button', { name: 'Start Autonomous Fix' })).toBeVisible({ timeout: 30000 });
-  await page.getByRole('button', { name: 'Start Autonomous Fix' }).click();
-  // task transitions appear in the header badge once the backend responds
-  await expect(page.getByText(/Task #\d+/).first()).toBeVisible({ timeout: 120000 });
-  // real autonomous loop: investigate + fix + Docker verification (~3-9 min).
-  // Proof tab renders PASS/FAIL rows from real verification records.
-  await page.getByRole('tab', { name: /Proof/ }).first().click();
-  await expect(page.getByText(/PROOF OF FIX|PASS|FAIL/).first()).toBeVisible({ timeout: 540000 });
-});

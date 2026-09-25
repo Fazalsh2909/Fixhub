@@ -58,6 +58,23 @@ def _repo(tmp_path: Path) -> str:
     return name
 
 
+def detail_rows(sid: int):
+    from app.models import AgentMessage, AgentSession
+
+    db = SessionLocal()
+    try:
+        s = db.query(AgentSession).filter_by(id=sid).first()
+        assert s is not None
+        return (
+            db.query(AgentMessage)
+            .filter_by(session_id=sid)
+            .order_by(AgentMessage.id.asc())
+            .all()
+        )
+    finally:
+        db.close()
+
+
 def test_session_codes_end_to_end(tmp_path: Path, monkeypatch):
     import app.llm.openrouter as _or
 
@@ -73,7 +90,19 @@ def test_session_codes_end_to_end(tmp_path: Path, monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["status"] == "done"
-    assert (tmp_path / "a.py").read_text() == "x=2\n"  # edit applied to workdir
+    # P0-1: the edit lands in the session's isolated workspace, never in the
+    # shared base. The base file must be untouched.
+    from app.models import AgentSession as _AgentSession
+    from app.repo.workspaces import remove_workspace as _remove_ws
+
+    _db = SessionLocal()
+    _sess = _db.query(_AgentSession).filter_by(id=sid).first()
+    assert _sess is not None and _sess.workspace_path
+    _ws = Path(_sess.workspace_path)
+    _db.close()
+    assert _ws.is_dir() and _ws != tmp_path
+    assert (_ws / "a.py").read_text() == "x=2\n"  # edit applied in session ws
+    assert (tmp_path / "a.py").read_text() == "x=1\n"  # shared base untouched
     tools = [m for m in body["messages"] if m["role"] == "tool"]
     assert any(m["tool"] == "read_file" and m["ok"] for m in tools)
     assert any(m["tool"] == "edit_file" and m["ok"] for m in tools)
@@ -89,6 +118,7 @@ def test_session_codes_end_to_end(tmp_path: Path, monkeypatch):
         f"/api/agent/sessions/{sid}/message", json={"content": "thanks", "max_turns": 2}
     )
     assert r.status_code == 200, r.text
+    _remove_ws(_ws)
 
 
 def test_session_pauses_when_turns_run_out(monkeypatch, tmp_path: Path):
@@ -166,9 +196,18 @@ def test_session_timeline_fields_and_plan(monkeypatch, tmp_path: Path):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["status"] == "done"
-    # assistant thinking survives (was dropped before)
+    # Phase 12: private reasoning is never exposed or persisted. `thinking`
+    # stays present-but-empty; the engineering summary carries what happened.
     assistants = [m for m in body["messages"] if m["role"] == "assistant"]
-    assert any("read a.py before editing" in (m["thinking"] or "") for m in assistants)
+    assert assistants and all(m["thinking"] == "" for m in assistants)
+    assert any(m.get("summary") for m in assistants)
+    for m in assistants:
+        assert "read a.py before editing" not in (m["content"] or "")
+    rows = detail_rows(sid)
+    assert not any(
+        "read a.py before editing" in r.content for r in rows if r.role == "assistant"
+    )
+    assert not any("reasoning" in (r.extra or "") for r in rows)
     # every tool row carries timing; the edit carries a diff preview
     tools = [m for m in body["messages"] if m["role"] == "tool"]
     assert tools and all("duration_ms" in m for m in tools)
@@ -212,7 +251,10 @@ def test_session_stream_emits_rows_live(monkeypatch, tmp_path: Path):
     rows = [_json.loads(d) for e, d in events if e == "message"]
     roles = [m["role"] for m in rows]
     assert roles[0] == "user"  # rows arrive in save order, live
-    assert any(m.get("thinking") for m in rows if m["role"] == "assistant")
+    for m in rows:
+        if m["role"] == "assistant":
+            assert m.get("thinking") == ""  # no private reasoning over SSE either
+            assert isinstance(m.get("summary"), str)
     final = _json.loads([d for e, d in events if e == "done"][-1])
     assert final["status"] == "paused"  # max_turns=1 with a tool call
 

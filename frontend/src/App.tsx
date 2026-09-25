@@ -25,7 +25,7 @@ import ProofPanel from './components/proof/ProofPanel';
 import SystemGraph from './components/system/SystemGraph';
 import { Badge, EmptyState, LoadingState } from './components/ui/ui';
 import VerificationCenter from './components/verify/VerificationCenter';
-import { api, type ConnectedRepo, type GhStatus } from './lib/api';
+import { api, isTestRepo, pickInstallationForRepo, type ConnectedRepo, type GhStatus } from './lib/api';
 import { diffStats, parseDiff } from './lib/diff';
 import { IDE_DEFAULTS, usePersistedState, useResize } from './lib/ide';
 import { derivePipeline } from './lib/pipeline';
@@ -102,6 +102,7 @@ export default function App() {
 
   const refreshTasks = useCallback(async () => {
     try {
+      // Backend /api/tasks already hides demo/acme/test fixtures by default.
       const list = await api.tasks();
       setTasks(list);
       if (selectedId == null && list.length > 0) setSelectedId(list[0].id);
@@ -112,13 +113,15 @@ export default function App() {
     try {
       const [s, c] = await Promise.all([api.ghStatus(), api.connected()]);
       setGhStatus(s);
-      const merged = [...c.repositories];
+      // Backend already filters, client drops strays so demo/* never flashes.
+      const merged = [...c.repositories].filter((r) => !isTestRepo(r.full_name));
       const byName = new Map(merged.map((r) => [r.full_name, r]));
       const inst = installationId.trim();
       if (inst) {
         try {
           const live = await api.ghRepos(inst);
           for (const r of live.repositories) {
+            if (isTestRepo(r.full_name)) continue;
             const local = byName.get(r.full_name);
             if (local) local.connected = local.connected || r.connected;
             else {
@@ -131,11 +134,16 @@ export default function App() {
       }
       setRepos(merged);
       if (s.installations.length > 0 && !installationId) {
-        setInstallationId(s.installations[0].installation_id);
+        // Prefer the installation owning the selected repo over blind [0]:
+        // [0] may be a stale/demo id that 403/503s every ISSUES poll.
+        setInstallationId(
+          pickInstallationForRepo(s.installations, selectedRepo) ??
+            s.installations[0].installation_id
+        );
       }
     } catch { /* offline */ }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [installationId]);
+  }, [installationId, selectedRepo]);
 
   useEffect(() => { refreshTasks(); }, [refreshTasks]);
   useEffect(() => { refreshRepos(); }, [refreshRepos]);
@@ -166,6 +174,16 @@ export default function App() {
     timer = window.setInterval(load, 3000);
     return () => { stop = true; if (timer) window.clearInterval(timer); };
   }, [selectedId]);
+
+  // Keep the installation aligned with the selected repo's owner. A stale
+  // default (demo/test id) 403/503s every ISSUES poll otherwise. Manual
+  // edits are respected until the repo (or installation list) changes.
+  useEffect(() => {
+    if (!selectedRepo || !ghStatus || ghStatus.installations.length === 0) return;
+    const match = pickInstallationForRepo(ghStatus.installations, selectedRepo);
+    if (match && match !== installationId) setInstallationId(match);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRepo, ghStatus]);
 
   // Live GitHub issues for the selected repo (localhost-safe poll fallback).
   useEffect(() => {
@@ -209,6 +227,20 @@ export default function App() {
     setSaveMsg('');
     setExplorerFilter('');
     setExpanded(new Set(['']));
+    // Phase 13: a repo switch resets incompatible task selection. The task
+    // dropdown, detail, and editor reset together so selectedRepo ↔
+    // selectedTask.repository_id ↔ selectedSession.repository_id stay
+    // consistent instead of showing Repo A's task under Repo B.
+    if (selectedRepo) {
+      const repoRow = repos.find((r) => r.full_name === selectedRepo);
+      if (detail && detail.repo_id != null && repoRow && detail.repo_id !== repoRow.id) {
+        setSelectedId(null);
+        setDetail(null);
+        setRunning(false);
+        setRunError('');
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedRepo]);
 
   const fileTree = useMemo(() => buildTree(repoFiles), [repoFiles]);
@@ -377,7 +409,12 @@ export default function App() {
       await refreshTasks();
       if (d && isTerminalState(d.state)) setRunning(false);
     } catch (e) {
-      setRunError(e instanceof Error ? e.message : 'trigger failed — is the backend on :8001?');
+      const msg = e instanceof Error ? e.message : 'trigger failed — is the backend on :8001?';
+      setRunError(
+        msg.includes('410')
+          ? 'Demo mode removed — clone a real repo and create a task instead.'
+          : msg
+      );
       setRunning(false);
     }
   }
@@ -514,7 +551,9 @@ export default function App() {
         automation={automation}
         running={running}
         canReview={canReview}
+        hasTaskSelection={selectedId != null}
         onStart={startFix}
+        onRunSelected={runSelected}
         onApprove={approve}
       />
 

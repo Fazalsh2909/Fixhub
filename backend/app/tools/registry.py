@@ -1,12 +1,15 @@
-"""Controlled agent tools. Allow-listed shell; no host secrets; timeouts always."""
+"""Controlled agent tools. Structured argv policy; no shell; no host secrets; timeouts always."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 from ..llm.base import ToolSpec
-from ..sandbox.docker_runner import run_in_sandbox
+from ..repo.sensitive import DENIED_MESSAGE, is_sensitive
+from ..sandbox.docker_runner import run_argv
+from .command_policy import evaluate, evaluate_structured
 
+# Kept for the tool-spec help text (the policy module is authoritative).
 ALLOWED_PREFIXES = (
     "pytest",
     "python -m pytest",
@@ -23,7 +26,6 @@ DENIED_SUBSTRINGS = ("rm -rf /", "mkfs", ":(){", "curl", "wget", "/etc/passwd", 
 
 
 def tool_specs() -> list[ToolSpec]:
-    allow = ", ".join(ALLOWED_PREFIXES)
     return [
         ToolSpec(
             "list_files",
@@ -42,16 +44,35 @@ def tool_specs() -> list[ToolSpec]:
         ),
         ToolSpec(
             "run_command",
-            f"Run an allow-listed command in sandbox workdir. Allowed prefixes: {allow}. "
-            'Examples: {"cmd": "python -m pytest -q"}, {"cmd": "ruff check ."}. '
+            "Run one allow-listed program in the isolated sandbox workdir — no shell, "
+            'no chaining. Prefer {"program": "pytest", "args": ["-q"]}. '
+            'A plain {"cmd": "python -m pytest -q"} string is also accepted and '
+            "parsed to argv. Allowed programs: pytest, python -m pytest, ruff "
+            "check/format, mypy, tsc, npm test/run, read-only git, ls, cat. "
             "Anything else is rejected — do not guess other commands.",
-            {"type": "object", "properties": {"cmd": {"type": "string"}}},
+            {
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string"},
+                    "program": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}},
+                },
+            },
         ),
         ToolSpec(
             "run_test",
-            f"Alias for run_command with test focus. Same allow-list: {allow}. "
-            'Example: {"target": "pytest -q"} or {"cmd": "python -m pytest tests/ -x -q"}.',
-            {"type": "object", "properties": {"target": {"type": "string"}}},
+            "Alias for run_command with test focus. Same policy. "
+            'Example: {"program": "pytest", "args": ["tests/", "-x", "-q"]} '
+            'or {"target": "pytest -q"}.',
+            {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "cmd": {"type": "string"},
+                    "program": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}},
+                },
+            },
         ),
         ToolSpec(
             "edit_file",
@@ -127,7 +148,26 @@ def _resolve(workdir: Path, rel: str) -> Path | None:
         return None
 
 
+def read_file(workdir: Path, path: str, max_chars: int = 4000) -> dict:
+    """Read a workdir-relative file. Sensitive files are denied (P0-3)."""
+    if is_sensitive((path or "").strip().lstrip("/")):
+        return {"ok": False, "output": DENIED_MESSAGE}
+    p = _resolve(workdir, path)
+    return (
+        {
+            "ok": p.exists(),
+            "output": p.read_text(errors="ignore")[:max_chars]
+            if p.exists()
+            else "not found",
+        }
+        if p
+        else {"ok": False, "output": "path escapes workdir"}
+    )
+
+
 def edit_file(workdir: Path, path: str, old_string: str, new_string: str) -> dict:
+    if is_sensitive((path or "").strip().lstrip("/")):
+        return {"ok": False, "output": DENIED_MESSAGE}
     target = _resolve(workdir, path)
     if target is None or not target.is_file():
         return {"ok": False, "output": "path escapes workdir or is not a file"}
@@ -157,6 +197,8 @@ def edit_file(workdir: Path, path: str, old_string: str, new_string: str) -> dic
 
 
 def create_file(workdir: Path, path: str, content: str) -> dict:
+    if is_sensitive((path or "").strip().lstrip("/")):
+        return {"ok": False, "output": DENIED_MESSAGE}
     target = _resolve(workdir, path)
     if target is None:
         return {"ok": False, "output": "path escapes workdir"}
@@ -187,10 +229,32 @@ def _unified_diff(path: str, before: str, after: str, max_chars: int = 4000) -> 
     return "\n".join(lines)[:max_chars]
 
 
-def run_command(workdir: Path, cmd: str, timeout: int = 180) -> dict:
-    if any(d in cmd for d in DENIED_SUBSTRINGS):
-        return {"ok": False, "output": "denied by tool policy"}
-    if not cmd.startswith(ALLOWED_PREFIXES):
-        return {"ok": False, "output": f"command not allow-listed: {cmd[:80]}"}
+def run_command(
+    workdir: Path,
+    cmd: str = "",
+    timeout: int = 180,
+    *,
+    program: str = "",
+    args: list[str] | None = None,
+) -> dict:
+    """Execute one policy-approved command with no shell.
+
+    Preferred shape is ``program`` + ``args`` (structured argv). ``cmd`` is
+    accepted for back-compat and parsed with shlex into argv. Anything the
+    policy rejects returns ``ok: False`` — rejections are evidence, never
+    exceptions, so the agent loop records them as TOOL events.
+    """
+    if program.strip() or args:
+        argv, reason = evaluate_structured(program, args or [])
+    else:
+        argv, reason = evaluate(cmd or "")
+    if argv is None:
+        return {"ok": False, "output": f"denied by tool policy: {reason}"}
+    if argv[0] == "pytest":
+        # The sandbox image carries no `pytest` console script on PATH
+        # (per-task deps live under /deps via PYTHONPATH, scripts excluded),
+        # so bare `pytest` dies in runc with "executable file not found".
+        # The module form always resolves — normalize after approval.
+        argv = ["python", "-m", "pytest", *argv[1:]]
     # Agent commands must execute inside the isolated sandbox, never on the API host.
-    return run_in_sandbox(workdir, cmd, timeout=timeout, require_isolation=True)
+    return run_argv(workdir, argv, timeout=timeout, require_isolation=True)

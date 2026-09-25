@@ -1,12 +1,16 @@
-"""Repo file browser: transparent VS Code-like read/edit of the agent workdir.
+"""Repo file browser: VS Code-like view of the shared base checkout.
 
-Same workdir the agent uses (cloned `local_path`, demo fallback) so what you
-see is what the agent sees. Reads are open; writes go through the standard
-`require_api_token` gate (open in dev, bearer in prod).
+Scope contract (P0-1): this surface shows the SHARED BASE (cloned
+`local_path`, demo fallback). Autonomous tasks and interactive sessions do
+NOT work here — they each get an isolated `workspaces/tasks/task-<id>/` or
+`workspaces/sessions/session-<id>/` directory (see `repo.workspaces` and
+`agent.api._workdir_for`). Writes here are explicit human base edits;
+agent evidence (diffs, verification) always comes from the isolated
+workspace recorded on `task.workspace_path`.
 
 Security: every path is jailed with `tools.registry._resolve` — `..` escapes
-and absolute paths are rejected. `.git` internals and `.env` files are never
-served or written. Sizes are capped so a huge bundle can't OOM the UI.
+and absolute paths are rejected. Sensitive contents are never served or
+written (403). Sizes are capped so a huge bundle can't OOM the UI.
 """
 
 from __future__ import annotations
@@ -62,8 +66,10 @@ def resolve_workdir(repo: Repository) -> tuple[Path, str]:
         p = Path(repo.local_path)
         if p.is_dir():
             return p, "workspace"
-    demo = Path(__file__).resolve().parents[3] / "demo" / "fastapi-jwt"
-    return demo, "demo"
+    raise HTTPException(
+        status_code=400,
+        detail=f"repo workspace not found for {repo.full_name} — clone it first",
+    )
 
 
 def _get_repo(db: Session, full_name: str) -> Repository:
@@ -118,12 +124,15 @@ def read_file(
     db: Session = Depends(get_db),
 ) -> dict:
     from ..tools.registry import _resolve
+    from .sensitive import DENIED_MESSAGE, is_sensitive
 
     repo = _get_repo(db, full_name)
     workdir, _ = resolve_workdir(repo)
     rel = (path or "").strip().lstrip("/")
-    if not rel or rel.startswith(".git") or rel == ".env" or rel.endswith("/.env"):
+    if not rel:
         raise HTTPException(status_code=403, detail="path not servable")
+    if is_sensitive(rel):
+        raise HTTPException(status_code=403, detail=DENIED_MESSAGE)
     target = _resolve(workdir, rel)
     if target is None:
         raise HTTPException(status_code=403, detail="path escapes workdir")
@@ -154,12 +163,15 @@ def save_file(
     _auth: None = Depends(require_api_token),
 ) -> dict:
     from ..tools.registry import _resolve
+    from .sensitive import DENIED_MESSAGE, is_sensitive
 
     repo = _get_repo(db, body.full_name)
     workdir, _ = resolve_workdir(repo)
     rel = (body.path or "").strip().lstrip("/")
-    if not rel or rel.startswith(".git") or rel == ".env" or rel.endswith("/.env"):
+    if not rel:
         raise HTTPException(status_code=403, detail="path not writable")
+    if is_sensitive(rel):
+        raise HTTPException(status_code=403, detail=DENIED_MESSAGE)
     if len(body.content.encode("utf-8")) > MAX_WRITE_BYTES:
         raise HTTPException(status_code=413, detail="file too large (500KB cap)")
     target = _resolve(workdir, rel)

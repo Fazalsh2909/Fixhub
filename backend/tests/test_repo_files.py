@@ -14,14 +14,19 @@ client = TestClient(app, raise_server_exceptions=False)
 
 
 def _ensure_repo(tmp_path: Path | None = None) -> str:
+    import tempfile
+
     init_db()
     db = SessionLocal()
     name = f"demo/files-{uuid.uuid4().hex[:8]}"
     if tmp_path is None:
-        # Read-only tests point at the bundled demo (no writes there).
-        workdir = Path(__file__).resolve().parents[1] / "demo" / "fastapi-jwt"
+        # Read-only tests get an isolated temp dir (demo fixtures deleted).
+        tmpdir = Path(tempfile.mkdtemp(prefix="fixhub-repo-"))
+        workdir = tmpdir / name.replace("/", "-")
+        (workdir / "app").mkdir(parents=True)
+        (workdir / "app" / "main.py").write_text("print('hi')\n")
     else:
-        # Write tests get an isolated dir so the shared demo stays pristine.
+        # Write tests get an isolated dir so repos never share state.
         workdir = tmp_path / name.replace("/", "-")
         (workdir / "app").mkdir(parents=True)
         (workdir / "app" / "main.py").write_text("print('hi')\n")

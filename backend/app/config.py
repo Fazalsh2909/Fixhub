@@ -72,14 +72,20 @@ class Settings(BaseSettings):
     skills_dir: str = ""
     skills_top_k: int = 2
     skills_max_chars: int = 6000
-    # Agent auto-retry: total attempts = 1 + this value. Retries on both
-    # verification FAIL (DEBUGGING) and retryable provider errors (429/5xx).
-    # Non-retryable provider errors (400/401/403) fail fast without retry.
+    # Agent auto-retry: total attempts = 1 + this value. Retries retryable
+    # provider errors (429/5xx) only — deterministic verification FAIL stops
+    # after attempt 1 (fail fast). Non-retryable provider errors
+    # (400/401/403/404) fail fast without retry.
     agent_max_retries: int = 2
     agent_retry_backoff_s: float = 5.0
     # Per-task spend guard. 0 = unlimited (dev). Prod: e.g. 0.50.
     # Enforced in orchestrator before each billable LLM call.
     agent_max_cost_usd: float = 0.0
+    # Per-task LLM call budget (logical tool_call invocations, shared across
+    # attempts and subagent turns). 0 = unlimited. Unlike dollars, this works
+    # for free-tier models that price at $0. Enforced in the orchestrator loop
+    # and the explore subagent before each billable call.
+    agent_max_llm_calls: int = 30
     # Transcript budget per LLM call (chars, ~4 chars/token). Older tool
     # output is truncated, oldest exchanges dropped — DB keeps the full record.
     agent_context_budget_chars: int = 60000
@@ -89,6 +95,16 @@ class Settings(BaseSettings):
     # Prod path: set REDIS_URL to ElastiCache; SQS adapter plugs into queue.py
     # via the same enqueue/dequeue/ack interface (see queue.py docstring).
     queue_backend: str = "auto"
+    # Primary autonomous coding path: mini-SWE-agent (thin adapter in
+    # app/agent/miniswe_adapter.py). False = legacy built-in ReAct loop
+    # (kept as fallback until the mini-SWE path is proven end-to-end).
+    miniswe_enabled: bool = True
+    # Diagnose-then-fix autonomy needs room to explore AND fix: 50 steps.
+    # Worst-case cost/time per run roughly doubles vs 25 — tune per repo.
+    miniswe_step_limit: int = 50
+    miniswe_wall_time_s: int = 1200
+    # Agent container image. Empty = settings.sandbox_image.
+    miniswe_image: str = ""
 
     def resolved_model(self) -> str:
         """Model id to send. FIXHUB_MODEL > NEXUS_MODEL alias > built-in default."""

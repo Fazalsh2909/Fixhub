@@ -45,6 +45,10 @@ def _get_session(db: Session, session_id: int) -> AgentSession:
 
 
 def _workdir_for(db: Session, session: AgentSession):
+    from pathlib import Path as _Path
+
+    from ..repo.workspaces import create_session_workspace
+
     repo = (
         db.query(Repository).filter_by(id=session.repo_id).first()
         if session.repo_id
@@ -54,11 +58,20 @@ def _workdir_for(db: Session, session: AgentSession):
         raise HTTPException(
             status_code=404, detail="repo not known — connect or clone it first"
         )
-    workdir, _ = resolve_workdir(repo)
-    if not workdir.is_dir():
+    base, _ = resolve_workdir(repo)
+    if not base.is_dir():
         raise HTTPException(
             status_code=400, detail="repo workspace not found — clone it first"
         )
+    # P0-1: file-modifying sessions work in their own isolated directory,
+    # never in the shared base. Provisioned lazily so read-only sessions
+    # cost nothing; recreated clean if missing (deterministic baseline).
+    if session.workspace_path and _Path(session.workspace_path).is_dir():
+        return repo, _Path(session.workspace_path)
+    workdir, _ = create_session_workspace(base, session.id)
+    session.workspace_path = str(workdir)
+    db.commit()
+    log_event(logger, "agent_session_workspace", session_id=session.id)
     return repo, workdir
 
 
@@ -104,12 +117,12 @@ def create_session(
 
 @router.get("/sessions")
 def list_sessions(repo: str = "", db: Session = Depends(get_db)) -> list[dict]:
-    q = db.query(AgentSession).order_by(AgentSession.id.desc()).limit(20)
-    rows = q.all()
+    # Phase 10: repo scoping at the SQL level, not in Python after fetch.
+    q = db.query(AgentSession).order_by(AgentSession.id.desc())
     if repo.strip():
         r = db.query(Repository).filter_by(full_name=repo.strip()).first()
-        rows = [s for s in rows if s.repo_id == (r.id if r else -1)]
-    return [{"id": s.id, "title": s.title, "state": s.state} for s in rows]
+        q = q.filter_by(repo_id=r.id if r else -1)
+    return [{"id": s.id, "title": s.title, "state": s.state} for s in q.limit(20).all()]
 
 
 @router.get("/sessions/{session_id}")

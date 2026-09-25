@@ -27,12 +27,12 @@ describe('taskElapsed', () => {
 describe('stageDurations', () => {
   it('computes spans only for stages with 2+ timestamps', () => {
     const d = stageDurations([
-      { stage: 'ANALYZING', message: 'a', created_at: '2026-09-22T12:00:00Z' },
-      { stage: 'ANALYZING', message: 'b', created_at: '2026-09-22T12:02:00Z' },
-      { stage: 'VERIFYING', message: 'c', created_at: '2026-09-22T12:03:00Z' },
+      { stage: 'AGENT', message: 'a', created_at: '2026-09-22T12:00:00Z' },
+      { stage: 'AGENT', message: 'b', created_at: '2026-09-22T12:02:00Z' },
+      { stage: 'DIFF', message: 'c', created_at: '2026-09-22T12:03:00Z' },
     ]);
-    expect(d.understand).toBe(120000);
-    expect(d.verify).toBeUndefined();
+    expect(d.working).toBe(120000);
+    expect(d.changes).toBeUndefined();
     expect(formatDuration(120000)).toBe('2m 0s');
   });
 });

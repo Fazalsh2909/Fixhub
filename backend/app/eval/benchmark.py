@@ -2,21 +2,9 @@
 
 from __future__ import annotations
 
-TASKS = [
-    {"id": "auth-jwt-expiry", "kind": "authentication bug", "repo": "demo/fastapi-jwt"},
-    {
-        "id": "pagination-offbyone",
-        "kind": "pagination bug",
-        "repo": "demo/fastapi-pagination",
-    },
-    {"id": "sql-nplus1", "kind": "SQL bug", "repo": "demo/fastapi-jwt"},
-    {
-        "id": "retry-idempotency",
-        "kind": "retry/idempotency bug",
-        "repo": "demo/fastapi-jwt",
-    },
-    {"id": "async-exc", "kind": "async exception", "repo": "demo/fastapi-jwt"},
-]
+# Demo fixtures (demo/fastapi-*) were deleted per user request — eval tasks
+# now resolve against real cloned repos. Empty until re-registered.
+TASKS: list[dict] = []
 
 METRICS = [
     "task_success",
@@ -27,58 +15,12 @@ METRICS = [
     "duration_s",
     "verification_failures",
     "tokens_used",
+    "files_changed",
+    "failure_reason",
 ]
 
-# Honest, hand-verified results. Only auth-jwt-expiry has a documented live run
-# (docs/DEMO-RUN-2026-09-04.md, tasks 17→21). Others are pending — not fabricated.
-EVAL_RESULTS = [
-    {
-        "task_id": "auth-jwt-expiry",
-        "status": "PASS",
-        "evidence": "docs/DEMO-RUN-2026-09-04.md (task 21 verified:true, pytest 1 passed)",
-        "repro": "FAILED tests/test_expiry.py — assert 500 == 401",
-        "fix": "ExpiredSignatureError/InvalidTokenError → 401",
-        "verified": True,
-    },
-    {
-        "task_id": "pagination-offbyone",
-        "status": "PENDING",
-        "evidence": (
-            "demo/fastapi-pagination regression test fails as designed "
-            "(2 failed); agent runs as backend tasks 110/111: correct "
-            "investigation, blocked — no Docker daemon on this Windows host "
-            "for the verification lane. Task 110 also exposed a raw "
-            "RemoteProtocolError leak, fixed + regression-tested."
-        ),
-        "repro": "pytest demo/fastapi-pagination (expect FAIL)",
-        "fix": "",
-        "verified": False,
-    },
-    {
-        "task_id": "sql-nplus1",
-        "status": "NOT_RUN",
-        "evidence": "",
-        "repro": "",
-        "fix": "",
-        "verified": False,
-    },
-    {
-        "task_id": "retry-idempotency",
-        "status": "NOT_RUN",
-        "evidence": "",
-        "repro": "",
-        "fix": "",
-        "verified": False,
-    },
-    {
-        "task_id": "async-exc",
-        "status": "NOT_RUN",
-        "evidence": "",
-        "repro": "",
-        "fix": "",
-        "verified": False,
-    },
-]
+# Honest, hand-verified results. Demo fixtures deleted — no recorded runs.
+EVAL_RESULTS: list[dict] = []
 
 
 def run_benchmark(
@@ -97,7 +39,20 @@ def run_benchmark(
     import time
     from pathlib import Path
 
-    task = next(t for t in TASKS if t["id"] == task_id)
+    task = next((t for t in TASKS if t["id"] == task_id), None)
+    if task is None:
+        return {
+            "task": {"id": task_id},
+            "metrics": {m: None for m in METRICS},
+            "recorded": None,
+            "note": "eval task not registered (demo fixtures deleted)",
+            "live": {
+                "mode": "error",
+                "verified": False,
+                "results": [],
+                "error": "unknown eval task",
+            },
+        }
     recorded = next((r for r in EVAL_RESULTS if r["task_id"] == task_id), None)
     base = {
         "task": task,
@@ -138,18 +93,27 @@ def run_benchmark(
             from ..agent.orchestrator import engineer_issue
 
             out = engineer_issue(db, task_row, workdir, llm)
+            _attr = out.get("attribution", {}) or {}
             live = {
                 "mode": "agent",
                 "verified": bool(out.get("verified")),
+                "overall": out.get("overall"),
                 "results": out.get("results", []),
+                "attribution": {
+                    "verdict": _attr.get("verdict"),
+                    "new": list(_attr.get("new", [])),
+                    "pre_existing": int(_attr.get("pre_existing", 0)),
+                    "resolved": list(_attr.get("resolved", [])),
+                },
             }
         else:
-            from ..verify.pipeline import run_verification
+            from ..verify.pipeline import overall_status, run_verification
 
             results = run_verification(db, task_row, workdir)
             live = {
                 "mode": "verification-only",
-                "verified": bool(all(ok for _, ok in results)),
+                "verified": overall_status(results) == "VERIFIED",
+                "overall": overall_status(results),
                 "results": results,
             }
     except Exception as e:
@@ -181,6 +145,38 @@ def run_benchmark(
         except Exception:
             pass
 
+    files_changed: list[str] = []
+    failure_reason: str | None = live.get("error")
+    if task_row is not None:
+        try:
+            from ..repo.workspaces import git_diff_all as _diff_all
+            from pathlib import Path as _P
+
+            ws = _P(task_row.workspace_path) if task_row.workspace_path else None
+            if ws is not None and ws.is_dir():
+                _d = _diff_all(ws)
+                files_changed = sorted(
+                    {
+                        ln[6:]
+                        for ln in _d.splitlines()
+                        if ln.startswith(("+++ b/", "--- a/"))
+                    }
+                )[:50]
+        except Exception:
+            pass
+        if not live.get("verified") and not failure_reason:
+            try:
+                failing = [
+                    getattr(r, "check", "?")
+                    for r in live.get("results", [])
+                    if getattr(r, "status", None) not in ("PASS", "SKIPPED")
+                    and getattr(r, "required", True)
+                ]
+                failure_reason = (
+                    f"required gates failing: {', '.join(failing)}" if failing else None
+                )
+            except Exception:
+                pass
     metrics = {
         "task_success": 1 if live.get("verified") else 0,
         "regression_rate": None,  # filled by caller comparing before/after repro
@@ -188,10 +184,21 @@ def run_benchmark(
         "iterations": iterations,
         "tool_failures": tool_failures,
         "duration_s": duration_s,
-        "verification_failures": sum(1 for _, ok in live.get("results", []) if not ok),
+        "verification_failures": sum(
+            1
+            for r in live.get("results", [])
+            if getattr(r, "status", None) != "PASS" and getattr(r, "required", True)
+        ),
         "tokens_used": after["total_tokens"] - before["total_tokens"],
         "llm_calls": after["llm_calls"] - before["llm_calls"],
         "est_cost_usd": round(after["est_cost_usd"] - before["est_cost_usd"], 6),
+        "files_changed": files_changed,
+        "failure_reason": failure_reason,
+        "verdict": live.get("overall"),
+        "new_failures": (live.get("attribution", {}) or {}).get("new", []),
+        "pre_existing_failures": (live.get("attribution", {}) or {}).get(
+            "pre_existing", 0
+        ),
     }
     return {**base, "live": live, "metrics": metrics}
 
@@ -199,7 +206,11 @@ def run_benchmark(
 def _pass_rate(results: list) -> float | None:
     if not results:
         return None
-    return sum(1 for _, ok in results if ok) / len(results)
+    statuses = [getattr(r, "status", None) for r in results]
+    if any(s is None for s in statuses):
+        # Legacy tuple shape (check, ok) — kept for recorded fixtures.
+        return sum(1 for _, ok in results if ok) / len(results)
+    return sum(1 for s in statuses if s == "PASS") / len(results)
 
 
 def summarize_eval_table(results: list[dict]) -> str:
@@ -209,10 +220,10 @@ def summarize_eval_table(results: list[dict]) -> str:
         "|---|---|---|---|---|---|",
     ]
     for r in results:
-        m = r.get("metrics", {})
-        task_id = r.get("task", {}).get("id", "?")
-        verified = r.get("live", {}).get(
-            "verified", r.get("recorded", {}).get("verified", False)
+        m = r.get("metrics", {}) or {}
+        task_id = (r.get("task", {}) or {}).get("id", "?")
+        verified = (r.get("live", {}) or {}).get(
+            "verified", (r.get("recorded", {}) or {}).get("verified", False)
         )
         lines.append(
             f"| {task_id} | {verified} | {m.get('duration_s')} | {m.get('tokens_used')} "

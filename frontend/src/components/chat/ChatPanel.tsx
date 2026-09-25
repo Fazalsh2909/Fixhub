@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { api } from '../../lib/api';
 import { EmptyState } from '../ui/ui';
 
@@ -22,6 +22,34 @@ export default function ChatPanel({
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+
+  // Phase 14: restore persisted session history on repo/task switch so a
+  // reload keeps the conversation (timestamps preserved server-side). This
+  // is the SAME store POST /api/chat writes — no second ephemeral history.
+  useEffect(() => {
+    if (!repo) {
+      setRows([]);
+      return;
+    }
+    let stop = false;
+    api
+      .chatHistory(repo, taskId)
+      .then((h) => {
+        if (stop) return;
+        setRows(
+          h.messages.map((m) => ({
+            role: m.role === 'assistant' ? 'assistant' : 'user',
+            text: m.content,
+          })),
+        );
+      })
+      .catch(() => {
+        if (!stop) setRows([]);
+      });
+    return () => {
+      stop = true;
+    };
+  }, [repo, taskId]);
 
   async function send() {
     const msg = input.trim();

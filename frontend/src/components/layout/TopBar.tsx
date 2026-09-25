@@ -49,7 +49,9 @@ export default function TopBar({
   automation,
   running,
   canReview,
+  hasTaskSelection,
   onStart,
+  onRunSelected,
   onApprove,
 }: {
   repos: ConnectedRepo[];
@@ -63,7 +65,9 @@ export default function TopBar({
   automation: AutomationStatus | null;
   running: boolean;
   canReview: boolean;
+  hasTaskSelection: boolean;
   onStart: () => void;
+  onRunSelected: () => void;
   onApprove: () => void;
 }) {
   const stateKind =
@@ -72,8 +76,22 @@ export default function TopBar({
     : detail.state === 'READY_FOR_APPROVAL' || detail.state === 'PR_CREATED' ? 'ok'
     : detail.state === 'REVIEWING' ? 'warn' : 'run';
   const modelShort = provider ? provider.model.split('/').slice(-1)[0] : '…';
-  const primaryLabel = canReview ? 'Approve & Create PR' : running ? 'Fix running…' : 'Start Autonomous Fix';
-  const primaryAction = canReview ? onApprove : onStart;
+  // Phase 13: the primary action must never fire the demo endpoint when a
+  // real task is selected. No selection → demo (e2e-safe, honest label via
+  // title). Selection → run the actual selected task.
+  const primaryLabel = canReview
+    ? 'Approve & Create PR'
+    : running
+      ? 'Fix running…'
+      : hasTaskSelection
+        ? 'Run Autonomous Fix'
+        : 'Start Autonomous Fix';
+  const primaryAction = canReview ? onApprove : hasTaskSelection ? onRunSelected : onStart;
+  const primaryTitle = canReview
+    ? 'Approve the verified diff and open a PR'
+    : hasTaskSelection
+      ? 'Run the agent on the selected task'
+      : 'Demo removed — clone a repo and create a task first';
 
   return (
     <header
@@ -175,6 +193,7 @@ export default function TopBar({
         <button title="Settings" aria-label="Settings" className="fh-btn" style={{ background: 'transparent', border: '1px solid var(--fh-border)', color: 'var(--fh-text-2)', borderRadius: 8, padding: '6px 9px', cursor: 'pointer' }}>⚙</button>
         <button
           onClick={primaryAction}
+          title={primaryTitle}
           disabled={running && !canReview}
           className="fh-btn"
           style={{

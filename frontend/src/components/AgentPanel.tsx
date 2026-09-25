@@ -427,10 +427,9 @@ export default function AgentPanel({ repo, dark, onWorkdirChanged }: Props) {
               </div>
             );
           if (m.role === 'assistant') {
-            if (!m.content && !m.thinking) return null; // pairing row only
+            if (!m.content) return null; // pairing row only — never render private reasoning
             return (
               <div key={m.id} className="fh-rise" style={{ margin: '2px 0', ...stagger }}>
-                {m.thinking && <Thought text={m.thinking} dark={dark} />}
                 {m.content && (
                   <div style={{ fontSize: 13, borderLeft: `2px solid ${dark.green}`, paddingLeft: 8, margin: '4px 0 4px 18px' }}>
                     <Md text={m.content} dark={dark} />

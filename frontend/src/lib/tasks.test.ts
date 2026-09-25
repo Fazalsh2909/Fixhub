@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatTaskLabel, isTerminalState, parseProof, verificationSummary } from './tasks';
+import { attributionLabel, formatTaskLabel, isTerminalState, parseProof, verificationSummary } from './tasks';
 
 describe('formatTaskLabel', () => {
   it('renders Task #id title — state', () => {
@@ -13,6 +13,7 @@ describe('isTerminalState', () => {
   it('marks verified/failed as terminal, analysing as not', () => {
     expect(isTerminalState('READY_FOR_APPROVAL')).toBe(true);
     expect(isTerminalState('FAILED')).toBe(true);
+    expect(isTerminalState('NEEDS_INFO')).toBe(true);
     expect(isTerminalState('ANALYZING')).toBe(false);
   });
 });
@@ -31,6 +32,15 @@ describe('verificationSummary', () => {
   });
 });
 
+describe('attributionLabel', () => {
+  it('maps baseline/env attributions to short labels', () => {
+    expect(attributionLabel('BASELINE_FAILURE')).toBe('pre-existing');
+    expect(attributionLabel('ENVIRONMENT_FAILURE')).toBe('environment');
+    expect(attributionLabel('TASK_FAILURE')).toBe('caused by change');
+    expect(attributionLabel('NONE')).toBeNull();
+    expect(attributionLabel(undefined)).toBeNull();
+  });
+});
 describe('parseProof', () => {
   it('extracts before/after and checks', () => {
     const proof = 'PROOF OF FIX\nBefore fix: FAIL\nAfter fix: PASS\nsuite: PASS\nlint: FAIL';

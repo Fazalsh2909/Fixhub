@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -20,7 +21,7 @@ from ..logging import get_logger, log_event
 from ..models import GitHubAccount, Repository, Task, TaskEvent
 from ..queue import enqueue
 from ..security import require_api_token
-from .app_auth import app_configured, get_installation_token
+from .app_auth import API, app_configured, get_installation_token
 from .read_client import GitHubReadClient
 
 router = APIRouter(prefix="/api/github", tags=["github"])
@@ -49,6 +50,74 @@ def _client_for(installation_id: str) -> GitHubReadClient:
         return GitHubReadClient(get_installation_token(installation_id))
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        # get_installation_token raises httpx.HTTPStatusError (unknown
+        # installation, revoked App) and jwt/OSError flavors — none of which
+        # is the caller's fault as HTTP 500. 503 keeps the UI honest.
+        logger.warning(f"github auth failed: {type(e).__name__}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"github auth failed ({type(e).__name__}) — "
+            "check the App installation id",
+        )
+
+
+def _installation_can_access_repo(installation_id: str, full_name: str) -> bool:
+    """Ask GitHub whether this installation actually sees the repo.
+
+    Any failure (unknown/revoked installation, network, non-200) means no —
+    fail closed, never cached. Kept separate so tests can stub the verdict
+    without touching the network.
+    """
+    try:
+        token = get_installation_token(installation_id)
+    except Exception:
+        return False
+    try:
+        with httpx.Client(timeout=10) as c:
+            r = c.get(
+                f"{API}/repos/{full_name}",
+                headers={
+                    # Token stays in the header object; only the status is read.
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                },
+            )
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _check_installation_owner(
+    db: Session, repo: Repository | None, installation_id: str
+) -> None:
+    """Phase 10: never trust a bare installation_id from the client. When the
+    repo already has an installation attached, a different id is a 403 —
+    the ownership boundary that multi-user auth will build on.
+
+    The stored id can go stale (App reinstalled, test pollution): before
+    refusing, check GitHub — if the caller's installation genuinely sees the
+    repo, adopt it and proceed. A stranger still gets 403."""
+    if (
+        repo is not None
+        and repo.installation_id
+        and installation_id
+        and repo.installation_id != installation_id
+    ):
+        if _installation_can_access_repo(installation_id, repo.full_name):
+            log_event(
+                logger,
+                "installation_self_heal",
+                repo=repo.full_name,
+                old=repo.installation_id,
+                new=installation_id,
+            )
+            repo.installation_id = installation_id
+            db.commit()
+            return
+        raise HTTPException(
+            status_code=403, detail="installation_id does not own this repository"
+        )
 
 
 @router.get("/status")
@@ -132,6 +201,7 @@ def repo_issues(
 ) -> dict:
     """Sync open issues for a repo (polling fallback when webhooks can't reach localhost)."""
     repo = db.query(Repository).filter_by(full_name=full_name.strip()).first()
+    _check_installation_owner(db, repo, installation_id)
     client = _client_for(installation_id)
     try:
         issues = client.list_repo_issues(full_name.strip())
@@ -161,6 +231,11 @@ def task_from_issue(
 ) -> dict:
     """Create a fix task from a live GitHub issue (chatbot 'fix #N' path)."""
     full_name = body.full_name.strip()
+    _check_installation_owner(
+        db,
+        db.query(Repository).filter_by(full_name=full_name).first(),
+        body.installation_id,
+    )
     client = _client_for(body.installation_id)
     try:
         issue = client.get_issue(full_name, body.issue_number)
@@ -171,33 +246,79 @@ def task_from_issue(
         if isinstance(issue, dict)
         else ""
     )
+    issue_body = issue.get("body", "") if isinstance(issue, dict) else ""
     repo = db.query(Repository).filter_by(full_name=full_name).first()
     if repo is None:
         repo = Repository(full_name=full_name, installation_id=body.installation_id)
         db.add(repo)
         db.flush()
     task = Task(
-        repo_id=repo.id, issue_number=body.issue_number, title=title, state="CREATED"
+        repo_id=repo.id, issue_number=body.issue_number, title=title, state="RUNNING"
     )
     db.add(task)
     db.flush()
+    # Keep the full body + top comments with the run so the agent sees them.
+    try:
+        from ..models import ChatMessage
+
+        if isinstance(issue, dict):
+            comments = client.get_issue_comments(full_name, body.issue_number)
+        else:
+            comments = []
+    except Exception:
+        comments = []
+    if (issue_body or "").strip():
+        db.add(
+            ChatMessage(
+                task_id=task.id,
+                repo_id=repo.id,
+                role="user",
+                content=issue_body.strip()[:4000],
+            )
+        )
+    for c in (comments or [])[:5]:
+        if isinstance(c, dict) and (c.get("body") or "").strip():
+            db.add(
+                ChatMessage(
+                    task_id=task.id,
+                    repo_id=repo.id,
+                    role="user",
+                    content=f"Comment by {c.get('user', {}).get('login', '')}: "
+                    f"{c.get('body', '').strip()[:1000]}",
+                )
+            )
     db.add(
         TaskEvent(
             task_id=task.id,
-            stage="CREATED",
+            stage="RUNNING",
             message=f"trigger=chat from-issue #{body.issue_number}",
         )
     )
     db.commit()
-    enqueue({"task_id": task.id, "repo": full_name, "issue": body.issue_number})
+    enqueue(
+        {
+            "run_id": task.id,
+            "task_id": task.id,
+            "repository": full_name,
+            "repo": full_name,
+            "issue_number": body.issue_number,
+            "issue": body.issue_number,
+        }
+    )
     log_event(logger, "task_from_issue", task_id=task.id, repo=full_name)
     return {"status": "ok", "task_id": task.id, "title": title}
 
 
 @router.get("/connected")
-def connected_repos(db: Session = Depends(get_db)) -> dict:
+def connected_repos(include_test: bool = False, db: Session = Depends(get_db)) -> dict:
     """Local repo inventory for the chatbot repo selector (no GitHub call)."""
-    rows = db.query(Repository).order_by(Repository.id.desc()).limit(100).all()
+    from ..models import is_test_repo_name as _is_test
+
+    rows = db.query(Repository).order_by(Repository.id.desc()).limit(200).all()
+    if not include_test:
+        rows = [r for r in rows if not _is_test(r.full_name or "")][:100]
+    else:
+        rows = rows[:100]
     return {
         "repositories": [
             {

@@ -2,9 +2,40 @@ export type TaskSummary = { id: number; title: string; state: string; issue?: nu
 
 export type TaskEvent = { stage: string; message: string; created_at?: string | null };
 
-export type VerificationRow = { check: string; passed: boolean; output: string };
+export type VerificationRow = {
+  check: string;
+  passed: boolean;
+  output: string;
+  attribution?: string;
+  duration_ms?: number;
+  phase?: string;
+};
+
+/** Short human label for a gate attribution (baseline vs task fault). */
+export function attributionLabel(attribution?: string): string | null {
+  switch (attribution) {
+    case 'BASELINE_FAILURE':
+      return 'pre-existing';
+    case 'ENVIRONMENT_FAILURE':
+    case 'DEPENDENCY_FAILURE':
+      return 'environment';
+    case 'INFRASTRUCTURE_FAILURE':
+      return 'infra';
+    case 'TIMEOUT':
+      return 'timeout';
+    case 'CONFIGURATION_FAILURE':
+      return 'config';
+    case 'UNRELATED_REPOSITORY_FAILURE':
+      return 'unrelated';
+    case 'TASK_FAILURE':
+      return 'caused by change';
+    default:
+      return null;
+  }
+}
 
 export type TaskDetail = TaskSummary & {
+  repo_id?: number;
   memories: { type: string; fact: string }[];
   events: TaskEvent[];
   verification: VerificationRow[];
@@ -43,7 +74,7 @@ export function formatTaskLabel(task: TaskSummary): string {
 }
 
 export function isTerminalState(state: string): boolean {
-  return ["READY_FOR_APPROVAL", "FAILED", "CANCELLED", "PR_CREATED"].includes(state);
+  return ["READY_FOR_APPROVAL", "FAILED", "CANCELLED", "PR_CREATED", "NEEDS_INFO"].includes(state);
 }
 
 export function verificationSummary(rows: VerificationRow[]): string {

@@ -85,3 +85,37 @@ def request_changes(
         pass
     db.commit()
     return {"status": "changes_requested", "task_id": task.id, "state": task.state}
+
+
+@router.delete("/{task_id}/workspace")
+def cleanup_workspace(
+    task_id: int,
+    db: Session = Depends(get_db),
+    _auth: None = Depends(require_api_token),
+) -> dict:
+    """Remove a task's isolated workspace (worktree + prune). Evidence (diff,
+    events, verification rows) stays in the DB — only the working directory
+    is reclaimed. Safe to call when no workspace exists."""
+    from pathlib import Path
+
+    from ..repo.workspaces import remove_workspace
+
+    task = db.query(Task).filter_by(id=task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    from ..sandbox.docker_runner import deps_volume_for_task, remove_deps_volume
+
+    remove_deps_volume(deps_volume_for_task(task_id))
+    removed = False
+    if task.workspace_path:
+        removed = remove_workspace(Path(task.workspace_path))
+        task.workspace_path = ""
+        db.add(
+            TaskEvent(
+                task_id=task.id,
+                stage="WORKSPACE_CLEANED",
+                message="isolated workspace removed; evidence preserved in DB",
+            )
+        )
+        db.commit()
+    return {"status": "cleaned" if removed else "no-workspace", "task_id": task.id}

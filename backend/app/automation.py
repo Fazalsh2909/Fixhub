@@ -13,8 +13,8 @@ row" stays literally true.
 
 from __future__ import annotations
 
+import re
 import threading
-from pathlib import Path
 
 from fastapi import APIRouter
 from sqlalchemy.orm import Session
@@ -31,8 +31,63 @@ _runs: dict[int, str] = {}
 _lock = threading.Lock()
 
 TERMINAL_STATES = frozenset(
-    {"REVIEWING", "READY_FOR_APPROVAL", "COMMITTED", "PUSHED", "PR_CREATED"}
+    {
+        "REVIEWING",
+        "READY_FOR_APPROVAL",
+        "APPROVED",
+        "BRANCH_CREATED",
+        "COMMITTED",
+        "PUSHED",
+        "PR_CREATED",
+    }
 )
+
+# States engineer_issue() can leave a task in when the server process dies# mid-run (dev restart, crash, OOM). None of these is ever a rest point —
+# engineer_issue() always ends in FAILED / DEBUGGING / READY_FOR_APPROVAL —
+# so their presence at startup means no background thread owns the task
+# anymore. CREATED / DEBUGGING / FAILED / BLOCKED / CANCELLED are untouched:
+# CREATED never started, the rest are legitimate points the operator (or a
+# new trigger) resumes from with Run.
+INTERRUPTED_STATES = frozenset(
+    {
+        "ANALYZING",
+        "REPRODUCING",
+        "ROOT_CAUSE_FOUND",
+        "PLANNING",
+        "IMPLEMENTING",
+        "TESTING",
+        "VERIFYING",
+    }
+)
+
+
+def recover_interrupted_tasks(db: Session) -> int:
+    """Mark runs that died with the server as FAILED (audited, re-runnable).
+
+    Returns the number of tasks recovered. Each recovery is a legal
+    FAILED transition with an explicit event, so the Agent Trace shows why
+    the task never finished — instead of sitting in a mid-loop state forever.
+    """
+    from .agent.orchestrator import STATES, transition
+
+    found = db.query(Task).filter(Task.state.in_(sorted(INTERRUPTED_STATES))).all()
+    recovered = 0
+    for task in found:
+        if task.state not in STATES:
+            continue
+        try:
+            transition(
+                db,
+                task,
+                "FAILED",
+                "run interrupted by server restart "
+                "(background thread did not survive restart) — "
+                "press Run to retry from a clean workspace",
+            )
+            recovered += 1
+        except Exception:
+            db.rollback()
+    return recovered
 
 
 class ApproveError(Exception):
@@ -42,6 +97,39 @@ class ApproveError(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+
+
+_URL_RE = re.compile(r"https?://\S+|www\.\S+")
+_FALLBACK_TITLE_RE = re.compile(r"^issue #\d+$", re.IGNORECASE)
+# "Fix #12: <url>" / "issue #3: ..." — the prefix adds junk words ("Fix",
+# "#12") that defeat the word count below (live task 239 burned 25 agent
+# steps on a URL-only instruction). Strip it before evaluating.
+_FIX_PREFIX_RE = re.compile(r"^(fix|issue|fixes|closes?)\s+#\d+\s*:?\s*", re.IGNORECASE)
+
+
+def is_thin_issue(title: str, body: str = "") -> bool:
+    """True when an issue has no actionable content to spend LLM calls on.
+
+    Thin = URL-only titles (live task 71), one-worders (tasks 117/122),
+    our own "issue #N" fallback when the real title was never fetched, or
+    a "Fix #N:"-prefixed URL with nothing actionable behind it (task 239).
+    Healthy = 2+ words or 8+ meaningful chars after URLs are stripped.
+    """
+    text = _URL_RE.sub(" ", f"{title or ''} {body or ''}").strip()
+    text = _FIX_PREFIX_RE.sub("", text).strip()
+    if _FALLBACK_TITLE_RE.match(text):
+        return True
+    words = [w for w in re.split(r"\s+", text) if re.search(r"[A-Za-z0-9]", w)]
+    chars = len(re.sub(r"\s+", "", text))
+    return not (len(words) >= 2 or chars >= 8)
+
+
+def mark_needs_info(db: Session, task: Task, reason: str) -> None:
+    """Park a thin task as NEEDS_INFO (audited). Auto-launch skips it;
+    explicit Run still works."""
+    from .agent.orchestrator import transition
+
+    transition(db, task, "NEEDS_INFO", reason)
 
 
 def task_branch(task: Task, patch: Patch | None) -> str:
@@ -64,7 +152,16 @@ def approve_task(
 
     Raises ApproveError(status_code, detail) on any refusal — the endpoint
     maps these to HTTP codes, the auto path records them as task events.
+
+    Verified pipeline (Phase 7/8/9): build the VerifiedArtifact from recorded
+    evidence (refuses unless verdict is VERIFIED) → confirm the workspace
+    still matches the artifact → policy gate → record approval → branch →
+    commit → push → remote-SHA verify → PR. Each durable state is set only
+    AFTER its operation succeeds. Failures land on the last good state,
+    never on a faked forward state.
     """
+    from pathlib import Path as _Path
+
     from .policy.engine import Decision, PolicyRequest, evaluate
 
     repo = db.query(Repository).filter_by(id=task.repo_id).first()
@@ -72,14 +169,21 @@ def approve_task(
         raise ApproveError(
             409, f"task is {task.state} — only REVIEWING tasks can be approved"
         )
-    patch = db.query(Patch).filter_by(task_id=task.id).order_by(Patch.id.desc()).first()
-    if (
-        patch is None
-        or not patch.diff.strip()
-        or patch.diff.strip() == "(no files changed)"
-    ):
-        raise ApproveError(409, "no verified diff to commit yet")
-    branch = task_branch(task, patch)
+    from .github.publisher import (
+        PolicyDeniedError,
+        PublishError,
+        build_verified_artifact,
+        verify_workspace_matches,
+    )
+
+    try:
+        artifact = build_verified_artifact(db, task, repo)
+    except PolicyDeniedError as e:
+        raise ApproveError(409, str(e))
+    branch = artifact.new_branch
+    ok, why = verify_workspace_matches(task, artifact)
+    if not ok:
+        raise ApproveError(409, why)
     if (
         evaluate(PolicyRequest(action="CREATE_BRANCH", task_id=task.id, branch=branch))
         == Decision.DENY
@@ -99,106 +203,167 @@ def approve_task(
             reason=reason[:2000],
         )
     )
+    db.commit()
+    approval = (
+        db.query(Approval)
+        .filter_by(task_id=task.id)
+        .order_by(Approval.id.desc())
+        .first()
+    )
+    artifact.approval_id = approval.id if approval else 0
+
+    def _set_state(new: str, message: str) -> None:
+        from .agent.orchestrator import STATES, TRANSITIONS
+
+        assert new in STATES, f"unknown task state {new}"
+        old = task.state or "CREATED"
+        if (
+            old in STATES
+            and new not in TRANSITIONS.get(old, frozenset())
+            and old != new
+        ):
+            raise ApproveError(500, f"illegal publish transition {old} → {new}")
+        task.state = new
+        db.add(
+            TaskEvent(
+                task_id=task.id,
+                stage=new,
+                message=message[:2000],
+                prev_state=old,
+                reason=f"approved by {approver}",
+            )
+        )
+        try:
+            from .memory.store import snapshot_task
+
+            snapshot_task(db, task.repo_id, task.id, task.title, new, message[:300])
+        except Exception:
+            pass
+        db.commit()
+
+    _set_state(
+        "APPROVED",
+        f"approved by {approver}; branch={branch}; verification={artifact.verification_status}",
+    )
+
+    # No GitHub installation: real local commit when the isolated workspace
+    # is a git repo, otherwise the decision is recorded locally (demo and
+    # snapshot workspaces have no git history to commit to).
+    if repo is None or not repo.installation_id:
+        workdir = _Path(task.workspace_path) if task.workspace_path else None
+        sha = ""
+        if workdir is not None and workdir.is_dir() and (workdir / ".git").exists():
+            try:
+                from .github.publisher import commit_in_workspace
+
+                sha = commit_in_workspace(
+                    workdir, branch, f"{artifact.title}\n\n{artifact.body[:1500]}"
+                )
+            except PublishError as e:
+                raise ApproveError(409, str(e))
+        _set_state(
+            "COMMITTED",
+            f"approved by {approver}; branch={branch}; sha={sha or 'local-record'}",
+        )
+        log_event(logger, "task_approved_local", task_id=task.id, approver=approver)
+        out: dict = {
+            "status": "approved",
+            "task_id": task.id,
+            "branch": branch,
+            "state": task.state,
+            "note": "no GitHub installation — commit recorded locally",
+        }
+        if sha:
+            out["commit_sha"] = sha
+            out["note"] = "no GitHub installation — committed to local task branch"
+        return out
+
+    # Full pipeline: branch → commit → push → remote-SHA verify → PR.
+    from .github.app_auth import get_installation_token
+    from .github.publisher import (
+        PRPublisher,
+        commit_worktree,
+        create_branch,
+        push_branch,
+        verify_remote_sha,
+    )
+
+    workdir = _Path(task.workspace_path) if task.workspace_path else None
+    if workdir is None or not workdir.is_dir() or not (workdir / ".git").exists():
+        raise ApproveError(
+            409,
+            "no git workspace for this task — re-run to provision one before publishing",
+        )
+    token = get_installation_token(repo.installation_id)
+    remote_url = repo.clone_url or f"https://github.com/{repo.full_name}.git"
+    try:
+        create_branch(workdir, branch)
+    except PublishError as e:
+        raise ApproveError(409, str(e))
+    _set_state(
+        "BRANCH_CREATED",
+        f"branch={branch} from base {artifact.base_sha[:8] if artifact.base_sha else 'snapshot'}",
+    )
+    try:
+        sha = commit_worktree(workdir, f"{artifact.title}\n\n{artifact.body[:1500]}")
+    except PublishError as e:
+        raise ApproveError(502, f"branch created but commit failed: {e}")
+    _set_state("COMMITTED", f"branch={branch}; sha={sha}")
+    try:
+        push_branch(workdir, remote_url, branch, token)
+        remote_sha = verify_remote_sha(remote_url, branch, sha, token)
+    except PublishError as e:
+        # Commit exists locally — stay COMMITTED, do not fake PUSHED.
+        db.add(
+            TaskEvent(
+                task_id=task.id,
+                stage="PUSH_FAILED",
+                message=str(e)[:2000],
+                prev_state="COMMITTED",
+                reason="push failed",
+            )
+        )
+        db.commit()
+        raise ApproveError(502, f"committed {sha[:8]} but push failed: {e}")
+    _set_state("PUSHED", f"branch={branch}; remote sha={remote_sha}")
+    try:
+        pr = PRPublisher(token, default_branch=artifact.base_branch).publish(artifact)
+    except Exception as e:
+        # Pushed but no PR — stay PUSHED, do not fake PR_CREATED.
+        db.add(
+            TaskEvent(
+                task_id=task.id,
+                stage="PR_FAILED",
+                message=f"pushed but PR creation failed: {e}"[:2000],
+                prev_state="PUSHED",
+                reason="pr failed",
+            )
+        )
+        db.commit()
+        raise ApproveError(502, f"pushed {remote_sha[:8]} but PR creation failed: {e}")
     db.add(
-        TaskEvent(
+        PullRequest(
             task_id=task.id,
-            stage="COMMITTED",
-            message=f"approved by {approver}; branch={branch}",
+            url=pr.get("html_url", ""),
+            number=pr.get("number", 0),
+            commit_sha=remote_sha,
         )
     )
-    task.state = "COMMITTED"
-    try:
-        from .memory.store import snapshot_task
-
-        snapshot_task(
-            db,
-            task.repo_id,
-            task.id,
-            task.title,
-            "COMMITTED",
-            f"approved by {approver}",
-        )
-    except Exception:
-        pass
-    db.commit()
-
-    # Push + open PR only with a GitHub installation; otherwise the commit
-    # decision is recorded locally (demo/cloned repos without App token).
-    if repo is not None and repo.installation_id:
-        try:
-            from .github.app_auth import get_installation_token
-            from .github.publisher import PRPublisher, VerifiedArtifact
-
-            token = get_installation_token(repo.installation_id)
-            artifact = VerifiedArtifact(
-                repo_full_name=repo.full_name,
-                base_branch=repo.default_branch or "main",
-                new_branch=branch,
-                patch_diff=patch.diff,
-                title=f"Fix #{task.issue_number}: {task.title}"
-                if task.issue_number
-                else task.title,
-                body=(
-                    f"Proof of Fix for #{task.issue_number}\n\nApproved by {approver}.\n"
-                    if task.issue_number
-                    else f"Approved by {approver}.\n"
-                ),
-                proof_passed=True,
-            )
-            pr = PRPublisher(token).publish(artifact)
-            db.add(
-                PullRequest(
-                    task_id=task.id,
-                    url=pr.get("html_url", ""),
-                    number=pr.get("number", 0),
-                )
-            )
-            task.state = "PR_CREATED"
-            db.add(
-                TaskEvent(
-                    task_id=task.id,
-                    stage="PR_CREATED",
-                    message=f"pr={pr.get('html_url', '')}",
-                )
-            )
-            try:
-                from .memory.store import snapshot_task as _snap
-
-                _snap(db, task.repo_id, task.id, task.title, "PR_CREATED", "pr opened")
-            except Exception:
-                pass
-            db.commit()
-            log_event(logger, "pr_created", task_id=task.id, approver=approver)
-            return {
-                "status": "pr_created",
-                "task_id": task.id,
-                "pr_url": pr.get("html_url", ""),
-                "branch": branch,
-                "state": task.state,
-            }
-        except Exception as e:
-            db.add(
-                TaskEvent(
-                    task_id=task.id,
-                    stage="REVIEWING",
-                    message=f"publish failed, still approved: {e}",
-                )
-            )
-            task.state = "REVIEWING"
-            db.commit()
-            raise ApproveError(502, f"approved but publish failed: {e}")
-    log_event(logger, "task_approved_local", task_id=task.id, approver=approver)
+    _set_state("PR_CREATED", f"pr={pr.get('html_url', '')}; sha={remote_sha}")
+    log_event(logger, "pr_created", task_id=task.id, approver=approver)
     return {
-        "status": "approved",
+        "status": "pr_created",
         "task_id": task.id,
+        "pr_url": pr.get("html_url", ""),
         "branch": branch,
+        "commit_sha": remote_sha,
         "state": task.state,
-        "note": "no GitHub installation — commit recorded locally",
     }
 
 
 def _is_retryable_error(err: str | None) -> bool:
-    """Provider 400/401/403 (bad key/permissions) fail fast; 429/5xx + verification FAIL retry."""
+    """Provider 400/401/403/404 (bad key/permissions/unknown model) fail fast;
+    429/5xx + verification FAIL retry."""
     if not err:
         return True
     low = err.lower()
@@ -206,13 +371,17 @@ def _is_retryable_error(err: str | None) -> bool:
         " 400",
         " 401",
         " 403",
+        " 404",
         "provider 400",
         "provider 401",
         "provider 403",
+        "provider 404",
     ):
         if code in low:
             return False
     if "unauthorized" in low or "forbidden" in low or "invalid api key" in low:
+        return False
+    if "not_found" in low or "not found" in low:
         return False
     return True
 
@@ -236,14 +405,48 @@ def run_task_sync(task_id: int, force: bool = False) -> dict:
         task = db.query(Task).filter_by(id=task_id).first()
         if not task:
             return {"error": "task not found", "status_code": 404, "task_id": task_id}
+        # SIMPLE PATH (active): every run goes through run_issue()
+        # (own session). The legacy state machine below is bypassed, not
+        # deleted — it stays for history until the cleanup pass.
+        if not force and task.state in ("COMPLETED", "BLOCKED"):
+            return {"task_id": task.id, "state": task.state, "skipped": True}
+        if not force and task.state == "NEEDS_INFO":
+            # Parked thin issue: only an explicit Run (force=True) spends
+            # agent budget on it.
+            return {
+                "task_id": task.id,
+                "state": task.state,
+                "skipped": True,
+                "reason": "needs-info: describe the issue, then press Run",
+            }
         if not force and task.state in TERMINAL_STATES:
             return {"task_id": task.id, "state": task.state, "skipped": True}
+        from .agent.issue_worker import run_issue
+
+        return run_issue(task_id)
 
         from .chat.router import resolve_workdir
+        from .repo.workspaces import create_task_workspace
 
         repo = db.query(Repository).filter_by(id=task.repo_id).first()
-        workdir = resolve_workdir(repo) if repo else Path(".")
-        if not workdir.is_dir():
+        if repo is None:
+            msg = "repo not found for task — connect or clone it first, then re-run"
+            db.add(TaskEvent(task_id=task.id, stage="FAILED", message=msg))
+            task.state = "FAILED"
+            db.commit()
+            return {"error": msg, "status_code": 400, "task_id": task.id}
+        try:
+            base = resolve_workdir(repo)
+        except Exception:
+            msg = (
+                f"repo workspace not found for {repo.full_name} — clone it first "
+                "(CLONE ANY OSS REPO / connect + clone), then re-run."
+            )
+            db.add(TaskEvent(task_id=task.id, stage="FAILED", message=msg))
+            task.state = "FAILED"
+            db.commit()
+            return {"error": msg, "status_code": 400, "task_id": task.id}
+        if not base.is_dir():
             name = repo.full_name if repo else "unknown"
             msg = (
                 f"repo workspace not found for {name} — clone it first "
@@ -254,12 +457,83 @@ def run_task_sync(task_id: int, force: bool = False) -> dict:
             db.commit()
             return {"error": msg, "status_code": 400, "task_id": task.id}
 
+        # P0-1: every run provisions a FRESH isolated task workspace (detached
+        # worktree at the base commit, or a snapshot copy). Retries never reuse
+        # unknown dirty state — each attempt recreates a clean baseline.
+        workdir, ws_sha = create_task_workspace(base, task.id)
+        task.workspace_path = str(workdir)
+        task.base_sha = ws_sha
+        db.add(
+            TaskEvent(
+                task_id=task.id,
+                stage="WORKSPACE_CREATED",
+                message=f"isolated workspace {workdir} at base {ws_sha or 'snapshot'}",
+            )
+        )
+        db.commit()
+
+        from .agent.miniswe_adapter import miniswe_available
         from .agent.orchestrator import engineer_issue
         from .llm.openrouter import provider_from_settings
-        from .verify.pipeline import build_proof, run_verification
+        from .verify.pipeline import build_proof, overall_status, run_verification
 
         _, api_key, _ = settings.resolved_llm()
-        if not api_key:
+        use_miniswe = bool(api_key and settings.miniswe_enabled and miniswe_available())
+        if use_miniswe:
+            # PRIMARY PATH: one mini-SWE-agent attempt (two at most, and only
+            # for retryable provider/infrastructure errors — deterministic
+            # verification outcomes never re-loop the agent).
+            import time as _time
+
+            from .agent.runner import run_miniswe_task
+
+            _result: dict = {"verified": False, "results": []}
+            _attempts = 0
+            for _attempt in (1, 2):
+                _attempts = _attempt
+                if _attempt > 1:
+                    workdir, ws_sha = create_task_workspace(base, task.id)
+                    task.workspace_path = str(workdir)
+                    task.base_sha = ws_sha
+                    db.add(
+                        TaskEvent(
+                            task_id=task.id,
+                            stage="WORKSPACE_CREATED",
+                            message=(
+                                f"retry attempt {_attempt}/2 after retryable "
+                                f"error: clean baseline {workdir}"
+                            ),
+                        )
+                    )
+                    db.commit()
+                _result = run_miniswe_task(db, task, workdir, repo)
+                if not _result.get("retryable"):
+                    break
+                _err = _result.get("error") if isinstance(_result, dict) else None
+                if not _is_retryable_error(_err if isinstance(_err, str) else None):
+                    break
+                if _attempt < 2:
+                    db.add(
+                        TaskEvent(
+                            task_id=task.id,
+                            stage="RETRYING",
+                            message=f"retryable error ({(_err or '')[:200]}); retrying once",
+                        )
+                    )
+                    db.commit()
+                    _backoff = max(0.0, float(settings.agent_retry_backoff_s or 0.0))
+                    if _backoff > 0:
+                        _time.sleep(_backoff)
+            record_task(bool(_result.get("verified")))
+            out = {
+                "task_id": task.id,
+                "state": task.state,
+                "attempts": _attempts,
+                "max_attempts": 2,
+                "mode": "mini-swe-agent",
+                **_result,
+            }
+        elif not api_key:
             db.add(
                 TaskEvent(
                     task_id=task.id,
@@ -269,7 +543,8 @@ def run_task_sync(task_id: int, force: bool = False) -> dict:
             )
             db.commit()
             results = run_verification(db, task, workdir)
-            verified = all(ok for _, ok in results)
+            verdict = overall_status(results)
+            verified = verdict == "VERIFIED"
             db.add(Patch(task_id=task.id, diff="(no files changed)", branch=""))
             task.state = "REVIEWING" if verified else "DEBUGGING"
             try:
@@ -294,7 +569,7 @@ def run_task_sync(task_id: int, force: bool = False) -> dict:
                 "regression run",
                 "PASS" if verified else "FAIL",
             )
-            out: dict = {
+            out = {
                 "task_id": task.id,
                 "verified": verified,
                 "proof": proof,
@@ -308,23 +583,35 @@ def run_task_sync(task_id: int, force: bool = False) -> dict:
             backoff = max(0.0, float(settings.agent_retry_backoff_s or 0.0))
             result: dict = {"verified": False, "results": []}
             attempts = 0
+            # One call budget shared by every attempt (else each retry mints a
+            # fresh 30). Threaded into engineer_issue + subagent turns.
+            llm_state: dict = {"calls": 0}
             for attempt in range(1, max_attempts + 1):
                 attempts = attempt
                 if attempt > 1:
+                    # Deterministic retry: clean baseline, clearly recorded.
+                    workdir, ws_sha = create_task_workspace(base, task.id)
+                    task.workspace_path = str(workdir)
+                    task.base_sha = ws_sha
                     db.add(
                         TaskEvent(
                             task_id=task.id,
-                            stage="ANALYZING",
-                            message=f"retry attempt {attempt}/{max_attempts}",
+                            stage="WORKSPACE_CREATED",
+                            message=(
+                                f"retry attempt {attempt}/{max_attempts}: "
+                                f"clean baseline {workdir} at {ws_sha or 'snapshot'}"
+                            ),
                         )
                     )
                     db.commit()
-                result = engineer_issue(db, task, workdir, provider_from_settings())
+                result = engineer_issue(
+                    db, task, workdir, provider_from_settings(), llm_state
+                )
                 try:
-                    from .repo.workspace import git_diff
+                    from .repo.workspaces import git_diff_all
 
                     diff = (
-                        git_diff(workdir)
+                        git_diff_all(workdir)
                         if (workdir / ".git").exists()
                         else "(no git repo — see TOOL edit events)"
                     )
@@ -335,7 +622,7 @@ def run_task_sync(task_id: int, force: bool = False) -> dict:
                             branch=task_branch(task, None),
                         )
                     )
-                    if result.get("verified"):
+                    if result.get("publishable", result.get("verified")):
                         task.state = "REVIEWING"
                     try:
                         from .memory.store import snapshot_task
@@ -353,9 +640,17 @@ def run_task_sync(task_id: int, force: bool = False) -> dict:
                     db.commit()
                 except Exception:
                     pass
-                if result.get("verified"):
+                if result.get("publishable", result.get("verified")):
+                    break
+                if result.get("retryable", True) is False:
+                    # Deterministic abort (breaker / pre-flight): retrying a
+                    # fresh workspace cannot change the outcome — fail fast.
                     break
                 err = result.get("error") if isinstance(result, dict) else None
+                if err is None:
+                    # Deterministic verification FAIL with no provider error:
+                    # fail fast after attempt 1 instead of 2 more full loops.
+                    break
                 if not _is_retryable_error(err if isinstance(err, str) else None):
                     break
                 if attempt < max_attempts:
@@ -382,8 +677,9 @@ def run_task_sync(task_id: int, force: bool = False) -> dict:
                 **result,
             }
 
-        # Hands-free PR: verified + flag on + installation attached.
-        if settings.auto_pr_on_verified and out.get("verified"):
+        # Hands-free PR: publishable (VERIFIED or WITH_LIMITATIONS) + flag on
+        # + installation attached. Proof documents any limitations.
+        if settings.auto_pr_on_verified and out.get("publishable", out.get("verified")):
             fresh = db.query(Task).filter_by(id=task_id).first()
             if fresh is not None and fresh.state in ("REVIEWING", "READY_FOR_APPROVAL"):
                 try:
@@ -423,6 +719,22 @@ def is_running(task_id: int) -> bool:
         return task_id in _runs
 
 
+def try_acquire(task_id: int) -> bool:
+    """Claim the run slot for a task. False when another run (background or
+    synchronous) already holds it — the caller must refuse, never double-run.
+    Pair with release() in a finally."""
+    with _lock:
+        if task_id in _runs:
+            return False
+        _runs[task_id] = "running"
+        return True
+
+
+def release(task_id: int) -> None:
+    with _lock:
+        _runs.pop(task_id, None)
+
+
 def _thread_main(task_id: int, force: bool = False) -> None:
     try:
         run_task_sync(task_id, force=force)
@@ -446,20 +758,26 @@ def _thread_main(task_id: int, force: bool = False) -> None:
         finally:
             db.close()
     finally:
-        with _lock:
-            _runs.pop(task_id, None)
+        release(task_id)
 
 
 def launch_task(task_id: int, force: bool = False) -> str:
-    """Start a background agent run. Returns 'started' or 'already-running'.
+    """Start a background agent run. Returns 'started', 'already-running',
+    or 'needs-info' (thin issue parked — only force starts it).
 
     force=True re-runs even terminal (REVIEWING+) tasks — used for explicit
     user `run` requests. Default False skips already-finished work.
     """
-    with _lock:
-        if task_id in _runs:
-            return "already-running"
-        _runs[task_id] = "running"
+    if not force:
+        db: Session = SessionLocal()
+        try:
+            task = db.query(Task).filter_by(id=task_id).first()
+            if task is not None and task.state == "NEEDS_INFO":
+                return "needs-info"
+        finally:
+            db.close()
+    if not try_acquire(task_id):
+        return "already-running"
     threading.Thread(target=_thread_main, args=(task_id, force), daemon=True).start()
     log_event(logger, "task_launched", task_id=task_id)
     return "started"

@@ -6,7 +6,9 @@ Fixhub stays connected via a **GitHub App installation**. Tokens are short-lived
 ## 1. Create the App
 
 1. GitHub → Settings → Developer settings → GitHub Apps → New.
-2. Permissions: **Issues** (read), **Contents** (read), **Pull requests** (write),
+2. Permissions: **Issues** (read + write — write is only used to post one
+   clarifying question when the agent gets stuck, and never for anything else),
+   **Contents** (read), **Pull requests** (write),
    **Checks** (read, optional). Subscribe to: `issues`, `issue_comment`, `label`.
 3. Note the **App ID** and **slug**; generate a **private key** (.pem).
 
