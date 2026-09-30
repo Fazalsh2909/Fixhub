@@ -1,270 +1,393 @@
-"""GitHub webhook: simple issue-opened trigger. HMAC → record → enqueue → 200.
+"""GitHub webhook: signature verify + dedupe + issue/CI trigger -> Task.
 
-Simple flow only: issue opened/reopened on a connected repo creates one
-RUNNING issue run and enqueues {"run_id", "repository", "issue_number"}.
-No expensive work here; the worker dequeues and runs the agent.
-Security kept: raw-body HMAC first, idempotent on X-GitHub-Delivery.
+Events: issues.opened/reopened (+ optional `fixhub-fix` label gate),
+workflow_run.completed/failed, check_run.completed/failure.
 """
-
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
 
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, Request
 from sqlalchemy.orm import Session
 
-from ..config import settings
-from ..db import SessionLocal
-from ..logging import get_logger, log_event
-from ..models import GitHubAccount, Repository, Task, TaskEvent, WebhookDelivery
-from ..queue import enqueue
+from app.config import settings
+from app.db.database import SessionLocal
+from app.db.models import Repository, Task, TaskEvent, WebhookDelivery
 
 router = APIRouter()
-logger = get_logger("fixhub.webhook")
-TRIGGER_LABEL = "fixhub-fix"
 
 
-def verify_signature(raw_body: bytes, signature: str, secret: str) -> bool:
+def verify_signature(secret: str, body: bytes, signature: str) -> bool:
+    if not secret or not signature:
+        return False
     if not signature.startswith("sha256="):
         return False
-    expected = (
-        "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest("sha256=" + expected, signature)
+
+
+def _event(db: Session, task_id: int, type_: str, data: dict) -> None:
+    db.add(TaskEvent(task_id=task_id, type=type_, data_json=json.dumps(data)[:4000]))
+
+
+def _ci_log_excerpt(*, repo_name: str, run_id: str, check_name: str) -> str:
+    """Fetch the failing-job log excerpt so the agent sees the real error.
+
+    Best-effort: any failure (no installation id, no Actions read, network)
+    returns "" and callers fall back to the one-line excerpt. Never raises.
+    """
+    if not run_id:
+        return ""
+    try:
+        from app.db.models import Repository as _Repo
+        from app.github import app_auth as _app_auth
+        from app.github import client as _gh
+        from app.db.database import SessionLocal as _SessionLocal
+    except Exception:
+        return ""
+    try:
+        s = _SessionLocal()
+        try:
+            row = s.query(_Repo).filter(_Repo.github_full_name == repo_name).first()
+            installation_id = row.installation_id if row else ""
+        finally:
+            s.close()
+        if not installation_id:
+            return ""
+        token = _app_auth.installation_token(installation_id)
+        out = _gh.failing_logs_excerpt(token=token, full_name=repo_name, run_id=run_id)
+        if check_name and check_name not in out:
+            out = f"check {check_name} failed\n{out}"
+        return out[:6000]
+    except Exception:
+        return ""
+
+
+def _run_id_from_url(url: str) -> str:
+    """Extract the workflow-run id from a check_run html_url (.../runs/123/job/456)."""
+    import re as _re
+
+    m = _re.search(r"/runs/(\d+)", url or "")
+    return m.group(1) if m else ""
+
+
+def _repo_token(repo_name: str) -> str:
+    """Installation token for a repo, or "" when unavailable. Never raises."""
+    try:
+        from app.db.models import Repository as _Repo
+        from app.github import app_auth as _app_auth
+        from app.db.database import SessionLocal as _SessionLocal
+
+        s = _SessionLocal()
+        try:
+            row = s.query(_Repo).filter(_Repo.github_full_name == repo_name).first()
+            installation_id = row.installation_id if row else ""
+        finally:
+            s.close()
+        if not installation_id:
+            return ""
+        return _app_auth.installation_token(installation_id)
+    except Exception:
+        return ""
+
+
+def build_ci_context(*, event_type: str, payload: dict, repo_name: str) -> dict:
+    """Structured CI context for the agent (best-effort enrichment, never raises).
+
+    Fields: provider, workflow_name, workflow_file, workflow_content,
+    run_id, commit_sha, branch, job, step, exit_code, failure_logs,
+    annotations, changed_files, url. Missing pieces stay "".
+    """
+    ctx: dict = {
+        "provider": "github", "workflow_name": "", "workflow_file": "",
+        "workflow_content": "", "run_id": "", "commit_sha": "", "branch": "",
+        "job": "", "step": "", "exit_code": "", "failure_logs": "",
+        "annotations": "", "changed_files": "", "url": "",
+    }
+    try:
+        token = _repo_token(repo_name)
+        if event_type == "workflow_run":
+            run = payload.get("workflow_run", {})
+            ctx.update({
+                "workflow_name": run.get("name", ""),
+                "workflow_file": run.get("path", ""),
+                "run_id": str(run.get("id", "")),
+                "commit_sha": run.get("head_sha", ""),
+                "branch": run.get("head_branch", ""),
+                "job": run.get("name", ""),
+                "url": run.get("html_url", ""),
+            })
+            if token:
+                try:
+                    steps = _gh_steps(token, repo_name, ctx["run_id"])
+                    if steps:
+                        ctx["job"] = steps[0]["job"]
+                        ctx["step"] = "; ".join(
+                            f"{s['step']} ({s['conclusion']})" for s in steps[:4])
+                except Exception:
+                    pass
+                if ctx["workflow_file"]:
+                    try:
+                        from app.github import client as _ghc
+                        ctx["workflow_content"] = _ghc.get_workflow_content(
+                            token=token, full_name=repo_name,
+                            path=ctx["workflow_file"], ref=ctx["commit_sha"])[:6000]
+                    except Exception:
+                        pass
+                pr_files = _pr_files_for_run(payload, token, repo_name)
+                if pr_files:
+                    ctx["changed_files"] = ", ".join(pr_files[:20])
+        elif event_type == "check_run":
+            run = payload.get("check_run", {})
+            suite = run.get("check_suite") or {}
+            ctx.update({
+                "run_id": _run_id_from_url(run.get("html_url", "")),
+                "commit_sha": run.get("head_sha", ""),
+                "branch": suite.get("head_branch", ""),
+                "job": run.get("name", ""),
+                "url": run.get("html_url", ""),
+            })
+            output = run.get("output") or {}
+            title = str(output.get("title") or "")
+            summary = str(output.get("summary") or "")[:1500]
+            if title or summary:
+                ctx["step"] = (title + (" — " + summary if summary else ""))[:2000]
+            if token and run.get("id") is not None:
+                try:
+                    from app.github import client as _ghc
+                    anns = _ghc.check_annotations(
+                        token=token, full_name=repo_name, check_run_id=run.get("id"))
+                    if anns:
+                        ctx["annotations"] = "; ".join(
+                            f"{a['path']}:{a['line'] or '?'} [{a['level']}] "
+                            f"{a['message'][:200]}" for a in anns[:5])[:2000]
+                except Exception:
+                    pass
+            prs = run.get("pull_requests") or []
+            if token and prs and prs[0].get("number"):
+                try:
+                    from app.github import client as _ghc
+                    files = _ghc.pull_files(token=token, full_name=repo_name,
+                                            number=prs[0]["number"])
+                    ctx["changed_files"] = ", ".join(files[:20])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return ctx
+
+
+def _gh_steps(token: str, repo_name: str, run_id: str) -> list[dict]:
+    from app.github import client as _ghc
+
+    if not run_id:
+        return []
+    return _ghc.failing_steps(token=token, full_name=repo_name, run_id=run_id)
+
+
+def _pr_files_for_run(payload: dict, token: str, repo_name: str) -> list[str]:
+    try:
+        from app.github import client as _ghc
+
+        run = payload.get("workflow_run", {})
+        prs = run.get("pull_requests") or []
+        if not prs or not prs[0].get("number"):
+            return []
+        return _ghc.pull_files(token=token, full_name=repo_name, number=prs[0]["number"])
+    except Exception:
+        return []
+
+
+def _maybe_enqueue(db: Session, task_id: int) -> dict:
+    """Auto-enqueue when AUTO_RUN_ON_WEBHOOK=1. Never raises; records QUEUED/QUEUE_FAILED."""
+    if not settings.AUTO_RUN_ON_WEBHOOK:
+        return {"enqueued": False, "reason": "disabled"}
+    try:
+        from app.tasks import queue as _queue
+    except Exception:
+        return {"enqueued": False, "reason": "queue module unavailable"}
+    try:
+        out = _queue.enqueue_task(task_id)
+    except Exception as exc:
+        out = {"enqueued": False, "error": str(exc)[:200]}
+    try:
+        if out.get("enqueued"):
+            _event(db, task_id, "QUEUED", {"job": out.get("job_id", "")})
+        else:
+            _event(db, task_id, "QUEUE_FAILED", {"error": out.get("error", "unavailable")[:300]})
+        db.commit()
+    except Exception:
+        pass
+    return out
+
+
+def _active_ci_task(db: Session, *, repo_name: str, sha: str, job: str) -> Task | None:
+    """An already-RUNNING CI task for the same repo+sha+job.
+
+    Statuses flip to terminal only when a run ends, so RUNNING also covers
+    queued-not-started jobs. Creating another task for the same failure would
+    just burn a second full agent run for the same fix.
+    """
+    if not sha:
+        return None
+    q = db.query(Task).filter(
+        Task.repository == repo_name,
+        Task.trigger_type == "ci",
+        Task.status == "RUNNING",
+        Task.ci_sha == sha,
     )
-    return hmac.compare_digest(signature, expected)
+    if job:
+        q = q.filter((Task.ci_job == job) | (Task.ci_workflow == job))
+    return q.order_by(Task.id.desc()).first()
 
 
-def _wants_fix(event: str, payload: dict) -> tuple[bool, str]:
-    """Simple trigger: issue opened/reopened, or explicit fix label/comment."""
-    if event == "issues":
-        action = payload.get("action", "")
-        labels = [
-            lbl.get("name", "") for lbl in payload.get("issue", {}).get("labels", [])
-        ]
-        if (
-            action == "labeled"
-            and (payload.get("label", {}) or {}).get("name") == TRIGGER_LABEL
-        ):
-            return True, "labeled"
-        if TRIGGER_LABEL in labels and action in ("opened", "labeled", "reopened"):
-            return True, "labeled" if action != "opened" else "labeled-on-open"
-        if action in ("opened", "reopened"):
-            # Auto-trigger for connected repos is decided below (needs DB);
-            # signal intent here so the handler checks connectedness.
-            return True, f"auto-{action}-intent"
-    if event == "issue_comment":
-        if _comment_author_is_bot(payload):
-            return False, "ignored-bot"
-        body = (payload.get("comment", {}).get("body", "") or "").strip()
-        if body.startswith("/fix"):
-            return True, "fix-comment"
-        # A human reply on an issue we asked about re-triggers the agent;
-        # the DB check below confirms we are actually awaiting a reply.
-        if body:
-            return True, "comment-intent"
-    return False, ""
-
-
-def _comment_author_is_bot(payload: dict) -> bool:
-    """Our own ask-back comments (and any bot) must never re-trigger us."""
-    user = (payload.get("comment", {}) or {}).get("user", {}) or {}
-    login = str(user.get("login", ""))
-    return user.get("type") == "Bot" or login.endswith("[bot]")
-
-
-def _is_followup(db: Session, repo_id: int, issue_number: int) -> bool:
-    """True when FixHub asked a clarifying question on this issue and no PR
-    has been recorded for it since — i.e. we are awaiting the human's reply."""
-    from ..models import PullRequest
-
-    task_ids = [
-        t.id
-        for t in db.query(Task)
-        .filter_by(repo_id=repo_id, issue_number=issue_number)
-        .all()
-    ]
-    if not task_ids:
-        return False
-    if db.query(PullRequest).filter(PullRequest.task_id.in_(task_ids)).count():
-        return False
-    return (
-        db.query(TaskEvent)
-        .filter(
-            TaskEvent.task_id.in_(task_ids),
-            TaskEvent.stage == "COMMENT_POSTED",
-        )
-        .count()
-        > 0
-    )
+def _get_or_create_repo(db: Session, full_name: str, default_branch: str = "main") -> Repository:
+    repo = db.query(Repository).filter(Repository.github_full_name == full_name).first()
+    if not repo:
+        repo = Repository(github_full_name=full_name, default_branch=default_branch)
+        db.add(repo)
+        db.commit()
+        db.refresh(repo)
+    return repo
 
 
 @router.post("/webhooks/github")
 async def github_webhook(
     request: Request,
     x_hub_signature_256: str = Header(default=""),
-    x_github_event: str = Header(default=""),
     x_github_delivery: str = Header(default=""),
-) -> dict:
-    raw = await request.body()  # MUST read raw bytes before parsing
-    if not verify_signature(raw, x_hub_signature_256, settings.github_webhook_secret):
-        raise HTTPException(status_code=401, detail="invalid signature")
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="invalid json")
+    x_github_event: str = Header(default=""),
+):
+    from fastapi.responses import JSONResponse
 
-    db: Session = SessionLocal()
-    try:
-        # idempotency: duplicate deliveries ack 200 without side effects
-        if db.query(WebhookDelivery).filter_by(delivery_id=x_github_delivery).first():
-            return {"status": "duplicate"}
-        ok, reason = _wants_fix(x_github_event, payload)
-        skip_reason = ""
-        if ok and x_github_event == "issues" and reason.endswith("-intent"):
-            # Auto-trigger requires a connected repo; label/comment triggers
-            # skip this check (explicit user intent).
-            action = payload.get("action", "")
-            repo_name = payload.get("repository", {}).get("full_name", "")
-            if not settings.auto_trigger_on_issue:
-                ok, reason = False, ""
-                skip_reason = "auto-trigger off (AUTO_TRIGGER_ON_ISSUE=false)"
-            else:
-                repo_row = db.query(Repository).filter_by(full_name=repo_name).first()
-                if repo_row is None:
-                    ok, reason = False, ""
-                    skip_reason = (
-                        f"repo {repo_name} unknown to FixHub — connect it first"
-                    )
-                elif not repo_row.connected:
-                    ok, reason = False, ""
-                    skip_reason = (
-                        f"repo {repo_name} is not connected — connect it first"
-                    )
-                else:
-                    reason = f"auto-{action}-connected"
-        if ok and x_github_event == "issue_comment" and reason == "comment-intent":
-            # Reply re-trigger: only when we asked something and no PR exists
-            # yet for this issue. Connected repo required, like auto-trigger.
-            repo_name = payload.get("repository", {}).get("full_name", "")
-            repo_row = db.query(Repository).filter_by(full_name=repo_name).first()
-            if repo_row is None or not repo_row.connected:
-                ok, reason = False, ""
-                skip_reason = f"repo {repo_name} is not connected — connect it first"
-            elif not _is_followup(
-                db, repo_row.id, payload.get("issue", {}).get("number", 0)
-            ):
-                ok, reason = False, ""
-                skip_reason = "comment is not a reply to a FixHub question — ignoring"
-            else:
-                reason = "comment-reply"
-        if not ok and not skip_reason:
-            skip_reason = reason or f"no trigger rule matched (event={x_github_event})"
-        task_id = None
-        if ok:
-            repo_name = payload.get("repository", {}).get("full_name", "unknown")
-            issue = payload.get("issue", {})
-            if x_github_event == "issue_comment":
-                issue = payload.get("issue", {})
-            repo = db.query(Repository).filter_by(full_name=repo_name).first()
-            if repo is None:
-                repo = Repository(full_name=repo_name)
-                db.add(repo)
-                db.flush()
-            inst_id_task = str((payload.get("installation", {}) or {}).get("id", ""))
-            if inst_id_task and not repo.installation_id:
-                repo.installation_id = inst_id_task
-            task = Task(
-                repo_id=repo.id,
-                issue_number=issue.get("number", 0),
-                title=issue.get("title", "") or "",
-                state="RUNNING",
-            )
-            db.add(task)
-            db.flush()
-            # Store the issue body + triggering comment alongside the run
-            # so the worker can build the prompt without another API call.
-            try:
-                from ..models import ChatMessage
+    body = await request.body()
+    if not verify_signature(settings.GITHUB_WEBHOOK_SECRET, body, x_hub_signature_256):
+        return JSONResponse(status_code=401, content={"error": "bad signature"})
+    if not x_github_delivery:
+        return JSONResponse(status_code=400, content={"error": "missing delivery id"})
 
-                body = (issue.get("body", "") or "").strip()
-                if body:
-                    db.add(
-                        ChatMessage(
-                            task_id=task.id,
-                            repo_id=repo.id,
-                            role="user",
-                            content=body[:4000],
-                        )
-                    )
-                if x_github_event == "issue_comment":
-                    comment = payload.get("comment", {}) or {}
-                    cbody = (comment.get("body", "") or "").strip()
-                    login = str((comment.get("user", {}) or {}).get("login", ""))
-                    if cbody:
-                        db.add(
-                            ChatMessage(
-                                task_id=task.id,
-                                repo_id=repo.id,
-                                role="user",
-                                content=f"Reply by {login}: {cbody[:2000]}",
-                            )
-                        )
-            except Exception:
-                pass
-            db.add(
-                TaskEvent(task_id=task.id, stage="RUNNING", message=f"trigger={reason}")
-            )
-            task_id = task.id
-            # Simple job payload: the worker only needs these three keys.
-            # task_id is kept for back-compat consumers.
-            enqueue(
-                {
-                    "run_id": task_id,
-                    "task_id": task_id,
-                    "repository": repo_name,
-                    "repo": repo_name,
-                    "issue_number": task.issue_number,
-                    "issue": task.issue_number,
-                }
-            )
-            log_event(
-                logger, "task_enqueued", task_id=task_id, repo=repo_name, reason=reason
-            )
-        db.add(
-            WebhookDelivery(
-                delivery_id=x_github_delivery,
-                event_type=x_github_event,
-                task_id=task_id,
-            )
-        )
-        # Remember the installation so /api/github/status shows the connection.
-        inst = payload.get("installation", {}) or {}
-        inst_id = str(inst.get("id", ""))
-        if inst_id:
-            acct = db.query(GitHubAccount).filter_by(installation_id=inst_id).first()
-            if acct is None:
-                repo_full = payload.get("repository", {}).get("full_name", "")
-                login = repo_full.split("/")[0] if "/" in repo_full else ""
-                db.add(
-                    GitHubAccount(
-                        login=login, installation_id=inst_id, account_type="User"
-                    )
-                )
+    db = SessionLocal()
+    try:
+        if db.query(WebhookDelivery).filter(WebhookDelivery.delivery_id == x_github_delivery).first():
+            return {"ok": True, "duplicate": True}
+        db.add(WebhookDelivery(delivery_id=x_github_delivery))
         db.commit()
-        # No sync launch here: the queue worker picks up the job. Webhook
-        # returns 200 quickly by design.
-        if task_id is None:
-            # Silent no-ops are why missed triggers confuse users: always say why.
-            log_event(
-                logger, "webhook_skipped", reason=skip_reason or "no trigger matched"
-            )
-            return {
-                "status": "ok",
-                "task_id": None,
-                "triggered": False,
-                "reason": skip_reason,
-            }
-        return {"status": "ok", "task_id": task_id, "triggered": True}
+
+        payload = json.loads(body.decode("utf-8") or "{}")
+        if x_github_event == "issues":
+            return _handle_issue(db, payload)
+        if x_github_event == "workflow_run":
+            return _handle_workflow_run(db, payload)
+        if x_github_event == "check_run":
+            return _handle_check_run(db, payload)
+        return {"ok": True, "ignored": x_github_event}
     finally:
         db.close()
+
+
+def _handle_issue(db: Session, payload: dict) -> dict:
+    action = payload.get("action")
+    if action not in ("opened", "reopened"):
+        return {"ok": True, "ignored": f"issues.{action}"}
+    labels = [l.get("name", "") for l in (payload.get("issue", {}).get("labels") or [])]
+    # Optional label gate: if the repo uses `fixhub-fix`, only those issues trigger.
+    # We do NOT require it — plain opened/reopened triggers by default.
+    _ = labels
+    repo_name = payload.get("repository", {}).get("full_name", "")
+    if not repo_name:
+        return {"ok": False, "error": "missing repository"}
+    issue = payload.get("issue", {})
+    _get_or_create_repo(db, repo_name)
+    task = Task(
+        repository=repo_name,
+        trigger_type="issue",
+        issue_number=issue.get("number"),
+        issue_title=issue.get("title", "")[:500],
+        issue_body=(issue.get("body") or "")[:8000],
+        issue_url=issue.get("html_url", ""),
+        status="RUNNING",
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    _event(db, task.id, "TASK_CREATED", {"trigger": "issue", "issue": task.issue_number})
+    db.commit()
+    queue = _maybe_enqueue(db, task.id)
+    return {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}
+
+
+def _handle_workflow_run(db: Session, payload: dict) -> dict:
+    action = payload.get("action")
+    run = payload.get("workflow_run", {})
+    if action != "completed" or run.get("conclusion") != "failure":
+        return {"ok": True, "ignored": f"workflow_run.{action}/{run.get('conclusion')}"}
+    repo_name = payload.get("repository", {}).get("full_name", "")
+    if not repo_name:
+        return {"ok": False, "error": "missing repository"}
+    _get_or_create_repo(db, repo_name)
+    dup = _active_ci_task(db, repo_name=repo_name, sha=run.get("head_sha", ""),
+                          job=run.get("name", ""))
+    if dup is not None:
+        return {"ok": True, "task_id": dup.id, "duplicate": "active_task"}
+    base_excerpt = f"workflow {run.get('name')} failed on {run.get('head_branch')}"
+    logs = _ci_log_excerpt(repo_name=repo_name, run_id=str(run.get("id", "")),
+                           check_name=run.get("name", ""))
+    task = Task(
+        repository=repo_name,
+        trigger_type="ci",
+        ci_run_id=str(run.get("id", "")),
+        ci_sha=run.get("head_sha", ""),
+        ci_workflow=run.get("name", ""),
+        ci_url=run.get("html_url", ""),
+        ci_excerpt=(f"{base_excerpt}\n--- failing logs ---\n{logs}" if logs else base_excerpt),
+        status="RUNNING",
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    _event(db, task.id, "TASK_CREATED", {"trigger": "ci", "run": task.ci_run_id})
+    _event(db, task.id, "CI_CONTEXT_LOADED",
+           build_ci_context(event_type="workflow_run", payload=payload, repo_name=repo_name))
+    db.commit()
+    queue = _maybe_enqueue(db, task.id)
+    return {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}
+
+
+def _handle_check_run(db: Session, payload: dict) -> dict:
+    if payload.get("action") != "completed":
+        return {"ok": True, "ignored": "check_run.not_completed"}
+    run = payload.get("check_run", {})
+    if run.get("conclusion") != "failure":
+        return {"ok": True, "ignored": "check_run.not_failure"}
+    repo_name = payload.get("repository", {}).get("full_name", "")
+    if not repo_name:
+        return {"ok": False, "error": "missing repository"}
+    _get_or_create_repo(db, repo_name)
+    dup = _active_ci_task(db, repo_name=repo_name, sha=run.get("head_sha", ""),
+                          job=run.get("name", ""))
+    if dup is not None:
+        return {"ok": True, "task_id": dup.id, "duplicate": "active_task"}
+    base_excerpt = f"check {run.get('name')} failed"
+    logs = _ci_log_excerpt(repo_name=repo_name,
+                           run_id=_run_id_from_url(run.get("html_url", "")),
+                           check_name=run.get("name", ""))
+    task = Task(
+        repository=repo_name,
+        trigger_type="ci",
+        ci_sha=run.get("head_sha", ""),
+        ci_job=run.get("name", ""),
+        ci_url=run.get("html_url", ""),
+        ci_excerpt=(f"{base_excerpt}\n--- failing logs ---\n{logs}" if logs else base_excerpt),
+        status="RUNNING",
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    _event(db, task.id, "TASK_CREATED", {"trigger": "ci-check"})
+    _event(db, task.id, "CI_CONTEXT_LOADED",
+           build_ci_context(event_type="check_run", payload=payload, repo_name=repo_name))
+    db.commit()
+    queue = _maybe_enqueue(db, task.id)
+    return {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}

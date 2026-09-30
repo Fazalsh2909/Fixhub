@@ -1,0 +1,4 @@
+# Benchmark run artifacts: keep baseline + latest committed, ignore the rest.
+tmp/
+run-*.json
+run-*.md

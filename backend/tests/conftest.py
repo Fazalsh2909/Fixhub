@@ -1,47 +1,47 @@
-"""Pytest isolation: never touch the live dev DB (backend/nexus.db).
-
-Every test previously did `init_db(); SessionLocal()` against the global
-engine bound to DATABASE_URL=sqlite:///./nexus.db, so a full suite run
-flooded Source Control + Tasks with demo/*, acme/*, test/* rows.
-
-This conftest forces an isolated SQLite file per test session BEFORE
-backend.app.db is imported, and overrides the FastAPI get_db dependency.
-"""
-
 import os
 import sys
-import tempfile
-from pathlib import Path
 
-# Isolated DB file for the whole pytest process.
-_TMP = Path(tempfile.gettempdir()) / f"fixhub-test-{os.getpid()}.db"
-if _TMP.exists():
+# Ensure backend/ is importable and use an isolated test database file.
+BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BACKEND not in sys.path:
+    sys.path.insert(0, BACKEND)
+
+os.environ.setdefault("LLM_API_KEY", "test-key")
+os.environ.setdefault("GITHUB_WEBHOOK_SECRET", "test-secret")
+os.environ.setdefault("WORKSPACE_ROOT", "./test-workspaces")
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+TEST_DB = os.path.join(BACKEND, "test-fixhub.db")
+if os.path.exists(TEST_DB):
+    os.remove(TEST_DB)
+
+from app.db.database import Base  # noqa: E402
+import app.db.database as _dbmod  # noqa: E402
+import app.github.webhook as _webhook  # noqa: E402
+import app.tasks.service as _service  # noqa: E402
+
+_test_engine = create_engine(f"sqlite:///{TEST_DB}", connect_args={"check_same_thread": False})
+_TestSession = sessionmaker(bind=_test_engine, autoflush=False, autocommit=False)
+Base.metadata.create_all(bind=_test_engine)
+
+# Point all SessionLocal users at the test DB.
+_dbmod.SessionLocal = _TestSession
+_webhook.SessionLocal = _TestSession
+_service.SessionLocal = _TestSession
+
+
+collect_ignore = ["fixtures"]  # deterministic target repos, not our suite
+
+
+@pytest.fixture()
+def db():
+    Base.metadata.drop_all(bind=_test_engine)
+    Base.metadata.create_all(bind=_test_engine)
+    s = _TestSession()
     try:
-        _TMP.unlink()
-    except OSError:
-        pass
-os.environ["DATABASE_URL"] = f"sqlite:///{_TMP}"
-
-# Ensure `import app.*` resolves to backend/app.
-_BACKEND = Path(__file__).resolve().parents[1]
-if str(_BACKEND) not in sys.path:
-    sys.path.insert(0, str(_BACKEND))
-
-import pytest  # noqa: E402
-
-
-@pytest.fixture(scope="session", autouse=True)
-def _isolated_db():
-    from app.db import SessionLocal, init_db
-
-    init_db()
-    yield
-    try:
-        SessionLocal().close()
-    except Exception:
-        pass
-    try:
-        if _TMP.exists():
-            _TMP.unlink()
-    except OSError:
-        pass
+        yield s
+    finally:
+        s.close()

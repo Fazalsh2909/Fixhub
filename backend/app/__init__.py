@@ -1,1 +1,0 @@
-"""Fixhub backend package."""

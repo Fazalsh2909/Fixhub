@@ -1,89 +1,104 @@
-import { useState } from 'react';
-import { PIPELINE, stageColor } from '../theme';
-import type { TaskEvent } from '../lib/tasks';
+import { useEffect, useRef, useState } from "react";
+import { api } from "../api";
+import type { TaskEvent } from "../types";
 
-type Props = {
-  events: TaskEvent[];
-  state?: string;
-  running: boolean;
-  traceEndRef: React.RefObject<HTMLDivElement | null>;
-  dark: Record<string, string>;
-};
-
-const COLLAPSE_AT = 300;
-
-function EventRow({ e, i, dark }: { e: TaskEvent; i: number; dark: Record<string, string> }) {
-  const [open, setOpen] = useState(false);
-  const color = stageColor(e.stage, dark);
-  const long = e.message.length > COLLAPSE_AT;
-  const shown = !long || open ? e.message : e.message.slice(0, COLLAPSE_AT) + '…';
-  const nested = e.stage === 'SUBAGENT';
-  return (
-    <div className="fh-rise" style={{
-      animationDelay: `${Math.min(i, 12) * 60}ms`,
-      display: 'flex', gap: 8, padding: '4px 6px',
-      borderBottom: `1px solid ${dark.border}55`, alignItems: 'baseline',
-      marginLeft: nested ? 16 : 0,
-      borderLeft: nested ? `2px solid ${color}66` : 'none',
-      paddingLeft: nested ? 8 : 6,
-    }}>
-      <span style={{ color: dark.muted, minWidth: 28, textAlign: 'right' }}>{i + 1}</span>
-      <span style={{
-        minWidth: 110, textAlign: 'center', fontSize: 11, fontWeight: 700,
-        color, border: `1px solid ${color}55`,
-        borderRadius: 4, padding: '1px 6px',
-      }}>{nested ? '◈ SUBAGENT' : e.stage}</span>
-      <span style={{ whiteSpace: 'pre-wrap', flex: 1, wordBreak: 'break-word' }}>
-        {shown}
-        {long && (
-          <span onClick={() => setOpen(!open)} style={{ color: dark.accent, cursor: 'pointer', marginLeft: 6 }}>
-            {open ? 'show less' : 'show more'}
-          </span>
-        )}
-      </span>
-      {e.created_at && (
-        <span style={{ color: dark.muted, fontSize: 11, whiteSpace: 'nowrap' }}>
-          {new Date(e.created_at).toLocaleTimeString()}
-        </span>
-      )}
-    </div>
-  );
+interface Props {
+  taskId: number | null;
 }
 
-export default function TraceView({ events, state, running, traceEndRef, dark }: Props) {
-  const pipeIdx = state ? PIPELINE.indexOf(state) : -1;
-  const pipeDone = state ? ['COMMITTED', 'PUSHED', 'PR_CREATED'].includes(state) : false;
+function shortData(data: string): string {
+  try {
+    const o = JSON.parse(data);
+    const s = JSON.stringify(o);
+    return s.length > 220 ? s.slice(0, 220) + "…" : s;
+  } catch {
+    return data.length > 220 ? data.slice(0, 220) + "…" : data;
+  }
+}
+
+export default function TraceView({ taskId }: Props) {
+  const [events, setEvents] = useState<TaskEvent[]>([]);
+  const [live, setLive] = useState(true);
+  const afterRef = useRef(0);
+  const esRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    setEvents([]);
+    afterRef.current = 0;
+    esRef.current?.close();
+    esRef.current = null;
+    if (!taskId) return;
+    let stop = false;
+    // Initial load.
+    api
+      .events(taskId, 0)
+      .then((d) => {
+        if (stop) return;
+        setEvents(d.events);
+        afterRef.current = d.events.length ? d.events[d.events.length - 1].id : 0;
+      })
+      .catch(() => {});
+    // Live SSE.
+    if (live) {
+      const es = api.eventSource(taskId, 0);
+      esRef.current = es;
+      es.onmessage = (m) => {
+        try {
+          const e = JSON.parse(m.data);
+          if (!e.id) return;
+          afterRef.current = Math.max(afterRef.current, e.id);
+          setEvents((ev) => (ev.some((x) => x.id === e.id) ? ev : [...ev, e]));
+        } catch {
+          /* keepalive */
+        }
+      };
+      es.onerror = () => {
+        /* poll fallback below keeps it fresh */
+      };
+    }
+    // Poll fallback every 3s (SSE may drop behind proxies).
+    const t = setInterval(async () => {
+      if (!live) return;
+      try {
+        const d = await api.events(taskId, afterRef.current);
+        if (d.events.length) {
+          afterRef.current = d.events[d.events.length - 1].id;
+          setEvents((ev) => {
+            const known = new Set(ev.map((x) => x.id));
+            return [...ev, ...d.events.filter((x: TaskEvent) => !known.has(x.id))];
+          });
+        }
+      } catch {
+        /* noop */
+      }
+    }, 3000);
+    return () => {
+      stop = true;
+      clearInterval(t);
+      esRef.current?.close();
+      esRef.current = null;
+    };
+  }, [taskId, live]);
+
+  if (!taskId) return <div className="pane-hint">Agent trace appears here.</div>;
+
   return (
-    <div role="status" style={{ fontSize: 12 }}>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginBottom: 8 }}>
-        {PIPELINE.map((s) => {
-          const idx = PIPELINE.indexOf(s);
-          const done = pipeDone || (pipeIdx >= 0 && idx < pipeIdx);
-          const current = !pipeDone && idx === pipeIdx;
-          return (
-            <span key={s} title={s} className={current ? 'fh-step-current' : ''}
-              style={{
-                padding: '2px 8px', borderRadius: 10, fontSize: 11,
-                border: `1px solid ${current ? dark.yellow : dark.border}`,
-                background: done ? '#3fb95022' : current ? '#d2992222' : 'transparent',
-                color: done ? dark.green : current ? dark.yellow : dark.muted,
-              }}>
-              {done ? '✓ ' : current ? '▶ ' : ''}{s}
-            </span>
-          );
-        })}
+    <div className="trace">
+      <div className="trace-head">
+        <strong>Agent trace</strong>
+        <label>
+          <input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} /> live
+        </label>
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6, color: dark.muted }}>
-        <span>{events.length} step{events.length === 1 ? '' : 's'}</span>
-        {running && <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}><span className="fh-live-dot" style={{ color: dark.green }} /> live — polling every 3s</span>}
-        {!running && events.length > 0 && <span>· idle</span>}
-        {state && <span style={{ marginLeft: 'auto' }}>state: <strong style={{ color: stageColor(state, dark) }}>{state}</strong></span>}
+      <div className="trace-list">
+        {events.map((e) => (
+          <div key={e.id} className="trace-row">
+            <code className="trace-type">{e.type}</code>
+            <span className="trace-data">{shortData(e.data)}</span>
+          </div>
+        ))}
+        {events.length === 0 && <div className="pane-hint">No events yet — run the task.</div>}
       </div>
-      {events.length === 0 && <div style={{ color: dark.muted }}>No trace yet — run the agent. Every tool call, test and state change lands here.</div>}
-      {events.filter((e) => e.stage !== 'PLAN').map((e, i) => (
-        <EventRow key={i} e={e} i={i} dark={dark} />
-      ))}
-      <div ref={traceEndRef} />
     </div>
   );
 }

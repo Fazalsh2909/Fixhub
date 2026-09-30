@@ -1,163 +1,95 @@
-"""Central config. Secrets come from env only; never logged."""
+"""FixHub global config. Secrets come ONLY from environment variables."""
+from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    app_name: str = "fixhub"
-    # development | production — controls fail-fast secret checks + HSTS.
-    app_env: str = "development"
-    database_url: str = "sqlite:///./fixhub.db"
-    redis_url: str = "redis://localhost:6379/0"
-    # Bearer token for mutating API routes (approve/reject/run/trigger/connect).
-    # Empty = open (dev/test). Set in prod; enforced when non-empty.
-    api_token: str = ""
-    github_app_id: str = ""
-    github_private_key: str = ""
-    github_webhook_secret: str = "dev-secret-change-me"
-    # GitHub App connection. Private key via env (PEM) or file path; file wins if set.
-    github_app_private_key_path: str = ""
-    github_app_slug: str = ""
-    # When True, any opened/reopened issue on a connected repo creates a task.
-    # Default True: connected repos are stay-connected — the agent starts
-    # immediately (AUTO_RUN) without label ceremony. Every run costs LLM
-    # calls and is capped by AGENT_MAX_COST_USD; set false for manual triage.
-    auto_trigger_on_issue: bool = True
-    # Automation: run the agent immediately when a task is created (chat fix,
-    # chat instruction, Create button, webhook). Runs in a background thread;
-    # the frontend polls the Agent Trace. Default True (Claude-code style).
-    # LLM spend note: every auto-run costs model calls — set false for manual.
-    auto_run: bool = True
-    # When True, a VERIFIED run (real tests PASS + non-empty diff + policy
-    # ALLOW + attached GitHub App) opens a PR without a manual Approve click.
-    # Pre-authorization is recorded as an AUTO_APPROVED approval row.
-    # Default-branch pushes stay DENY no matter what. Default False.
-    auto_pr_on_verified: bool = False
-    # Generic OpenAI-compatible provider. TOKENROUTER_* kept for backwards compat.
-    # LLM_PROVIDER: tokenrouter | openai | experiential | bynara | xkiro | custom
-    llm_provider: str = "tokenrouter"
-    tokenrouter_base_url: str = "https://api.tokenrouter.com/v1"
-    tokenrouter_api_key: str = ""
-    openai_base_url: str = "https://api.openai.com/v1"
-    openai_api_key: str = ""
-    # Experiential Labs gateway (OpenAI-compatible, docs: platform.experientiallabs.ai/docs).
-    # Model slugs from GET /v1/models, e.g. glm-5.3. Key is xpl_... (settings/api-keys).
-    explabs_base_url: str = "https://api.experientiallabs.ai/v1"
-    explabs_api_key: str = ""
-    # NaraRouter gateway (OpenAI-compatible, docs: router.bynara.id/docs).
-    # Model aliases from GET /api/pricing, e.g. glm-5.3-free. Key is sk-nry-...
-    bynara_base_url: str = "https://router.bynara.id/v1"
-    bynara_api_key: str = ""
-    # xKiro gateway (OpenAI-compatible, docs: docs.xkiro.com).
-    # Model ids carry vendor prefix, e.g. minimax/minimax-m3. Key is sk-xt-...
-    xkiro_base_url: str = "https://api.xkiro.com/v1"
-    xkiro_api_key: str = ""
-    # Model id (already vendor-prefixed, e.g. minimax/minimax-m3:free).
-    # NEXUS_MODEL is accepted as a fallback alias (old .env name) — FIXHUB_MODEL wins.
-    # NOTE: restart uvicorn after editing backend/.env; the running server keeps old values.
-    fixhub_model: str = ""
-    nexus_model: str = ""
-    default_branch_guard: str = "main"
-    sandbox_image: str = "python:3.11-slim"
-    sandbox_timeout_s: int = 300
-    # Comma-separated CORS origins. Local dev defaults; set FRONTEND_URL in prod.
-    cors_origins: str = "http://localhost:5173,http://localhost:5174"
-    # Simple in-memory rate limit for demo trigger (req/min/IP).
-    rate_limit_per_min: int = 20
-    # ECC/opencode skill injection for the fix agent. Empty = auto:
-    # vendored bundle first, then the local user pack, else silently off.
-    skills_enabled: bool = True
-    skills_dir: str = ""
-    skills_top_k: int = 2
-    skills_max_chars: int = 6000
-    # Agent auto-retry: total attempts = 1 + this value. Retries retryable
-    # provider errors (429/5xx) only — deterministic verification FAIL stops
-    # after attempt 1 (fail fast). Non-retryable provider errors
-    # (400/401/403/404) fail fast without retry.
-    agent_max_retries: int = 2
-    agent_retry_backoff_s: float = 5.0
-    # Per-task spend guard. 0 = unlimited (dev). Prod: e.g. 0.50.
-    # Enforced in orchestrator before each billable LLM call.
-    agent_max_cost_usd: float = 0.0
-    # Per-task LLM call budget (logical tool_call invocations, shared across
-    # attempts and subagent turns). 0 = unlimited. Unlike dollars, this works
-    # for free-tier models that price at $0. Enforced in the orchestrator loop
-    # and the explore subagent before each billable call.
-    agent_max_llm_calls: int = 30
-    # Transcript budget per LLM call (chars, ~4 chars/token). Older tool
-    # output is truncated, oldest exchanges dropped — DB keeps the full record.
-    agent_context_budget_chars: int = 60000
-    # Explore-subagent turns. A runaway explorer is worse than a missing answer.
-    subagent_max_turns: int = 6
-    # Queue backend: redis (default when reachable) | memory (tests/demo).
-    # Prod path: set REDIS_URL to ElastiCache; SQS adapter plugs into queue.py
-    # via the same enqueue/dequeue/ack interface (see queue.py docstring).
-    queue_backend: str = "auto"
-    # Primary autonomous coding path: mini-SWE-agent (thin adapter in
-    # app/agent/miniswe_adapter.py). False = legacy built-in ReAct loop
-    # (kept as fallback until the mini-SWE path is proven end-to-end).
-    miniswe_enabled: bool = True
-    # Diagnose-then-fix autonomy needs room to explore AND fix: 50 steps.
-    # Worst-case cost/time per run roughly doubles vs 25 — tune per repo.
-    miniswe_step_limit: int = 50
-    miniswe_wall_time_s: int = 1200
-    # Agent container image. Empty = settings.sandbox_image.
-    miniswe_image: str = ""
+    # App
+    APP_NAME: str = "FixHub"
+    ENV: str = "dev"  # dev | prod
+    LOG_LEVEL: str = "info"
 
-    def resolved_model(self) -> str:
-        """Model id to send. FIXHUB_MODEL > NEXUS_MODEL alias > built-in default."""
-        return (
-            self.fixhub_model.strip() or self.nexus_model.strip() or "z-ai/glm-5.3-free"
-        )
+    # Database: SQLite dev, Postgres prod (e.g. postgresql+psycopg://user:pass@host/db)
+    DATABASE_URL: str = "sqlite:///./fixhub.db"
 
-    def resolved_llm(self) -> tuple[str, str, str]:
-        """Return (base_url, api_key, model) for the selected provider."""
-        model = self.resolved_model()
-        if self.llm_provider in ("experiential", "explabs"):
-            return self.explabs_base_url, self.explabs_api_key, model
-        if self.llm_provider == "bynara":
-            return self.bynara_base_url, self.bynara_api_key, model
-        if self.llm_provider == "xkiro":
-            return self.xkiro_base_url, self.xkiro_api_key, model
-        if self.llm_provider == "openai" or self.openai_api_key:
-            if (
-                self.openai_api_key
-                and self.llm_provider == "tokenrouter"
-                and not self.tokenrouter_api_key
-            ):
-                # Auto-prefer OpenAI when only it is configured.
-                return self.openai_base_url, self.openai_api_key, model
-            if self.llm_provider == "openai":
-                return self.openai_base_url, self.openai_api_key, model
-        return self.tokenrouter_base_url, self.tokenrouter_api_key, model
+    # LLM provider switch: "bynara" | "xkiro" (both OpenAI-compatible).
+    # Switch providers by setting LLM_PROVIDER only — no other edits needed.
+    LLM_PROVIDER: str = "bynara"
+    # Bynara router
+    BYNARA_BASE_URL: str = "https://router.bynara.id/v1"
+    BYNARA_API_KEY: str = ""
+    BYNARA_MODEL: str = "nemotron-3.5-lightning-free"
+    # Xkiro gateway
+    XKIRO_BASE_URL: str = "https://api.xkiro.com/v1"
+    XKIRO_API_KEY: str = ""
+    XKIRO_MODEL: str = "qwen/qwen3-coder-plus:free"
+    # Legacy explicit trio: when LLM_API_KEY is set it wins over LLM_PROVIDER
+    # (backward compat + tests). Leave empty to use the provider switch.
+    LLM_BASE_URL: str = "https://router.bynara.id/v1"
+    LLM_API_KEY: str = ""
+    LLM_MODEL: str = "nemotron-3.5-lightning-free"
+    LLM_TIMEOUT_S: int = 120
+    # Transient upstream blips (429/5xx, 200-with-error-body) are retried with
+    # backoff instead of killing the run: attempts × (20s, 40s, 80s, …).
+    LLM_RETRY_ATTEMPTS: int = 4
+    LLM_RETRY_BASE_S: float = 20.0
+    LLM_MAX_ITERATIONS: int = 40
+    # Conversation window: how many recent tool-exchange blocks are resent to
+    # the LLM per call (older ones are replaced by a one-line summary).
+    LLM_HISTORY_GROUPS: int = 12
+    # Thrash guard: stop rewriting the same file after this many writes/edits
+    # and finish with what exists instead of burning the iteration budget.
+    LLM_MAX_REWRITES_PER_PATH: int = 8
+    LLM_MAX_RUNTIME_S: int = 900
+    LLM_MAX_OUTPUT_BYTES: int = 200_000
 
-    def cors_origin_list(self) -> list[str]:
-        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+    # Agent tool bounds
+    TOOL_OUTPUT_MAX_BYTES: int = 20_000
+    # Default per-command wall time. Package installs routinely exceed 60s on
+    # constrained networks; the agent loop's runtime/iteration caps (not this)
+    # are what bound total runaway cost.
+    COMMAND_TIMEOUT_S: int = 180
 
-    @property
-    def is_prod(self) -> bool:
-        return self.app_env.lower() == "production"
+    # Sandbox / workspaces
+    WORKSPACE_ROOT: str = "./workspaces"
+    # 0 = remove per-task workspace after terminal states (fresh per-task).
+    # 1 = keep for debugging (manual `docker compose down -v` to wipe).
+    WORKSPACE_KEEP: int = 0
 
-    def validate_prod(self) -> None:
-        """Fail fast on unsafe prod defaults. Called at app startup."""
-        if not self.is_prod:
-            return
-        problems: list[str] = []
-        if not self.github_webhook_secret or self.github_webhook_secret in (
-            "dev-secret-change-me",
-            "change-me",
-        ):
-            problems.append(
-                "GITHUB_WEBHOOK_SECRET must be set to a random 32+ char value"
-            )
-        if self.database_url.startswith("sqlite"):
-            problems.append("DATABASE_URL must be Postgres in production")
-        if not self.api_token:
-            problems.append("API_TOKEN must be set in production")
-        if problems:
-            raise RuntimeError("unsafe production config: " + "; ".join(problems))
+    # GitHub App
+    GITHUB_APP_ID: str = ""
+    GITHUB_APP_PRIVATE_KEY: str = ""  # PEM contents (prefer Secrets Manager in prod)
+    GITHUB_APP_PRIVATE_KEY_PATH: str = ""
+    GITHUB_WEBHOOK_SECRET: str = ""
+    GITHUB_API_URL: str = "https://api.github.com"
+
+    # Queue (RQ/Redis). Webhooks enqueue; `worker` service runs jobs.
+    REDIS_URL: str = "redis://localhost:6379/0"
+    QUEUE_NAME: str = "fixhub"
+    # 1 = webhook auto-enqueues an agent run on issue/CI trigger.
+    # 0 = webhook only creates the Task; run via POST /api/tasks/{id}/run.
+    AUTO_RUN_ON_WEBHOOK: int = 1
+    # 1 = agent run commits+pushes+PRs immediately (legacy behaviour).
+    # 0 = agent run stops at NEEDS_REVIEW; publish via POST /api/tasks/{id}/approve.
+    AUTO_PUBLISH: int = 1
+    JOB_TIMEOUT_S: int = 1200
 
 
 settings = Settings()
+
+
+def active_llm() -> tuple[str, str, str]:
+    """Resolve (base_url, api_key, model) for the active provider.
+
+    Explicit legacy LLM_API_KEY wins (backward compat); otherwise the
+    LLM_PROVIDER preset (bynara|xkiro) is used. Unknown provider -> bynara.
+    """
+    if settings.LLM_API_KEY:
+        return (settings.LLM_BASE_URL, settings.LLM_API_KEY, settings.LLM_MODEL)
+    provider = (settings.LLM_PROVIDER or "bynara").strip().lower()
+    if provider == "xkiro":
+        return (settings.XKIRO_BASE_URL, settings.XKIRO_API_KEY, settings.XKIRO_MODEL)
+    return (settings.BYNARA_BASE_URL, settings.BYNARA_API_KEY, settings.BYNARA_MODEL)

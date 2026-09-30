@@ -1,39 +1,21 @@
-# Python
 __pycache__/
 *.pyc
-*.pyo
-.venv/
-venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Secrets + local state — never commit
+*.db
+workspaces/
+test-workspaces/
 .env
-.env.local
 *.pem
 *.key
-*.db
-*.sqlite
-*.sqlite3
-fixhub.db
-workspaces/
-
-# Node / frontend
 node_modules/
-dist/
-dist-ssr/
-*.local
-
-# Playwright / test output
-playwright-report/
-test-results/
-blob-report/
-
-# OS / editors
+frontend/dist/
+.venv/
+venv/
+*.log
+coverage/
+htmlcov/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .DS_Store
 Thumbs.db
-.vscode/
-.idea/

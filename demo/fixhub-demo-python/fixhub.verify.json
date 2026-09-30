@@ -1,1 +1,0 @@
-{"suite": "python -m pytest -q", "lint": null, "type": null, "regression": "python -m pytest tests/test_total.py -q", "targeted": "python -m pytest tests/test_total.py tests/test_format.py -q"}

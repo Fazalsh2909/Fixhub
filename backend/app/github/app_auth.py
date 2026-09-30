@@ -1,75 +1,44 @@
-"""GitHub App auth: App JWT -> installation token (short-lived, cached).
-
-Tokens are returned to callers only — never logged, never stored in DB,
-never forwarded to the sandbox. Cache is in-memory with expiry margin.
-"""
-
+"""GitHub App auth: short-lived installation tokens. No secrets in logs/context."""
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 import httpx
-import jwt
+import jwt as _pyjwt
 
-from ..config import settings
-
-API = "https://api.github.com"
-
-# installation_id -> (token, expires_at_epoch)
-_cache: dict[str, tuple[str, float]] = {}
+from app.config import settings
 
 
-def _private_key_pem() -> str:
-    if settings.github_app_private_key_path:
-        return Path(settings.github_app_private_key_path).read_text(encoding="utf-8")
-    return settings.github_private_key
+def _private_key() -> str:
+    if settings.GITHUB_APP_PRIVATE_KEY:
+        return settings.GITHUB_APP_PRIVATE_KEY
+    if settings.GITHUB_APP_PRIVATE_KEY_PATH:
+        with open(settings.GITHUB_APP_PRIVATE_KEY_PATH, "r", encoding="utf-8") as fh:
+            return fh.read()
+    raise RuntimeError("GitHub App private key is not configured")
 
 
-def app_configured() -> bool:
-    return bool(settings.github_app_id and _private_key_pem())
-
-
-def build_app_jwt(app_id: str, private_key_pem: str) -> str:
+def app_jwt() -> str:
     now = int(time.time())
-    payload = {"iat": now - 60, "exp": now + 540, "iss": app_id}
-    return jwt.encode(payload, private_key_pem, algorithm="RS256")
+    payload = {"iat": now - 60, "exp": now + 600, "iss": settings.GITHUB_APP_ID}
+    return _pyjwt.encode(payload, _private_key(), algorithm="RS256")
 
 
-def get_installation_token(installation_id: str) -> str:
-    """Exchange App JWT for an installation token. Cached until ~60s before expiry."""
-    hit = _cache.get(installation_id)
-    if hit and hit[1] - 60 > time.time():
-        return hit[0]
-    pem = _private_key_pem()
-    if not settings.github_app_id or not pem:
-        raise RuntimeError("GitHub App not configured (app id / private key missing)")
-    app_jwt = build_app_jwt(settings.github_app_id, pem)
-    with httpx.Client(timeout=30) as c:
-        r = c.post(
-            f"{API}/app/installations/{installation_id}/access_tokens",
-            headers={
-                "Authorization": f"Bearer {app_jwt}",
-                "Accept": "application/vnd.github+json",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
-    token = data["token"]
-    # GitHub returns ISO8601 expires_at; fall back to 50 min on parse failure.
-    try:
-        from datetime import datetime, timezone
-
-        exp = (
-            datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
-            .replace(tzinfo=timezone.utc)
-            .timestamp()
-        )
-    except Exception:
-        exp = time.time() + 3000
-    _cache[installation_id] = (token, exp)
-    return token
+def installation_token(installation_id: str | int) -> str:
+    """Exchange App JWT for a 1-hour installation token."""
+    url = f"{settings.GITHUB_API_URL}/app/installations/{installation_id}/access_tokens"
+    resp = httpx.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {app_jwt()}",
+            "Accept": "application/vnd.github+json",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["token"]
 
 
-def clear_token_cache() -> None:
-    _cache.clear()
+def clone_url_with_token(full_name: str, token: str) -> str:
+    # Token is embedded for git only; callers must never log this URL.
+    return f"https://x-access-token:{token}@github.com/{full_name}.git"

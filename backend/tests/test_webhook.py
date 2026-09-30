@@ -1,399 +1,210 @@
-"""Webhook signature + idempotency + auto-trigger tests."""
-
+"""Webhook signature, issue/CI triggers, duplicate prevention, task creation."""
 import hashlib
 import hmac
 import json
-import uuid
 
 from fastapi.testclient import TestClient
 
 from app.config import settings
-from app.db import SessionLocal, init_db
-from app.github.webhook import _wants_fix, verify_signature
-from app.main import create_app
-from app.models import Repository
-
-app = create_app()
-client = TestClient(app, raise_server_exceptions=False)
+from app.db.models import Task, WebhookDelivery
+from app.github.webhook import verify_signature
+from app.main import app
 
 
-def test_verify_signature_roundtrip():
-    import hashlib
-    import hmac
+def _sig(body: bytes) -> str:
+    return "sha256=" + hmac.new(b"test-secret", body, hashlib.sha256).hexdigest()
 
-    secret = "s3cret"
+
+def test_verify_signature_ok_and_bad():
     body = b'{"a":1}'
-    sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    assert verify_signature(body, sig, secret) is True
-    assert verify_signature(body, "sha256=dead", secret) is False
+    good = "sha256=" + hmac.new(b"test-secret", body, hashlib.sha256).hexdigest()
+    assert verify_signature("test-secret", body, good) is True
+    assert verify_signature("test-secret", body, "sha256=deadbeef") is False
+    assert verify_signature("", body, good) is False
+    assert verify_signature("test-secret", body, "") is False
 
 
-def test_wants_fix_on_label():
-    payload = {
-        "action": "labeled",
-        "label": {"name": "fixhub-fix"},
-        "issue": {"number": 1},
-        "repository": {"full_name": "a/b"},
-    }
-    ok, _ = _wants_fix("issues", payload)
-    assert ok is True
-
-
-def test_ignores_unlabeled_open():
-    # Simple flow: any opened issue is trigger intent; connectedness is
-    # checked in the handler (needs DB), not in _wants_fix.
+def test_issue_trigger_creates_task(db):
+    c = TestClient(app)
     payload = {
         "action": "opened",
-        "issue": {"labels": [], "number": 1},
-        "repository": {"full_name": "a/b"},
+        "repository": {"full_name": "acme/demo"},
+        "issue": {"number": 7, "title": "login broken", "body": "500 on login", "html_url": "http://x/7", "labels": []},
     }
-    ok, reason = _wants_fix("issues", payload)
-    assert ok is True
-    assert "auto-opened" in reason
+    body = json.dumps(payload).encode()
+    r = c.post(
+        "/webhooks/github",
+        content=body,
+        headers={"X-Hub-Signature-256": _sig(body), "X-GitHub-Delivery": "d-1", "X-GitHub-Event": "issues"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["task_id"]
+    t = db.query(Task).filter(Task.issue_number == 7).first()
+    assert t and t.trigger_type == "issue" and t.status == "RUNNING"
 
 
-def test_fix_comment_trigger():
-    payload = {
-        "comment": {"body": "/fix please"},
-        "issue": {"number": 2},
-        "repository": {"full_name": "a/b"},
-    }
-    ok, reason = _wants_fix("issue_comment", payload)
-    assert ok is True and reason == "fix-comment"
-
-
-def test_auto_trigger_unlabeled_open_on_connected_repo(monkeypatch):
-    """Simple flow: any opened issue on a connected repo starts a RUNNING run."""
-    import app.github.webhook as wh
-
-    init_db()
-    db = SessionLocal()
-    name = f"demo/auto-{uuid.uuid4().hex[:8]}"
-    repo = Repository(full_name=name, connected=True)
-    db.add(repo)
-    db.commit()
-    db.close()
-    monkeypatch.setattr(wh.settings, "auto_trigger_on_issue", True)
-
+def test_duplicate_delivery_ignored(db):
+    c = TestClient(app)
     payload = {
         "action": "opened",
-        "issue": {"number": 7, "title": "login redirect loop", "labels": []},
-        "repository": {"full_name": name},
-        "installation": {"id": 123},
+        "repository": {"full_name": "acme/demo"},
+        "issue": {"number": 8, "title": "t", "body": "b", "html_url": "", "labels": []},
     }
-    raw = json.dumps(payload).encode()
-    sig = (
-        "sha256="
-        + hmac.new(
-            settings.github_webhook_secret.encode(), raw, hashlib.sha256
-        ).hexdigest()
-    )
-    r = client.post(
+    body = json.dumps(payload).encode()
+    h = {"X-Hub-Signature-256": _sig(body), "X-GitHub-Delivery": "d-dup", "X-GitHub-Event": "issues"}
+    assert c.post("/webhooks/github", content=body, headers=h).json()["task_id"]
+    r2 = c.post("/webhooks/github", content=body, headers=h)
+    assert r2.json().get("duplicate") is True
+    assert db.query(Task).filter(Task.issue_number == 8).count() == 1
+    assert db.query(WebhookDelivery).filter(WebhookDelivery.delivery_id == "d-dup").count() == 1
+
+
+def test_ci_failure_trigger(db):
+    c = TestClient(app)
+    payload = {
+        "action": "completed",
+        "repository": {"full_name": "acme/demo"},
+        "workflow_run": {"id": 99, "name": "CI", "conclusion": "failure", "head_sha": "abc123", "head_branch": "main", "html_url": "http://x/99"},
+    }
+    body = json.dumps(payload).encode()
+    r = c.post(
         "/webhooks/github",
-        content=raw,
-        headers={
-            "Content-Type": "application/json",
-            "X-Hub-Signature-256": sig,
-            "X-GitHub-Event": "issues",
-            "X-GitHub-Delivery": f"auto-{uuid.uuid4().hex[:8]}",
-        },
+        content=body,
+        headers={"X-Hub-Signature-256": _sig(body), "X-GitHub-Delivery": "d-ci", "X-GitHub-Event": "workflow_run"},
     )
-    assert r.status_code == 200, r.text
-    assert r.json()["task_id"] is not None
+    assert r.json()["task_id"]
+    t = db.query(Task).filter(Task.ci_run_id == "99").first()
+    assert t and t.trigger_type == "ci" and t.ci_sha == "abc123"
 
 
-def _signed_post(payload: dict, event: str = "issues"):
-    raw = json.dumps(payload).encode()
-    sig = (
-        "sha256="
-        + hmac.new(
-            settings.github_webhook_secret.encode(), raw, hashlib.sha256
-        ).hexdigest()
-    )
-    return client.post(
+def test_ci_success_ignored(db):
+    c = TestClient(app)
+    payload = {
+        "action": "completed",
+        "repository": {"full_name": "acme/demo"},
+        "workflow_run": {"id": 100, "name": "CI", "conclusion": "success", "head_sha": "x", "head_branch": "main", "html_url": ""},
+    }
+    body = json.dumps(payload).encode()
+    r = c.post(
         "/webhooks/github",
-        content=raw,
-        headers={
-            "Content-Type": "application/json",
-            "X-Hub-Signature-256": sig,
-            "X-GitHub-Event": event,
-            "X-GitHub-Delivery": f"skip-{uuid.uuid4().hex[:8]}",
-        },
+        content=body,
+        headers={"X-Hub-Signature-256": _sig(body), "X-GitHub-Delivery": "d-ok", "X-GitHub-Event": "workflow_run"},
     )
+    assert r.json().get("ignored")
+    assert db.query(Task).count() == 0
 
 
-def test_skipped_delivery_says_why_not_connected(monkeypatch):
-    """Silent no-ops confused users: an unconnected repo gets triggered:false
-    plus the exact reason instead of a bare null task_id."""
-    import app.github.webhook as wh
+def test_check_run_enriches_excerpt(db, monkeypatch):
+    import app.github.webhook as _wh
 
-    init_db()
-    db = SessionLocal()
-    name = f"demo/skip-{uuid.uuid4().hex[:8]}"
-    db.add(Repository(full_name=name, connected=False))
-    db.commit()
-    db.close()
-    monkeypatch.setattr(wh.settings, "auto_trigger_on_issue", True)
-    r = _signed_post(
-        {
-            "action": "opened",
-            "issue": {"number": 3, "title": "t", "labels": []},
-            "repository": {"full_name": name},
-            "installation": {"id": 1},
-        }
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["task_id"] is None
-    assert body["triggered"] is False
-    assert "not connected" in body["reason"]
-
-
-def test_skipped_delivery_says_why_flag_off(monkeypatch):
-    import app.github.webhook as wh
-
-    init_db()
-    db = SessionLocal()
-    name = f"demo/skipoff-{uuid.uuid4().hex[:8]}"
-    db.add(Repository(full_name=name, connected=True))
-    db.commit()
-    db.close()
-    monkeypatch.setattr(wh.settings, "auto_trigger_on_issue", False)
-    r = _signed_post(
-        {
-            "action": "opened",
-            "issue": {"number": 4, "title": "t", "labels": []},
-            "repository": {"full_name": name},
-            "installation": {"id": 1},
-        }
-    )
-    assert r.json()["triggered"] is False
-    assert "AUTO_TRIGGER_ON_ISSUE" in r.json()["reason"]
-
-
-def _comment_post(
-    payload: dict, delivery_suffix: str = "c1", event: str = "issue_comment"
-):
-    raw = json.dumps(payload).encode()
-    sig = (
-        "sha256="
-        + hmac.new(
-            settings.github_webhook_secret.encode(), raw, hashlib.sha256
-        ).hexdigest()
-    )
-    return client.post(
+    monkeypatch.setattr(_wh, "_ci_log_excerpt",
+                        lambda *, repo_name, run_id, check_name: "JOB Lint failed\n  step ruff conclusion=failure")
+    c = TestClient(app)
+    payload = {
+        "action": "completed",
+        "repository": {"full_name": "acme/demo"},
+        "check_run": {"conclusion": "failure", "head_sha": "def456", "name": "backend",
+                      "html_url": "http://x/actions/runs/4242/job/99"},
+    }
+    body = json.dumps(payload).encode()
+    r = c.post(
         "/webhooks/github",
-        content=raw,
-        headers={
-            "Content-Type": "application/json",
-            "X-Hub-Signature-256": sig,
-            "X-GitHub-Event": event,
-            "X-GitHub-Delivery": f"cmt-{delivery_suffix}-{uuid.uuid4().hex[:8]}",
-        },
+        content=body,
+        headers={"X-Hub-Signature-256": _sig(body), "X-GitHub-Delivery": "d-cr", "X-GitHub-Event": "check_run"},
     )
+    assert r.json()["task_id"]
+    t = db.query(Task).filter(Task.ci_job == "backend").first()
+    assert t and "failing logs" in t.ci_excerpt and "ruff" in t.ci_excerpt
 
 
-def _connected_repo(name: str):
-    from app.models import Repository as _R
+def test_check_run_enrichment_failure_falls_back(db, monkeypatch):
+    import app.github.webhook as _wh
 
-    init_db()
-    db = SessionLocal()
-    repo = _R(full_name=name, connected=True)
-    db.add(repo)
-    db.commit()
-    rid = repo.id
-    db.close()
-    return rid
+    # No installation id / no logs available -> plain one-line excerpt, still triggers.
+    monkeypatch.setattr(_wh, "_ci_log_excerpt",
+                        lambda *, repo_name, run_id, check_name: "")
+    c = TestClient(app)
+    payload = {
+        "action": "completed",
+        "repository": {"full_name": "acme/demo"},
+        "check_run": {"conclusion": "failure", "head_sha": "abc", "name": "backend", "html_url": ""},
+    }
+    body = json.dumps(payload).encode()
+    r = c.post(
+        "/webhooks/github",
+        content=body,
+        headers={"X-Hub-Signature-256": _sig(body), "X-GitHub-Delivery": "d-cr2", "X-GitHub-Event": "check_run"},
+    )
+    assert r.json()["task_id"]
+    t = db.query(Task).filter(Task.ci_job == "backend").first()
+    assert t and t.ci_excerpt == "check backend failed"
 
 
-def test_bot_comment_never_triggers(monkeypatch):
-    import app.github.webhook as wh
+def test_run_id_from_url():
+    from app.github.webhook import _run_id_from_url
 
-    name = f"demo/bot-{uuid.uuid4().hex[:8]}"
-    _connected_repo(name)
-    monkeypatch.setattr(wh.settings, "auto_trigger_on_issue", True)
-    r = _comment_post(
-        {
-            "action": "created",
-            "issue": {"number": 1, "title": "t"},
-            "comment": {
-                "body": "I tried to fix #1 but ...",
-                "user": {"login": "fixhub[bot]", "type": "Bot"},
-            },
-            "repository": {"full_name": name},
+    assert _run_id_from_url("https://github.com/o/r/actions/runs/36275862356/job/108498366867") == "36275862356"
+    assert _run_id_from_url("") == ""
+    assert _run_id_from_url("http://x/99") == ""
+
+
+def test_ci_duplicate_active_task(db, monkeypatch):
+    import app.github.webhook as _wh
+
+    monkeypatch.setattr(_wh, "_ci_log_excerpt",
+                        lambda *, repo_name, run_id, check_name: "")
+    c = TestClient(app)
+
+    def _post(delivery):
+        payload = {
+            "action": "completed",
+            "repository": {"full_name": "acme/demo"},
+            "check_run": {"conclusion": "failure", "head_sha": "sha9", "name": "backend",
+                          "html_url": "http://x/actions/runs/1/job/1"},
         }
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["triggered"] is False
-
-
-def test_human_reply_after_ask_back_retriggers(monkeypatch):
-    """Agent asked → human replies → new RUNNING run carrying the reply."""
-    import app.github.webhook as wh
-    from app.models import ChatMessage, Task, TaskEvent
-
-    name = f"demo/reply-{uuid.uuid4().hex[:8]}"
-    rid = _connected_repo(name)
-    monkeypatch.setattr(wh.settings, "auto_trigger_on_issue", True)
-    db = SessionLocal()
-    t = Task(repo_id=rid, issue_number=5, title="mystery", state="COMPLETED")
-    db.add(t)
-    db.flush()
-    db.add(TaskEvent(task_id=t.id, stage="COMMENT_POSTED", message="please clarify"))
-    db.commit()
-    db.close()
-    r = _comment_post(
-        {
-            "action": "created",
-            "issue": {"number": 5, "title": "mystery", "body": "it breaks"},
-            "comment": {
-                "body": "expected 200, got 500 on /login",
-                "user": {"login": "human", "type": "User"},
-            },
-            "repository": {"full_name": name},
-        },
-        delivery_suffix="reply1",
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["triggered"] is True, body
-    db2 = SessionLocal()
-    try:
-        nt = db2.query(Task).filter_by(id=body["task_id"]).first()
-        assert nt.state == "RUNNING"
-        msgs = [m.content for m in db2.query(ChatMessage).filter_by(task_id=nt.id)]
-        assert any("expected 200" in m for m in msgs)
-    finally:
-        db2.close()
-
-
-def test_comment_ignored_without_prior_ask_back(monkeypatch):
-    import app.github.webhook as wh
-
-    name = f"demo/noprior-{uuid.uuid4().hex[:8]}"
-    _connected_repo(name)
-    monkeypatch.setattr(wh.settings, "auto_trigger_on_issue", True)
-    r = _comment_post(
-        {
-            "action": "created",
-            "issue": {"number": 2, "title": "t"},
-            "comment": {
-                "body": "+1 same here",
-                "user": {"login": "human", "type": "User"},
-            },
-            "repository": {"full_name": name},
-        },
-        delivery_suffix="noprior",
-    )
-    assert r.json()["triggered"] is False
-
-
-def test_comment_ignored_after_pr_exists(monkeypatch):
-    import app.github.webhook as wh
-    from app.models import PullRequest, Task, TaskEvent
-
-    name = f"demo/prdone-{uuid.uuid4().hex[:8]}"
-    rid = _connected_repo(name)
-    monkeypatch.setattr(wh.settings, "auto_trigger_on_issue", True)
-    db = SessionLocal()
-    t = Task(repo_id=rid, issue_number=3, title="done", state="COMPLETED")
-    db.add(t)
-    db.flush()
-    db.add(TaskEvent(task_id=t.id, stage="COMMENT_POSTED", message="q?"))
-    db.add(PullRequest(task_id=t.id, url="http://x/pr/9", number=9, commit_sha="abc"))
-    db.commit()
-    db.close()
-    r = _comment_post(
-        {
-            "action": "created",
-            "issue": {"number": 3, "title": "done"},
-            "comment": {"body": "thanks!", "user": {"login": "human", "type": "User"}},
-            "repository": {"full_name": name},
-        },
-        delivery_suffix="prdone",
-    )
-    assert r.json()["triggered"] is False
-
-
-def test_from_issue_stores_body_and_runs(monkeypatch):
-    """from-issue keeps the fetched body+comments and starts RUNNING."""
-    import app.github.api as gapi
-    from app.models import ChatMessage, Task
-
-    name = f"demo/fromissue-{uuid.uuid4().hex[:8]}"
-    _connected_repo(name)
-
-    class _FakeClient:
-        def get_issue(self, full_name, number):
-            assert (full_name, number) == (name, 9)
-            return {"title": "Real title here", "body": "Real body with repro steps"}
-
-        def get_issue_comments(self, full_name, number):
-            return [{"user": {"login": "r"}, "body": "more context"}]
-
-    monkeypatch.setattr(gapi, "_client_for", lambda inst: _FakeClient())
-    r = client.post(
-        "/api/github/from-issue",
-        json={"full_name": name, "issue_number": 9, "installation_id": "inst-1"},
-    )
-    assert r.status_code == 200, r.text
-    tid = r.json()["task_id"]
-    db = SessionLocal()
-    try:
-        t = db.query(Task).filter_by(id=tid).first()
-        assert t.state == "RUNNING"
-        assert t.title == "Real title here"
-        bodies = " ".join(
-            m.content for m in db.query(ChatMessage).filter_by(task_id=tid)
+        body = json.dumps(payload).encode()
+        return c.post(
+            "/webhooks/github",
+            content=body,
+            headers={"X-Hub-Signature-256": _sig(body), "X-GitHub-Delivery": delivery,
+                     "X-GitHub-Event": "check_run"},
         )
-        assert "Real body with repro steps" in bodies
-        assert "more context" in bodies
-    finally:
-        db.close()
+
+    r1 = _post("dup-a")
+    r2 = _post("dup-b")
+    assert r1.json()["task_id"] == r2.json()["task_id"]
+    assert r2.json().get("duplicate") == "active_task"
+    assert db.query(Task).filter(Task.ci_sha == "sha9").count() == 1
 
 
-def test_thin_issue_still_creates_simple_run(monkeypatch):
-    """Simple flow: even a thin issue creates a RUNNING run — the agent
-    itself decides INSUFFICIENT_INFO; the webhook never gates on content."""
-    import app.github.webhook as wh
-    from app.models import Task
+def test_ci_different_job_creates_new_task(db, monkeypatch):
+    import app.github.webhook as _wh
 
-    init_db()
-    db = SessionLocal()
-    name = f"demo/thin-{uuid.uuid4().hex[:8]}"
-    db.add(Repository(full_name=name, connected=True))
-    db.commit()
-    db.close()
-    monkeypatch.setattr(wh.settings, "auto_trigger_on_issue", True)
-    r = _signed_post(
-        {
-            "action": "opened",
-            "issue": {
-                "number": 9,
-                "title": "https://github.com/example/repo",
-                "labels": [],
-            },
-            "repository": {"full_name": name},
-            "installation": {"id": 1},
+    monkeypatch.setattr(_wh, "_ci_log_excerpt",
+                        lambda *, repo_name, run_id, check_name: "")
+    c = TestClient(app)
+    for delivery, job in (("dj-1", "backend"), ("dj-2", "frontend")):
+        payload = {
+            "action": "completed",
+            "repository": {"full_name": "acme/demo"},
+            "check_run": {"conclusion": "failure", "head_sha": "sha10", "name": job,
+                          "html_url": "http://x/actions/runs/1/job/1"},
         }
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["task_id"] is not None
-    assert body["triggered"] is True
-    db2 = SessionLocal()
-    try:
-        task = db2.query(Task).filter_by(id=body["task_id"]).first()
-        assert task.state == "RUNNING"
-    finally:
-        from app.models import TaskEvent
+        body = json.dumps(payload).encode()
+        c.post(
+            "/webhooks/github",
+            content=body,
+            headers={"X-Hub-Signature-256": _sig(body), "X-GitHub-Delivery": delivery,
+                     "X-GitHub-Event": "check_run"},
+        )
+    assert db.query(Task).filter(Task.ci_sha == "sha10").count() == 2
 
-        db2.query(TaskEvent).filter_by(task_id=body["task_id"]).delete(
-            synchronize_session=False
-        )
-        db2.query(Task).filter_by(id=body["task_id"]).delete(synchronize_session=False)
-        db2.query(Repository).filter_by(full_name=name).delete(
-            synchronize_session=False
-        )
-        db2.commit()
-        db2.close()
+
+def test_bad_signature_rejected(db):
+    c = TestClient(app)
+    r = c.post(
+        "/webhooks/github",
+        content=b"{}",
+        headers={"X-Hub-Signature-256": "sha256=nope", "X-GitHub-Delivery": "d-x", "X-GitHub-Event": "issues"},
+    )
+    assert r.status_code == 401

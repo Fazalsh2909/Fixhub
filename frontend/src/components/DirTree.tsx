@@ -1,62 +1,68 @@
-import type { DirNode } from '../lib/files';
-import { formatBytes } from '../theme';
+import { useCallback, useEffect, useState } from "react";
+import { api } from "../api";
+import type { FileEntry } from "../types";
 
-type Props = {
-  node: DirNode;
-  depth: number;
-  expanded: Set<string>;
-  onToggle: (dir: string) => void;
-  openPath: string;
-  onOpen: (path: string) => void;
-  dark: Record<string, string>;
-};
+interface Props {
+  taskId: number | null;
+  onOpenFile: (path: string) => void;
+}
 
-export default function DirTree({ node, depth, expanded, onToggle, openPath, onOpen, dark }: Props): React.JSX.Element {
-  void dark;
-  void formatBytes;
+export default function DirTree({ taskId, onOpenFile }: Props) {
+  const [path, setPath] = useState(".");
+  const [entries, setEntries] = useState<FileEntry[]>([]);
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
+    if (!taskId) return;
+    try {
+      const d = await api.files(taskId, path);
+      setEntries(d.entries);
+      setError("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "failed");
+    }
+  }, [taskId, path]);
+
+  useEffect(() => {
+    setPath(".");
+  }, [taskId]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  if (!taskId) return <div className="pane-hint">Select a task to browse its workspace.</div>;
+
+  const up = path !== "." ? path.split("/").slice(0, -1).join("/") || "." : null;
+
   return (
-    <>
-      {node.dirs.map((d) => {
-        const isOpen = expanded.has(d.path);
-        return (
-          <div key={d.path}>
-            <div
-              onClick={() => onToggle(d.path)}
-              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onToggle(d.path); } }}
-              tabIndex={0}
-              role="treeitem"
-              aria-expanded={isOpen}
-              title={d.path}
-              style={{ padding: '4px 8px', paddingLeft: 8 + depth * 12, borderRadius: 6, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', fontWeight: 600, color: 'var(--fh-text-2)' }}
-            >
-              <span style={{ color: 'var(--fh-muted)', marginRight: 6, display: 'inline-block', width: 12 }} aria-hidden="true">{isOpen ? '▾' : '▸'}</span>
-              <span style={{ marginRight: 6, color: 'var(--fh-info)' }} aria-hidden="true">▸</span>{d.name}
-            </div>
-            {isOpen && (
-              <DirTree node={d} depth={depth + 1} expanded={expanded} onToggle={onToggle} openPath={openPath} onOpen={onOpen} dark={dark} />
-            )}
-          </div>
-        );
-      })}
-      {node.files.map((f) => {
-        const name = f.path.split('/').pop() ?? f.path;
-        const active = f.path === openPath;
-        const important = /test|spec|auth|jwt|middleware|verify|main\.py|App\.tsx/i.test(f.path);
+    <div className="dirtree">
+      <div className="dirtree-head">
+        <span title={path}>{path}</span>
+        <button onClick={load} title="Refresh">↻</button>
+      </div>
+      {error && <div className="err">{error}</div>}
+      {up && (
+        <div className="dirtree-row" onClick={() => setPath(up)}>
+          <span>📁 ..</span>
+        </div>
+      )}
+      {entries.map((e) => {
+        const full = path === "." ? e.name : `${path}/${e.name}`;
         return (
           <div
-            key={f.path}
-            onClick={() => onOpen(f.path)}
-            onKeyDown={(e) => { if (e.key === 'Enter') onOpen(f.path); }}
-            tabIndex={0}
-            role="treeitem"
-            aria-selected={active}
-            title={f.path}
-            style={{ padding: '4px 8px', paddingLeft: 8 + depth * 12 + 18, borderRadius: 6, cursor: 'pointer', fontSize: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', background: active ? 'rgba(74,168,255,0.12)' : 'transparent', borderLeft: important ? '2px solid rgba(74,168,255,0.35)' : '2px solid transparent', color: active ? 'var(--fh-text)' : 'var(--fh-text-2)' }}
+            key={full}
+            className="dirtree-row"
+            onClick={() => (e.is_dir ? setPath(full) : onOpenFile(full))}
+            title={full}
           >
-            <span className="mono" style={{ color: active ? 'var(--fh-info)' : 'var(--fh-muted)', marginRight: 6 }} aria-hidden="true">{name.endsWith('.py') ? 'py' : name.endsWith('.tsx') || name.endsWith('.ts') ? 'ts' : '··'}</span>{name}
+            <span>
+              {e.is_dir ? "📁" : "📄"} {e.name}
+            </span>
+            {!e.is_dir && e.size > 1024 && <small>{(e.size / 1024).toFixed(1)}k</small>}
           </div>
         );
       })}
-    </>
+      {entries.length === 0 && !error && <div className="pane-hint">(empty — run the task first)</div>}
+    </div>
   );
 }

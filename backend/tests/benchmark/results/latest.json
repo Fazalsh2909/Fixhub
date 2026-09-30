@@ -1,0 +1,413 @@
+{
+  "summary": {
+    "total_scenarios": 17,
+    "ran": 17,
+    "skipped": 0,
+    "bug_fix_success": "11/11",
+    "bug_fix_rate": 1.0,
+    "safe_failures": "3/3",
+    "reliability_probes": "3/3",
+    "unexpected_failures": 0,
+    "average_steps": 4.8,
+    "median_steps": 4,
+    "average_tool_calls": 4.1,
+    "duplicate_call_rate": 0.058,
+    "average_repair_rounds": 0.0,
+    "average_runtime_s": 2.8,
+    "average_files_read": 1.8,
+    "average_files_changed": 0.6,
+    "failure_breakdown": {}
+  },
+  "results": [
+    {
+      "scenario_id": "01-off-by-one",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 3.8,
+      "agent_steps": 4,
+      "tool_calls": 4,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 1,
+      "repair_rounds": 0,
+      "files_read": [
+        "app.py",
+        "tests/test_mean.py"
+      ],
+      "files_changed": [
+        "app.py"
+      ],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": ""
+    },
+    {
+      "scenario_id": "02-exception-handling",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 3.8,
+      "agent_steps": 4,
+      "tool_calls": 4,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 1,
+      "repair_rounds": 0,
+      "files_read": [
+        "calc.py",
+        "tests/test_ratio.py"
+      ],
+      "files_changed": [
+        "calc.py"
+      ],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": ""
+    },
+    {
+      "scenario_id": "03-api-response",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 3.6,
+      "agent_steps": 5,
+      "tool_calls": 5,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 1,
+      "repair_rounds": 0,
+      "files_read": [
+        "api.py",
+        "tests/test_api.py"
+      ],
+      "files_changed": [
+        "api.py"
+      ],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": ""
+    },
+    {
+      "scenario_id": "04-missing-validation",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 3.5,
+      "agent_steps": 4,
+      "tool_calls": 4,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 1,
+      "repair_rounds": 0,
+      "files_read": [
+        "tests/test_users.py",
+        "users.py"
+      ],
+      "files_changed": [
+        "users.py"
+      ],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": ""
+    },
+    {
+      "scenario_id": "05-sql-query",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 3.6,
+      "agent_steps": 4,
+      "tool_calls": 4,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 1,
+      "repair_rounds": 0,
+      "files_read": [
+        "store.py",
+        "tests/test_store.py"
+      ],
+      "files_changed": [
+        "store.py"
+      ],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": ""
+    },
+    {
+      "scenario_id": "06-config-parsing",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 3.5,
+      "agent_steps": 4,
+      "tool_calls": 4,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 1,
+      "repair_rounds": 0,
+      "files_read": [
+        "settings.py",
+        "tests/test_settings.py"
+      ],
+      "files_changed": [
+        "settings.py"
+      ],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": ""
+    },
+    {
+      "scenario_id": "07-javascript",
+      "stack": "javascript",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 2.7,
+      "agent_steps": 4,
+      "tool_calls": 4,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 1,
+      "repair_rounds": 0,
+      "files_read": [
+        "sum.js",
+        "test.js"
+      ],
+      "files_changed": [
+        "sum.js"
+      ],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": ""
+    },
+    {
+      "scenario_id": "08-ci-unit-test",
+      "stack": "python",
+      "trigger_type": "ci",
+      "tokens": null,
+      "runtime_s": 3.7,
+      "agent_steps": 5,
+      "tool_calls": 5,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 1,
+      "repair_rounds": 0,
+      "files_read": [
+        ".github/workflows/ci.yml",
+        "stats.py",
+        "tests/test_stats.py"
+      ],
+      "files_changed": [
+        "stats.py"
+      ],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": ""
+    },
+    {
+      "scenario_id": "09-lint-format",
+      "stack": "python",
+      "trigger_type": "ci",
+      "tokens": null,
+      "runtime_s": 5.6,
+      "agent_steps": 4,
+      "tool_calls": 4,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 1,
+      "repair_rounds": 0,
+      "files_read": [
+        ".github/workflows/ci.yml",
+        "util.py"
+      ],
+      "files_changed": [
+        "util.py"
+      ],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": ""
+    },
+    {
+      "scenario_id": "10-dep-pin-parse",
+      "stack": "python",
+      "trigger_type": "ci",
+      "tokens": null,
+      "runtime_s": 3.9,
+      "agent_steps": 4,
+      "tool_calls": 4,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 1,
+      "repair_rounds": 0,
+      "files_read": [
+        "deps.py",
+        "tests/test_deps.py"
+      ],
+      "files_changed": [
+        "deps.py"
+      ],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": ""
+    },
+    {
+      "scenario_id": "S1-timeout",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 2.1,
+      "agent_steps": 5,
+      "tool_calls": 2,
+      "duplicate_calls_blocked": 1,
+      "failed_tool_calls": 0,
+      "command_count": 2,
+      "validation_attempts": 0,
+      "repair_rounds": 0,
+      "files_read": [],
+      "files_changed": [],
+      "final_status": "FINISHED",
+      "result": "PASS",
+      "failure_category": "EXPECTED_SAFE_FAILURE"
+    },
+    {
+      "scenario_id": "S2-ambiguous",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 1.5,
+      "agent_steps": 4,
+      "tool_calls": 4,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 0,
+      "validation_attempts": 0,
+      "repair_rounds": 0,
+      "files_read": [
+        "app.py"
+      ],
+      "files_changed": [],
+      "final_status": "COMPLETED",
+      "result": "PASS",
+      "failure_category": "EXPECTED_SAFE_FAILURE"
+    },
+    {
+      "scenario_id": "S3-path-security",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 0.0,
+      "agent_steps": 7,
+      "tool_calls": 4,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 3,
+      "command_count": 0,
+      "validation_attempts": 0,
+      "repair_rounds": 0,
+      "files_read": [
+        "../../x",
+        ".env",
+        "/etc/passwd",
+        "app.py"
+      ],
+      "files_changed": [],
+      "final_status": "FINISHED",
+      "result": "PASS",
+      "failure_category": "EXPECTED_SAFE_FAILURE"
+    },
+    {
+      "scenario_id": "R-path-discipline",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 0.1,
+      "agent_steps": 6,
+      "tool_calls": 3,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 1,
+      "validation_attempts": 0,
+      "repair_rounds": 0,
+      "files_read": [
+        "a/b/c.py"
+      ],
+      "files_changed": [],
+      "final_status": "FINISHED",
+      "result": "PASS",
+      "failure_category": "EXPECTED_SAFE_FAILURE"
+    },
+    {
+      "scenario_id": "F-duplicates",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 0.0,
+      "agent_steps": 9,
+      "tool_calls": 6,
+      "duplicate_calls_blocked": 3,
+      "failed_tool_calls": 3,
+      "command_count": 0,
+      "validation_attempts": 0,
+      "repair_rounds": 0,
+      "files_read": [
+        "nope.py"
+      ],
+      "files_changed": [],
+      "final_status": "FINISHED",
+      "result": "PASS",
+      "failure_category": "EXPECTED_SAFE_FAILURE"
+    },
+    {
+      "scenario_id": "K-cancel",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 0.0,
+      "agent_steps": 2,
+      "tool_calls": 1,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 1,
+      "command_count": 0,
+      "validation_attempts": 0,
+      "repair_rounds": 0,
+      "files_read": [],
+      "files_changed": [],
+      "final_status": "CANCELLED",
+      "result": "PASS",
+      "failure_category": "EXPECTED_SAFE_FAILURE"
+    },
+    {
+      "scenario_id": "J-repair",
+      "stack": "python",
+      "trigger_type": "issue",
+      "tokens": null,
+      "runtime_s": 6.9,
+      "agent_steps": 7,
+      "tool_calls": 7,
+      "duplicate_calls_blocked": 0,
+      "failed_tool_calls": 0,
+      "command_count": 2,
+      "validation_attempts": 2,
+      "repair_rounds": 0,
+      "files_read": [
+        "app.py",
+        "tests/test_f.py"
+      ],
+      "files_changed": [
+        "app.py"
+      ],
+      "final_status": "AWAITING_CI",
+      "result": "PASS",
+      "failure_category": ""
+    }
+  ]
+}

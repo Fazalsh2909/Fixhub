@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+tests/
+test-*.db
+*.db
+.env
+*.pem
+*.key
+.venv/
+workspaces/
+test-workspaces/

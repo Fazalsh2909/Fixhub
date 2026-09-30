@@ -1,0 +1,52 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - "redisdata:/data"
+    restart: unless-stopped
+  backend:
+    build: ./backend
+    # Host 8001: 8000 is taken on this machine by another stack (infra-api).
+    ports: ["8001:8000"]
+    env_file: ./backend/.env
+    environment:
+      # Docker default; override in backend/.env for local runs.
+      WORKSPACE_ROOT: /tmp/fixhub-workspaces
+      WORKSPACE_KEEP: "0"
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_NAME: fixhub
+      # Shared SQLite file: backend + worker MUST see the same DB.
+      DATABASE_URL: sqlite:////srv/backend/data/fixhub.db
+    volumes:
+      - "workspaces:/tmp/fixhub-workspaces"
+      - "dbdata:/srv/backend/data"
+      # GitHub App private key (dockerignored from the image, mounted read-only).
+      - "./backend/fixhub-app.pem:/srv/backend/fixhub-app.pem:ro"
+    depends_on: [redis]
+    restart: unless-stopped
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.tasks.worker"]
+    env_file: ./backend/.env
+    environment:
+      WORKSPACE_ROOT: /tmp/fixhub-workspaces
+      WORKSPACE_KEEP: "0"
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_NAME: fixhub
+      DATABASE_URL: sqlite:////srv/backend/data/fixhub.db
+    volumes:
+      - "workspaces:/tmp/fixhub-workspaces"
+      - "dbdata:/srv/backend/data"
+      - "./backend/fixhub-app.pem:/srv/backend/fixhub-app.pem:ro"
+    depends_on: [redis, backend]
+    restart: unless-stopped
+  frontend:
+    build: ./frontend
+    ports: ["8080:80"]
+    depends_on: [backend]
+    restart: unless-stopped
+volumes:
+  workspaces:
+  redisdata:
+  dbdata:

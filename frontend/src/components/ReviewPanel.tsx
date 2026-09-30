@@ -1,57 +1,113 @@
-import { verificationSummary, type TaskDetail, type VerificationRow } from '../lib/tasks';
+import { useEffect, useState } from "react";
+import { api } from "../api";
+import type { TaskSummary, Verification } from "../types";
 
-type Props = {
-  detail: TaskDetail | null;
-  verification: VerificationRow[];
-  running: boolean;
-  onRun: () => void;
-  onApprove: () => void;
-  onReject: () => void;
-  canReview: boolean;
-  dark: Record<string, string>;
-};
+interface Props {
+  task: TaskSummary | null;
+  onChanged: () => void;
+  onDiffRefresh: () => void;
+}
 
-export default function ReviewPanel({ detail, verification, running, onRun, onApprove, onReject, canReview, dark }: Props) {
+export default function ReviewPanel({ task, onChanged, onDiffRefresh }: Props) {
+  const [ver, setVer] = useState<Verification | null>(null);
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  useEffect(() => {
+    setVer(null);
+    setMsg("");
+    if (!task) return;
+    api
+      .verification(task.id)
+      .then(setVer)
+      .catch(() => {});
+  }, [task?.id]);
+
+  if (!task) return <div className="pane-hint">Select a task to review.</div>;
+
+  const approve = async () => {
+    setBusy(true);
+    setMsg("");
+    try {
+      const r = await api.approve(task.id, title, body);
+      setMsg(`Published ✓ ${r.branch || ""} ${r.pr || ""}`);
+      onChanged();
+      onDiffRefresh();
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : "approve failed");
+    }
+    setBusy(false);
+  };
+
+  const run = async (sync: boolean) => {
+    setBusy(true);
+    setMsg("");
+    try {
+      const r = await api.runTask(task.id, sync);
+      setMsg(r.queued ? `Queued ✓ job ${r.job_id}` : `Finished: ${r.result?.status || "?"}`);
+      onChanged();
+      onDiffRefresh();
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : "run failed");
+    }
+    setBusy(false);
+  };
+
   return (
-    <aside style={{ width: 300, borderLeft: `1px solid ${dark.border}`, padding: 12, overflow: 'auto', background: dark.panel }}>
-      <h3 style={{ marginTop: 0 }}>Review</h3>
-      <p style={{ fontSize: 13, color: dark.muted }}>
-        {detail ? `Task #${detail.id} ${detail.state}` : 'No run yet.'}
-      </p>
-      <button onClick={onRun} disabled={detail == null || running} style={{ width: '100%', background: dark.accent, color: '#fff', border: 0, borderRadius: 6, padding: '8px', cursor: 'pointer', marginBottom: 8 }}>
-        {running ? 'Running — polling task…' : 'Run agent on selected task'}
-      </button>
-      {canReview ? (
-        <>
-          <button onClick={onApprove} style={{ width: '100%', background: dark.green, color: '#fff', border: 0, borderRadius: 6, padding: '8px', cursor: 'pointer', marginBottom: 6 }}>
-            Approve & Commit
-          </button>
-          <button onClick={onReject} style={{ width: '100%', background: 'transparent', color: dark.text, border: `1px solid ${dark.border}`, borderRadius: 6, padding: '8px', cursor: 'pointer' }}>
-            Request changes
-          </button>
-        </>
-      ) : (
-        <div style={{ fontSize: 12, color: dark.muted }}>Approve & Commit unlocks when a REVIEWING diff exists. Nothing pushes before that.</div>
-      )}
-      {detail?.pr_url && (
-        <div style={{ marginBottom: 8 }}>
-          <a href={detail.pr_url} target="_blank" rel="noreferrer" style={{ color: dark.green, fontSize: 13, fontWeight: 600 }}>
-            Pull request #{detail.pr_number || ''} ↗
+    <div className="review">
+      <div className="review-status">
+        <span className={`pill ${task.status}`}>{task.status}</span>
+        {task.pr_url && (
+          <a href={task.pr_url} target="_blank" rel="noreferrer">
+            Open PR #{task.pr_number}
           </a>
-        </div>
-      )}
-      <h4>Proof of Fix</h4>
-      <pre style={{ whiteSpace: 'pre-wrap', fontSize: 12, color: dark.muted }}>
-        {detail ? verificationSummary(verification) : 'No run yet.'}
-      </pre>
-      {detail && detail.approvals && detail.approvals.length > 0 && (
-        <>
-          <h4>Decisions</h4>
-          {detail.approvals.map((a, i) => (
-            <div key={i} style={{ fontSize: 12, color: dark.muted }}>[{a.decision}] {a.approver} {a.reason}</div>
+        )}
+      </div>
+      {ver && (
+        <ul className="checks">
+          {ver.checks.map((c) => (
+            <li key={c.name} className={c.passed ? "pass" : "fail"}>
+              {c.passed ? "✓" : "○"} {c.name}
+            </li>
           ))}
-        </>
+        </ul>
       )}
-    </aside>
+      {task.error && <div className="err">{task.error.slice(0, 400)}</div>}
+      <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="PR title (optional override)" />
+      <textarea value={body} onChange={(e) => setBody(e.target.value)} placeholder="PR body (optional override)" rows={3} />
+      <div className="review-btns">
+        <button onClick={() => run(false)} disabled={busy}>
+          Enqueue run
+        </button>
+        <button onClick={() => run(true)} disabled={busy} title="Run inline (waits for agent)">
+          Run now
+        </button>
+        <button onClick={approve} disabled={busy || !["NEEDS_REVIEW", "FAILED", "RUNNING"].includes(task.status)} title="Approve & Commit — publish pending changes">
+          Approve & Commit
+        </button>
+        {(task.status === "RUNNING" || task.status === "AWAITING_CI") && (
+          <button
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await api.cancelTask(task.id);
+                setMsg("Cancel requested — the run stops promptly.");
+                onChanged();
+              } catch (e) {
+                setMsg(e instanceof Error ? e.message : "cancel failed");
+              }
+              setBusy(false);
+            }}
+            disabled={busy}
+            title="Stop this run (agent loop checks every step)"
+          >
+            Cancel run
+          </button>
+        )}
+      </div>
+      {msg && <div className="foot-msg">{msg}</div>}
+    </div>
   );
 }
