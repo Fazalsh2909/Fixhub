@@ -69,9 +69,15 @@ def test_c_traversal_rejected(ws):
 # --- D/E/F: fixed cwd, exit codes, timeout ---
 
 def test_d_fixed_cwd(ws):
+    import sys as _sys
+
     from app.agent import tools as _t
 
-    out = _t.run_command(ws, "cd", cwd="sub")
+    # Portable cwd proof: bare `cd` prints the directory on Windows cmd but
+    # is silent on POSIX sh, so ask the interpreter (same pattern as test_e).
+    out = _t.run_command(
+        ws, f'"{_sys.executable}" -c "import os; print(os.getcwd())"', cwd="sub"
+    )
     assert "exit_code: 0" in out and "ws/sub" in out.replace("\\", "/")
     assert "cwd: sub" in out
     bad = _t.run_command(ws, "echo hi", cwd="../..")
