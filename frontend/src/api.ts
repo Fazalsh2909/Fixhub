@@ -14,6 +14,11 @@ export const api = {
       body: JSON.stringify({ github_full_name, installation_id }),
     }).then(j),
   issues: (repo: string) => fetch(`/api/github/issues?repo=${encodeURIComponent(repo)}`).then(j),
+  repoContents: (repo: string, path = ".", ref = "") =>
+    fetch(`/api/github/contents?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}&ref=${encodeURIComponent(ref)}`).then(j),
+  repoFile: (repo: string, path: string, ref = "") =>
+    fetch(`/api/github/file?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}&ref=${encodeURIComponent(ref)}`).then(j),
+  publishedDiff: (id: number) => fetch(`/api/tasks/${id}/published-diff`).then(j),
   tasks: () => fetch("/api/tasks").then(j),
   task: (id: number) => fetch(`/api/tasks/${id}`).then(j),
   runTask: (id: number, sync = false) => fetch(`/api/tasks/${id}/run${sync ? "?sync=true" : ""}`, { method: "POST" }).then(j),
@@ -36,12 +41,6 @@ export const api = {
     }).then(j),
   diff: (id: number) => fetch(`/api/tasks/${id}/diff`).then(j),
   events: (id: number, after = 0) => fetch(`/api/tasks/${id}/events?after=${after}`).then(j),
-  terminal: (id: number, command: string) =>
-    fetch(`/api/tasks/${id}/terminal`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command }),
-    }).then(j),
   chat: (id: number, message: string) =>
     fetch(`/api/tasks/${id}/chat`, {
       method: "POST",

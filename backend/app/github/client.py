@@ -216,6 +216,75 @@ def get_workflow_content(*, token: str, full_name: str, path: str, ref: str = ""
     return text[:max_bytes]
 
 
+def repo_dir_contents(*, token: str, full_name: str, path: str = ".", ref: str = "",
+                     limit: int = 100) -> list[dict]:
+    """List one repo directory via the contents API: [{name, type, size, sha}].
+
+    `ref` is a branch/sha (default branch when empty). Raises ValueError when
+    the path is a file, httpx errors on API failure.
+    """
+    p = (path or ".").strip().strip("/")
+    suffix = "" if p in ("", ".") else f"/{p}"
+    url = f"{settings.GITHUB_API_URL}/repos/{full_name}/contents{suffix}"
+    params = {"ref": ref} if ref else {}
+    resp = httpx.get(url, headers=_headers(token), params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, list):
+        raise ValueError(f"{path} is a file, not a directory")
+    out = []
+    for it in data:
+        if it.get("type") not in ("file", "dir"):
+            continue
+        out.append({"name": it.get("name", ""), "type": it.get("type", ""),
+                    "size": it.get("size", 0), "sha": it.get("sha", "")})
+    return out[:limit]
+
+
+def repo_file_content(*, token: str, full_name: str, path: str, ref: str = "",
+                      max_bytes: int = 200000) -> dict:
+    """Fetch one repo file via the contents API: {content, truncated, binary, size}.
+
+    `ref` is a branch/sha (default branch when empty). Raises ValueError when
+    the path is a directory, httpx errors on API failure.
+    """
+    import base64
+
+    p = (path or "").strip().strip("/")
+    if not p or p == ".":
+        raise ValueError("path is required")
+    url = f"{settings.GITHUB_API_URL}/repos/{full_name}/contents/{p}"
+    params = {"ref": ref} if ref else {}
+    resp = httpx.get(url, headers=_headers(token), params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list):
+        raise ValueError(f"{path} is a directory, not a file")
+    raw = base64.b64decode(data.get("content") or "")
+    size = len(raw)
+    truncated = size > max_bytes
+    if truncated:
+        raw = raw[:max_bytes]
+    binary = b"\x00" in raw
+    return {"content": "" if binary else raw.decode("utf-8", errors="replace"),
+            "truncated": truncated, "binary": binary, "size": size}
+
+
+def pull_diff(*, token: str, full_name: str, number: int,
+              max_bytes: int = 200000) -> dict:
+    """Unified diff of a PR via the raw-diff media type: {diff, truncated}.
+
+    Raises on API failure.
+    """
+    url = f"{settings.GITHUB_API_URL}/repos/{full_name}/pulls/{number}"
+    headers = {**_headers(token), "Accept": "application/vnd.github.diff"}
+    resp = httpx.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    text = resp.text or ""
+    truncated = len(text) > max_bytes
+    return {"diff": text[:max_bytes], "truncated": truncated}
+
+
 def list_issues(*, token: str, full_name: str, state: str = "open", limit: int = 50) -> list[dict]:
     """List issues (excluding PRs) for a repo using an installation token."""
     url = f"{settings.GITHUB_API_URL}/repos/{full_name}/issues"

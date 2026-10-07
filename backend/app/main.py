@@ -222,6 +222,93 @@ def list_github_issues(repo: str, db: Session = Depends(_db)) -> list[dict] | di
         return JSONResponse(status_code=502, content={"error": f"github api failed: {exc}"[:300]})
 
 
+@app.get("/api/github/contents")
+def read_repo_dir(repo: str, path: str = ".", ref: str = "", db: Session = Depends(_db)) -> list[dict] | dict:
+    """Read-only directory listing of a connected repo at ref (branch/sha).
+
+    Powers the in-IDE repo browser and the published-changes view for expired
+    task workspaces. Never raises: unconnected repos 400, GitHub failures 502.
+    """
+    from fastapi.responses import JSONResponse
+
+    from app.github import app_auth as _app_auth
+    from app.github import client as _gh
+
+    row = db.query(Repository).filter(Repository.github_full_name == repo).first()
+    if not row or not row.installation_id:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"{repo} is not connected (set installation_id via POST /api/repositories/connect)"},
+        )
+    try:
+        token = _app_auth.installation_token(row.installation_id)
+        return _gh.repo_dir_contents(token=token, full_name=repo, path=path, ref=ref)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)[:300]})
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"error": f"github api failed: {exc}"[:300]})
+
+
+@app.get("/api/github/file")
+def read_repo_file(repo: str, path: str, ref: str = "", db: Session = Depends(_db)) -> dict:
+    """Read-only file content of a connected repo at ref (branch/sha).
+
+    Returns {content, truncated, binary, size}. Unconnected repos 400,
+    GitHub failures 502.
+    """
+    from fastapi.responses import JSONResponse
+
+    from app.github import app_auth as _app_auth
+    from app.github import client as _gh
+
+    row = db.query(Repository).filter(Repository.github_full_name == repo).first()
+    if not row or not row.installation_id:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"{repo} is not connected (set installation_id via POST /api/repositories/connect)"},
+        )
+    try:
+        token = _app_auth.installation_token(row.installation_id)
+        return _gh.repo_file_content(token=token, full_name=repo, path=path, ref=ref)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)[:300]})
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"error": f"github api failed: {exc}"[:300]})
+
+
+@app.get("/api/tasks/{task_id}/published-diff")
+def task_published_diff(task_id: int, db: Session = Depends(_db)) -> dict:
+    """Unified diff of the task's pull request, for expired workspaces.
+
+    Returns the DiffInfo shape {branch, status, files, stat, diff}. 404 when
+    the task has no PR yet, 400 when its repo is not connected, 502 on
+    GitHub failures.
+    """
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    from app.github import app_auth as _app_auth
+    from app.github import client as _gh
+
+    t = db.query(Task).filter(Task.id == task_id).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="task not found")
+    if not t.pr_number:
+        raise HTTPException(status_code=404, detail="task has no pull request yet")
+    row = db.query(Repository).filter(Repository.github_full_name == t.repository).first()
+    if not row or not row.installation_id:
+        raise HTTPException(status_code=400, detail=f"{t.repository} is not connected")
+    try:
+        token = _app_auth.installation_token(row.installation_id)
+        files = _gh.pull_files(token=token, full_name=t.repository, number=t.pr_number)
+        dd = _gh.pull_diff(token=token, full_name=t.repository, number=t.pr_number)
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"error": f"github api failed: {exc}"[:300]})
+    return {"branch": t.branch or "", "status": "published", "files": files, "stat": "",
+            "diff": dd["diff"], "truncated": dd["truncated"],
+            "pr_number": t.pr_number, "pr_url": t.pr_url or ""}
+
+
 @app.post("/api/tasks/from-issue")
 def create_task_from_issue(payload: dict, db: Session = Depends(_db)) -> dict:
     """Create a RUNNING task from a live GitHub issue (Fix button). Body: {repository, issue_number}."""

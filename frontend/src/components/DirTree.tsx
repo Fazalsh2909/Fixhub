@@ -1,30 +1,46 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import type { FileEntry } from "../types";
 
 interface Props {
   taskId: number | null;
   onOpenFile: (path: string) => void;
+  onExpired?: () => void;
 }
 
-export default function DirTree({ taskId, onOpenFile }: Props) {
+export default function DirTree({ taskId, onOpenFile, onExpired }: Props) {
   const [path, setPath] = useState(".");
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [error, setError] = useState("");
+  // Once the backend reports the workspace expired (410), directory
+  // navigation must not refetch: the browser logs every failed fetch, so each
+  // click would be pure console noise. A ref (not state) gates the guard so
+  // flipping it never retriggers the effect below. ↻ forces an explicit retry.
+  const expiredRef = useRef(false);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (manual = false) => {
     if (!taskId) return;
+    if (expiredRef.current && !manual) return;
     try {
       const d = await api.files(taskId, path);
       setEntries(d.entries);
       setError("");
+      expiredRef.current = false;
     } catch (e) {
-      setError(e instanceof Error ? e.message : "failed");
+      const msg = e instanceof Error ? e.message : "failed";
+      setError(msg);
+      if (/410|expired|gone/i.test(msg)) {
+        expiredRef.current = true;
+        onExpired?.();
+      }
     }
   }, [taskId, path]);
 
   useEffect(() => {
     setPath(".");
+    setEntries([]);
+    setError("");
+    expiredRef.current = false;
   }, [taskId]);
   useEffect(() => {
     load();
@@ -38,7 +54,7 @@ export default function DirTree({ taskId, onOpenFile }: Props) {
     <div className="dirtree">
       <div className="dirtree-head">
         <span title={path}>{path}</span>
-        <button onClick={load} title="Refresh">↻</button>
+        <button onClick={() => load(true)} title="Refresh">↻</button>
       </div>
       {error && <div className="err">{error}</div>}
       {up && (
