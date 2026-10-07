@@ -60,6 +60,9 @@ export interface DiffInfo {
   files: string[];
   stat: string;
   diff: string;
+  truncated?: boolean;
+  pr_number?: number | null;
+  pr_url?: string;
 }
 
 export interface Verification {

@@ -95,7 +95,7 @@ docker compose down -v
 
 ## IDE (local UI)
 
-`http://localhost:8080` in Docker (or `:5173` via `npm run dev`): task list, per-task Explorer, Monaco editor with multi-tab open/save (`Ctrl+S`), sandboxed terminal, TraceView (agent steps, live SSE + poll fallback), Diff/Proof, ReviewPanel (Enqueue / Run now / Approve & Commit), chat notes, per-repo Issues tab with manual **Fix** buttons, Repositories panel (installations with one-click Connect plus manual owner/repo form for forks/OSS).
+`http://localhost:8080` in Docker (or `:5173` via `npm run dev`): task list, per-task Explorer, Monaco editor with multi-tab open/save (`Ctrl+S`), TraceView (agent steps, live SSE + poll fallback), Diff/Proof, ReviewPanel (Enqueue / Run now / Approve & Commit), chat notes, per-repo Issues tab with manual **Fix** buttons, Repositories panel (installations with one-click Connect plus manual owner/repo form for forks/OSS).
 
 Backend IDE APIs (all scoped to a task workspace with the same path/sensitive-file guards as agent tools, `backend/app/api/ide.py`):
 
