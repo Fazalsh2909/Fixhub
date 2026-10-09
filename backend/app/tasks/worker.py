@@ -26,13 +26,16 @@ def main() -> None:
 
     conn = Redis.from_url(settings.REDIS_URL)
     conn.ping()
-    # Production schema path first (Alembic); dev/test fall back to create_all.
+    # Gate 0: Alembic is authoritative; in prod a failed migration raises
+    # MigrationFailed and stops the worker (no create_all continuation).
+    # Production never calls create_all/ensure_columns (Alembic only).
     from app.db import migrate as _migrate
     from app.db.database import Base, engine, ensure_columns
 
     _migrate.upgrade_head()
-    Base.metadata.create_all(bind=engine)
-    ensure_columns()
+    if settings.ENV.strip().lower() != "prod":
+        Base.metadata.create_all(bind=engine)
+        ensure_columns()
     with Connection(conn):
         q = Queue(settings.QUEUE_NAME)
         log.info(

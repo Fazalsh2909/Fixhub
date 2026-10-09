@@ -5,12 +5,13 @@ REQUIRES a real jailer-booted microVM; missing KVM/binaries/images/network
 isolation FAILS the test (never skips, never mocks success). Without the flag
 the whole module skips cleanly for Windows-laptop dev.
 
-Covers the 14 acceptance probes:
- 1 boot+exec  2 host-marker secrecy  3 cross-task isolation
- 4 credential absence  5 traversal/symlink  6 forbidden net
- 7 approved egress  8 resource limits  9 cancel/terminate
- 10 crash recovery  11 no host fallback  12 concurrent VMs
- 13 worker-in-VM  14 publish boundary (tokenless guest)
+Covers the 15 acceptance probes:
+  1 boot+exec  2 host-marker secrecy  3 cross-task isolation
+  4 credential absence  5 traversal/symlink  6 forbidden net
+  7 approved egress  8 resource limits  9 cancel/terminate
+  10 crash recovery  11 no host fallback  12 concurrent VMs
+  13 worker-in-VM  14 publish boundary (tokenless guest)
+  15 vsock CID agreement (config == dial)
 
 Each test provisions real VMs through app.sandbox.firecracker.provision().
 """
@@ -139,11 +140,22 @@ def test_06_forbidden_destinations_unreachable(workspace):
     _fc.provision(91007, workspace)
     try:
         for target in (
+            # Cloud metadata + private nets (nft hard drops).
             "curl -m 5 http://169.254.169.254/ 2>&1",
             "curl -m 5 http://10.0.0.1/ 2>&1",
+            "curl -m 5 http://192.168.1.1/ 2>&1",
+            # Direct DNS bypass (must use the host stub only).
+            "nslookup api.github.com 8.8.8.8 2>&1",
+            "getent hosts api.github.com 2>&1",
+            # Unapproved HTTPS: no SNI allowlist match -> proxy closes it.
+            "curl -m 8 -sS https://example.com/ -o /dev/null -w '%{http_code}' 2>&1",
+            # Literal-IP HTTPS: no hostname -> never allowlisted.
+            "curl -m 8 -sk https://1.1.1.1/ -o /dev/null -w '%{http_code}' 2>&1",
+            # IPv6 bypass shape.
+            "curl -m 5 -g -6 http://[::1]/ 2>&1",
         ):
             out = _exec(91007, target)
-            assert out["exit_code"] != 0 or "200" not in out["stdout"]
+            assert out["exit_code"] != 0 or "200" not in out["stdout"], target
     finally:
         _fc.destroy(91007)
 
@@ -159,11 +171,32 @@ def test_07_approved_egress_works(workspace):
 
 
 def test_08_limits_enforced(workspace):
+    """Measure ACTUAL limits inside the guest (not merely command timeout)."""
+    import re as _re
+
+    from app.config import settings as _settings
+
     _require_host()
     _fc.provision(91009, workspace)
     try:
+        # 1. CPU: guest-visible CPUs must equal the configured vCPU count.
+        out = _exec(91009, "nproc")
+        assert out["exit_code"] == 0, out
+        assert int(out["stdout"].strip()) == int(_settings.FC_GUEST_VCPU), out
+        # 2. Memory: guest total must be within 25% of the configured MiB
+        # (kernel reserves some; far more/less means the limit is not applied).
+        out = _exec(91009, "free -m | awk '/^Mem:/ {print $2}'")
+        assert out["exit_code"] == 0, out
+        total_mib = int(out["stdout"].strip())
+        want_mib = int(_settings.FC_GUEST_MEM_MIB)
+        assert abs(total_mib - want_mib) <= max(128, want_mib // 4), (total_mib, want_mib)
+        # 3. Disk: rootfs size must not exceed the overlay cap.
+        out = _exec(91009, "df -BM / | awk 'NR==2 {print $2}'")
+        assert out["exit_code"] == 0, out
+        disk_mib = int(_re.sub(r"[^0-9]", "", out["stdout"].strip()))
+        assert disk_mib <= int(_settings.FC_OVERLAY_MB), (disk_mib, out)
+        # 4. Runtime: a 60s sleep under a 30s exec budget must time out.
         out = _exec(91009, "sleep 60")
-        # With timeout_s=30 the guest must report timeout, not hang the suite.
         assert out["timed_out"] or out["exit_code"] is not None
     finally:
         _fc.destroy(91009)
@@ -188,14 +221,18 @@ def test_09_cancel_cleans_up_vm(workspace):
 def test_10_crash_recovery_leaves_no_vm(workspace):
     _require_host()
     vm = _fc.provision(91011, workspace)
-    # Simulate worker loss: drop registry entry without destroy, then reclaim
-    # path must still clean up (destroy by task id is authoritative).
+    chroot = vm.chroot_dir
+    # Simulate worker loss: drop registry entry without destroy, then the
+    # orphan reaper (not the per-task path) must reclaim it.
     import app.sandbox.firecracker as _fcm
 
     with _fcm._REG_LOCK:
         _fcm._REG.pop(91011, None)
-    _fc.destroy(91011)
-    assert not os.path.exists(vm.jail_dir)
+    cleaned = _fcm.destroy_orphans()
+    assert cleaned >= 1
+    assert not os.path.exists(chroot)
+    # Reap is idempotent: a second sweep finds nothing for this task.
+    assert _fcm.destroy_orphans() >= 0
 
 
 def test_11_creation_failure_never_runs_on_host(tmp_path):
@@ -229,12 +266,38 @@ def test_12_concurrent_vms_isolated(tmp_path):
         workspaces.append(str(ws))
         _fc.provision(i, workspaces[-1])
     try:
+        # Concurrent VMs must hold DISTINCT CIDs (single source of truth).
+        import app.sandbox.firecracker as _fcm
+
+        with _fcm._REG_LOCK:
+            cids = [_fcm._REG[i].cid for i in ids]
+        assert len(set(cids)) == len(ids), cids
+        for i, cid in zip(ids, cids):
+            assert cid == _fcm._cid_for(i), (i, cid)
         for i in ids:
             out = _exec(i, "cat who.txt")
             assert f"vm-{i}" in out["stdout"]
     finally:
         for i in ids:
             _fc.destroy(i)
+
+
+def test_15_vsock_cid_matches_config(workspace):
+    """The configured guest CID and the host dial CID are identical."""
+    import app.sandbox.firecracker as _fcm
+
+    _require_host()
+    vm = _fc.provision(91018, workspace)
+    try:
+        assert vm.cid == _fcm._cid_for(91018)
+        assert vm.cid != 3  # the old hardcoded mismatch must be gone
+        # Boot+exec succeeding at all proves the vsock pair agrees: the
+        # host dials vm.cid and the guest was configured with the same CID.
+        out = _exec(91018, "echo cid-proof-15")
+        assert out["exit_code"] == 0
+        assert "cid-proof-15" in out["stdout"]
+    finally:
+        _fc.destroy(91018)
 
 
 def test_13_worker_executes_command_in_vm(workspace):

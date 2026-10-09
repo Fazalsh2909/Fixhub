@@ -45,12 +45,15 @@ def _create_tables() -> None:
         if settings.ENV.strip().lower() == "prod":
             raise RuntimeError(f"refusing production startup: {exc}") from exc
         raise RuntimeError(f"refusing startup: {exc}") from exc
-    # Phase 4: Alembic migrations are the production path; create_all stays
-    # for dev/test bootstrapping. migrate.upgrade_head() is a no-op-safe
-    # wrapper (falls back to create_all when alembic is unavailable).
+    # Gate 0: Alembic is the schema authority. In production a failed
+    # migration stops startup (MigrationFailed propagates — NO create_all
+    # fallback, NO partial schema). Production never calls create_all or
+    # ensure_columns at all; dev/test keep create_all bootstrapping
+    # (explicit local convenience only, loudly).
     _migrate.upgrade_head()
-    Base.metadata.create_all(bind=engine)
-    ensure_columns()
+    if settings.ENV.strip().lower() != "prod":
+        Base.metadata.create_all(bind=engine)
+        ensure_columns()
     _promote_admins()
     _sweep_stale_running_tasks()
     _start_ci_watcher()
@@ -282,6 +285,15 @@ def _sweep_stale_running_tasks() -> None:
             db.commit()
         finally:
             db.close()
+    except Exception:
+        pass
+    # Gate 0: reclaim crashed-worker microVMs (jail dirs with no live owner
+    # + overstayed VMs past FC_VM_MAX_RUNTIME_S). Best-effort, never raises;
+    # the DB lease sweep above stays the source of truth for task state.
+    try:
+        from app.sandbox import firecracker as _fc
+
+        _fc.destroy_orphans()
     except Exception:
         pass
 

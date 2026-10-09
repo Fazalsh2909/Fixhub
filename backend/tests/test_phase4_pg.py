@@ -789,3 +789,133 @@ def test_pg_statement_timeout_bounds_long_query(pg_url):
                 raise AssertionError("pg_sleep(5) should have been cancelled at 100ms")
     finally:
         eng.dispose()
+
+
+# --- Gate 0: migration authority (fresh + legacy upgrade, data preserved) ---
+
+
+def _fresh_db_url(pg_url, name):
+    import psycopg
+
+    admin = _libpq_url(pg_url).rsplit("/", 1)[0] + "/fixhub"
+    conn = psycopg.connect(admin, autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,))
+            if cur.fetchone():
+                # Drop first so the test proves a from-scratch migration.
+                cur.execute(f'DROP DATABASE "{name}" WITH (FORCE)')
+            cur.execute(f'CREATE DATABASE "{name}"')
+    finally:
+        conn.close()
+    return _pg_url().rsplit("/", 1)[0] + f"/{name}"
+
+
+def test_pg_fresh_migration_to_head_without_create_all(pg_url, monkeypatch):
+    """A from-scratch database reaches head via Alembic alone (no create_all)."""
+    from sqlalchemy import inspect
+
+    from app.config import settings as _settings
+    from app.db import migrate as _migrate
+
+    url = _fresh_db_url(pg_url, "fixhub_mig_fresh")
+    prev = _settings.DATABASE_URL
+    _settings.DATABASE_URL = url
+    try:
+        assert _migrate.upgrade_head(strict=True) is True
+    finally:
+        _settings.DATABASE_URL = prev
+    eng = create_engine(url, poolclass=NullPool)
+    try:
+        tables = set(inspect(eng).get_table_names())
+    finally:
+        eng.dispose()
+    for required in ("users", "tasks", "repositories", "task_events", "memories",
+                     "pull_requests", "webhook_deliveries", "alembic_version"):
+        assert required in tables, tables
+
+
+def test_pg_legacy_upgrade_preserves_data_and_ownerless_policy(pg_url):
+    """A pre-auth (0001) database upgrades with user data intact and legacy
+    ownerless rows still NULL (inaccessible forever per LEGACY_DATA.md)."""
+    from sqlalchemy import inspect, text
+
+    from app.config import settings as _settings
+    from app.db import migrate as _migrate
+
+    url = _fresh_db_url(pg_url, "fixhub_mig_legacy")
+    prev = _settings.DATABASE_URL
+    _settings.DATABASE_URL = url
+    try:
+        assert _migrate.upgrade_head(strict=True, revision="0001_baseline") is True
+    finally:
+        _settings.DATABASE_URL = prev
+    eng = create_engine(url, poolclass=NullPool)
+    try:
+        with eng.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO repositories (github_full_name, installation_id, "
+                "default_branch, created_at) "
+                "VALUES ('legacy/repo', 'inst-1', 'main', now())"
+            ))
+            repo_id = conn.execute(text(
+                "SELECT id FROM repositories WHERE github_full_name='legacy/repo'"
+            )).scalar()
+            conn.execute(text(
+                "INSERT INTO tasks (repository, repository_id, status, issue_title, "
+                "created_at, updated_at) "
+                "VALUES ('legacy/repo', :rid, 'COMPLETED', 'legacy work', now(), now())"
+            ), {"rid": repo_id})
+            conn.execute(text(
+                "INSERT INTO memories (repository, path, summary, updated_at) "
+                "VALUES ('legacy/repo', 'a.py', 'legacy memory', now())"
+            ))
+        # Upgrade to head (0002 adds owner_id + users; 0004 claims; 0005 misc).
+        _settings.DATABASE_URL = url
+        try:
+            assert _migrate.upgrade_head(strict=True) is True
+        finally:
+            _settings.DATABASE_URL = prev
+        with eng.connect() as conn:
+            cols = {c["name"] for c in inspect(eng).get_columns("tasks")}
+            for required in ("owner_id", "claimed_by", "lease_expires_at"):
+                assert required in cols, cols
+            # User data survived the upgrade byte-for-byte.
+            title = conn.execute(text(
+                "SELECT issue_title FROM tasks WHERE repository='legacy/repo'"
+            )).scalar()
+            assert title == "legacy work"
+            summary = conn.execute(text(
+                "SELECT summary FROM memories WHERE repository='legacy/repo'"
+            )).scalar()
+            assert summary == "legacy memory"
+            # Legacy rows are still ownerless ...
+            assert conn.execute(text(
+                "SELECT owner_id FROM tasks WHERE repository='legacy/repo'"
+            )).scalar() is None
+            assert conn.execute(text(
+                "SELECT owner_id FROM repositories WHERE github_full_name='legacy/repo'"
+            )).scalar() is None
+            # ... and invisible to every ownership-scoped query.
+            visible = conn.execute(text(
+                "SELECT COUNT(*) FROM tasks WHERE owner_id = 1"
+            )).scalar()
+            assert visible == 0
+    finally:
+        eng.dispose()
+
+
+def test_prod_migration_failure_stops_startup(monkeypatch):
+    """Gate 0: in production a failed migration raises (no create_all rescue)."""
+    import sys as _sys
+
+    from app.config import settings as _settings
+    from app.db import migrate as _migrate
+
+    monkeypatch.setattr(_settings, "ENV", "prod")
+    monkeypatch.setitem(_sys.modules, "alembic", None)
+    try:
+        _migrate.upgrade_head()
+    except _migrate.MigrationFailed:
+        return
+    raise AssertionError("prod migration failure must raise MigrationFailed")

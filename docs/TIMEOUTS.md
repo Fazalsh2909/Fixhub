@@ -15,6 +15,7 @@ Single coherent model. Validated at startup by `app.config.validate_timeout_ladd
 | `TASK_LEASE_S` | 3600 | claim lease: outlives the job; recovery threshold |
 | `LEASE_RENEW_EVERY_S` | 120 | heartbeat: renew while actively executing |
 | `TOOL_CLEANUP_GRACE_S` | 30 | grace to renew/revalidate after a long tool |
+| `FC_VM_MAX_RUNTIME_S` | 1500 | microVM reaper cap: overstayed VMs are destroyed (< `JOB_TIMEOUT_S`) |
 
 ## Ordering rules (all enforced, fail-fast `ValueError`)
 

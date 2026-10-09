@@ -93,7 +93,20 @@ _SCHEMA_PATCHES = {
 
 
 def ensure_columns() -> None:
-    """Additive, idempotent schema upgrade for existing databases."""
+    """Additive, idempotent schema upgrade for existing databases.
+
+    Gate 0: production schema authority is Alembic ONLY. In prod this is a
+    no-op so a half-migrated database can never be silently patched into a
+    half-working shape outside migrations. Dev/test SQLite keeps the patches
+    for pre-existing local databases.
+    """
+    try:
+        from app.config import settings as _settings
+
+        if str(getattr(_settings, "ENV", "dev") or "dev").strip().lower() == "prod":
+            return
+    except Exception:
+        pass
     from sqlalchemy import text as _text
 
     for table, columns in _SCHEMA_PATCHES.items():

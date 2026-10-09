@@ -85,13 +85,29 @@ class Settings(BaseSettings):
     FC_CHROOT_BASE: str = "/srv/firecracker/jails"
     FC_GUEST_VCPU: int = 2
     FC_GUEST_MEM_MIB: int = 1024
+    # Writable-disk cap (MiB): the immutable base rootfs must fit inside it
+    # (fail-closed otherwise); the per-task overlay is an exact copy, so the
+    # VM's disk can never exceed this cap.
     FC_OVERLAY_MB: int = 5120
+    # Guest process cap (cgroup pids.max, enforced by the jailer).
+    FC_PIDS_MAX: int = 256
+    # Worker-side runtime cap per microVM (seconds, enforced by the orphan/
+    # overstay reaper). Must stay below JOB_TIMEOUT_S so the RQ kill (not a
+    # leaked VM) is what bounds runaway work.
+    FC_VM_MAX_RUNTIME_S: int = 1500
     FC_BOOT_TIMEOUT_S: int = 30
     FC_VSOCK_TIMEOUT_S: int = 10
+    # Host egress services (root-ns veth address; see net.py/egress.py).
+    FC_EGRESS_PROXY_ADDR: str = "10.200.0.1"
+    FC_EGRESS_PROXY_PORT: int = 8443
+    FC_DNS_STUB_ADDR: str = "10.200.0.1"
     # Phase 5 egress allowlist (comma-separated host suffixes,
-    # enforced on the HOST via nft — never in the guest).
+    # enforced on the HOST via SNI proxy + nft — never in the guest).
+    # github.com is required for git ls-remote/clone; api/codeload/objects
+    # cover API + archive + LFS traffic.
     FC_EGRESS_ALLOWLIST: str = (
-        "api.github.com,codeload.github.com,objects.githubusercontent.com,"
+        "github.com,api.github.com,codeload.github.com,"
+        "objects.githubusercontent.com,"
         "pypi.org,files.pythonhosted.org,registry.npmjs.org"
     )
     # Phase 5 real-VM test gate: 1 = sandbox security tests REQUIRE real KVM

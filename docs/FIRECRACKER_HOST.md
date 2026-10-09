@@ -43,7 +43,8 @@ fast unit tests; `FIXHUB_FIRECRACKER_TEST=1` runs only on the KVM host/CI.
 
 1. Develop on the laptop with `SANDBOX_BACKEND=host` (default).
 2. `pytest backend/tests/test_sandbox_backend.py` runs everywhere (no KVM).
-3. Real-VM suite (`FIXHUB_FIRECRACKER_TEST=1`) runs on the KVM host or KVM CI
-   only: `FIXHUB_FIRECRACKER_TEST=1 python -m pytest backend/tests/test_sandbox_firecracker.py -q`.
+3. Real-VM suite runs on the KVM host or KVM CI only (both flags, fail-closed
+   — missing KVM/binaries/images/net isolation FAILS, never skips, never mocks):
+   `FIXHUB_FIRECRACKER_TEST=1 FC_REQUIRE_KVM=1 python -m pytest backend/tests/test_sandbox_firecracker.py -q`.
 4. Provisioning code under the `firecracker` backend fails closed on Windows
    with a clear message (never host fallback).

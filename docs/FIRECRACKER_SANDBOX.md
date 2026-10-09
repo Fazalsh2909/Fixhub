@@ -33,15 +33,27 @@ immutable base + disposable overlay.
   images, net isolation) raises `SandboxBlockedError` → task BLOCKED.
   Unknown backend names fail closed (never default to host).
 
+## Jail layout (official)
+
+`<FC_CHROOT_BASE>/firecracker/task-<id>/root/` holds `firecracker` (jailer
+copy), `firecracker.pid`, `api.socket` (explicit `--api-sock /api.socket`),
+`vmlinux`, and `overlay.ext4`. The host dials `<root>/api.socket`; drive and
+kernel API paths are jail-relative (`./…`). There is no host fallback.
+
 ## Files
 
 - `backend/app/sandbox/backend.py` — ABC + dispatch (the cut point).
 - `backend/app/sandbox/sandbox.py` — host backend + shared redaction/policy.
 - `backend/app/sandbox/firecracker.py` — jailer lifecycle, vsock exec, repo
-  sync both directions, destroy/recovery.
+  sync both directions, destroy/orphan reaper. Guest CID = `_cid_for(task)`
+  in BOTH the `/vsock` config and every host `VsockClient` dial.
 - `backend/app/sandbox/guest_agent.py` — host-side protocol + token stripping.
 - `backend/app/sandbox/guest/agent.py` — guest-side exec server (baked into rootfs).
-- `backend/app/sandbox/net.py` — netns/TAP/nft default-deny.
+- `backend/app/sandbox/net.py` — netns/TAP/veth/nft default-deny + forced
+  TCP-443 redirect into the host proxy. No default route in task netns.
+- `backend/app/sandbox/egress.py` — host SNI proxy + DNS stub (the
+  allowlist enforcement point; `FC_EGRESS_ALLOWLIST` suffixes, including
+  `github.com` for git ls-remote/clone).
 - `backend/app/sandbox/images.py` — artifact verification.
 - Tests: `test_sandbox_backend.py` (no KVM) + `test_sandbox_firecracker.py`
-  (14 real-VM probes, `FIXHUB_FIRECRACKER_TEST=1`).
+  (15 real-VM probes, `FIXHUB_FIRECRACKER_TEST=1`).
