@@ -5,6 +5,22 @@ services:
     volumes:
       - "redisdata:/data"
     restart: unless-stopped
+  # Phase 4: production database. Local dev keeps SQLite by default; set
+  # USE_POSTGRES=1 (or override DATABASE_URL) to run backend+worker on PG.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fixhub
+      POSTGRES_PASSWORD: fixhub
+      POSTGRES_DB: fixhub
+    volumes:
+      - "pgdata:/var/lib/postgresql/data"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fixhub -d fixhub"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
   backend:
     build: ./backend
     # Host 8001: 8000 is taken on this machine by another stack (infra-api).
@@ -16,7 +32,7 @@ services:
       WORKSPACE_KEEP: "0"
       REDIS_URL: redis://redis:6379/0
       QUEUE_NAME: fixhub
-      # Shared SQLite file: backend + worker MUST see the same DB.
+      # SQLite default (dev). Production: postgresql+psycopg://fixhub:fixhub@postgres:5432/fixhub
       DATABASE_URL: sqlite:////srv/backend/data/fixhub.db
     volumes:
       - "workspaces:/tmp/fixhub-workspaces"
@@ -41,6 +57,7 @@ services:
       - "./backend/fixhub-app.pem:/srv/backend/fixhub-app.pem:ro"
     depends_on: [redis, backend]
     restart: unless-stopped
+    # Scale: docker compose up --scale worker=N (claim guard keeps it safe).
   frontend:
     build: ./frontend
     ports: ["8080:80"]
@@ -50,3 +67,4 @@ volumes:
   workspaces:
   redisdata:
   dbdata:
+  pgdata:

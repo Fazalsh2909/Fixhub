@@ -1,6 +1,7 @@
 import Editor from "@monaco-editor/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
+import { Lock, X } from "lucide-react";
 
 interface Tab {
   key: string;
@@ -143,19 +144,20 @@ export default function EditorTabs({ taskId }: Props) {
         {tabs.map((t) => (
           <div key={t.key} className={`tab ${t.key === active ? "active" : ""}`} onClick={() => setActive(t.key)}>
             <span title={t.readOnly ? `${t.origin}:${t.path}` : t.path}>
-              {t.readOnly ? "◌ " : ""}{t.path.split("/").pop()}
-              {t.dirty ? " •" : ""}
-              {t.saving ? " …" : ""}
+              {t.readOnly ? <Lock size={12} /> : null}{t.path.split("/").pop()}
+              {t.dirty && !t.saving ? " — unsaved" : ""}
+              {t.saving ? " — saving" : ""}
             </span>
             <button
               title="Close"
+              aria-label={`Close ${t.path}`}
               onClick={(e) => {
                 e.stopPropagation();
                 setTabs((ts) => ts.filter((x) => x.key !== t.key));
                 if (active === t.key) setActive(tabs.filter((x) => x.key !== t.key).map((x) => x.key)[0] || null);
               }}
             >
-              ×
+              <X size={12} />
             </button>
           </div>
         ))}

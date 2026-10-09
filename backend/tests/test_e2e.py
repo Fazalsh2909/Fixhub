@@ -55,9 +55,10 @@ def test_e2e_issue_to_push(db, tmp_path, monkeypatch):
 
     # Scripted LLM: investigate then fix then verify. Reads microscopically like a real agent.
     script = [
-        AssistantMessage("", [ToolCall("1", "read_file", {"path": "calc.py"})]),
-        AssistantMessage("", [ToolCall("2", "edit_file", {"path": "calc.py", "old": "return a - b  # BUG: should add", "new": "return a + b"})]),
-        AssistantMessage("", [ToolCall("3", "run_command", {"command": "python -c \"from calc import add; assert add(2,3)==5\""})]),
+        AssistantMessage("", [ToolCall("1", "read_file", {"path": "test_calc.py"})]),
+        AssistantMessage("", [ToolCall("2", "read_file", {"path": "calc.py"})]),
+        AssistantMessage("", [ToolCall("3", "edit_file", {"path": "calc.py", "old": "return a - b  # BUG: should add", "new": "return a + b"})]),
+        AssistantMessage("", [ToolCall("4", "run_command", {"command": "python -c \"from calc import add; assert add(2,3)==5\""})]),
         AssistantMessage("Fixed add() to use + instead of -. Tests pass.", []),
     ]
     calls = {"i": 0}

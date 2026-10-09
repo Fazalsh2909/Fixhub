@@ -211,11 +211,26 @@ def _pytest_gate(workspace: str, cmds: list[tuple[str, str]]) -> tuple[bool, str
     cannot run tests at all (missing deps) — infra noise must not block."""
     from app.sandbox import sandbox as _sandbox
 
+    def _gate_run(ws: str, cmd: str, timeout_s: int, cwd: str):
+        # Phase 5: firecracker backend executes gates inside the guest;
+        # host backend keeps the exact legacy call shape (mock-compatible).
+        try:
+            from app.sandbox.backend import active_backend_name as _active
+            from app.sandbox.backend import run_command as _dispatch
+
+            if _active() == "firecracker":
+                return _dispatch(ws, cmd, timeout_s=timeout_s, cwd=cwd)
+        except _sandbox.SandboxBlockedError:
+            raise
+        except Exception:
+            pass
+        return _sandbox.run_command(ws, cmd, timeout_s=timeout_s, cwd=cwd)
+
     outs: list[str] = []
     overall = True
     for cwd, cmd in cmds:
         try:
-            res = _sandbox.run_command(workspace, cmd, timeout_s=300, cwd=cwd)
+            res = _gate_run(workspace, cmd, 300, cwd)
         except _sandbox.SandboxBlockedError as exc:
             return False, f"gate blocked by sandbox policy: {exc}"
         body = f"$ [{cwd}] {cmd}\n{res.stdout}\n{res.stderr}".strip()
@@ -238,6 +253,19 @@ def _pytest_gate(workspace: str, cmds: list[tuple[str, str]]) -> tuple[bool, str
 def _ruff_gate(workspace: str, py_files: list[str], version: str) -> tuple[bool, str]:
     from app.sandbox import sandbox as _sandbox
 
+    def _gate_run(ws: str, cmd: str, timeout_s: int):
+        try:
+            from app.sandbox.backend import active_backend_name as _active
+            from app.sandbox.backend import run_command as _dispatch
+
+            if _active() == "firecracker":
+                return _dispatch(ws, cmd, timeout_s=timeout_s)
+        except _sandbox.SandboxBlockedError:
+            raise
+        except Exception:
+            pass
+        return _sandbox.run_command(ws, cmd, timeout_s=timeout_s)
+
     pin = f"ruff=={version}" if version != "latest" else "ruff"
     files = " ".join(f'"{f}"' for f in py_files[:50])
     # Sequential single-purpose commands (no shell chaining like `;` or
@@ -256,7 +284,7 @@ def _ruff_gate(workspace: str, py_files: list[str], version: str) -> tuple[bool,
     overall = True
     try:
         for cmd, timeout in steps:
-            res = _sandbox.run_command(workspace, cmd, timeout_s=timeout)
+            res = _gate_run(workspace, cmd, timeout)
             # `pip install` noise is irrelevant; only its exit code matters.
             body = "" if cmd.startswith("pip install") else f"{res.stdout}\n{res.stderr}".strip()
             outs.append(f"$ {cmd}\n(exit {res.exit_code})" + (f"\n{body}" if body else ""))

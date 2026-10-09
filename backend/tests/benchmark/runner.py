@@ -11,6 +11,7 @@ workspace, gates, memory, and task lifecycle execute throughout.
 Results: results/latest.json (+ run-<ts>.json); --write-baseline also writes
 baseline.json + baseline.md (committed).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -32,6 +33,9 @@ def _parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--scenario", default="")
     p.add_argument("--write-baseline", action="store_true")
+    # Phase 5 parity: --sandbox host (default, everywhere) or firecracker
+    # (Linux/KVM host only; fails closed without prerequisites).
+    p.add_argument("--sandbox", default="host", choices=["host", "firecracker"])
     return p.parse_args()
 
 
@@ -46,11 +50,18 @@ def main() -> int:
         except Exception:
             pass
     root = tempfile.mkdtemp(prefix="bench-", dir=TMP)
-    os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(root, "bench.db").replace("\\", "/")
+    os.environ["DATABASE_URL"] = "sqlite:///" + os.path.join(root, "bench.db").replace(
+        "\\", "/"
+    )
     os.environ["WORKSPACE_ROOT"] = os.path.join(root, "workspaces")
     os.environ.setdefault("LLM_API_KEY", "bench-key")
     os.environ.setdefault("GITHUB_WEBHOOK_SECRET", "bench-secret")
     sys.path.insert(0, BACKEND)
+    if args.sandbox != "host":
+        from app.config import settings as _settings
+
+        _settings.SANDBOX_BACKEND = args.sandbox
+        print(f"[bench] SANDBOX_BACKEND={args.sandbox} (KVM host required)")
 
     from tests.benchmark.scenarios import SCENARIOS
 
@@ -63,20 +74,30 @@ def main() -> int:
     for spec in selected:
         res = run_scenario(root, spec)
         results.append(res)
-        print(f"{res['scenario_id']:22s} {res['result']:6s} "
-              f"steps={res['agent_steps']:<4d} tools={res['tool_calls']:<4d} "
-              f"{res['runtime_s']:.0f}s {res['failure_category'] or ''}")
+        print(
+            f"{res['scenario_id']:22s} {res['result']:6s} "
+            f"steps={res['agent_steps']:<4d} tools={res['tool_calls']:<4d} "
+            f"{res['runtime_s']:.0f}s {res['failure_category'] or ''}"
+        )
     summary = summarize(results)
     print_report(summary, results)
     ts = time.strftime("%Y%m%d-%H%M%S")
-    with open(os.path.join(HERE, "results", "latest.json"), "w", encoding="utf-8") as fh:
+    with open(
+        os.path.join(HERE, "results", "latest.json"), "w", encoding="utf-8"
+    ) as fh:
         json.dump({"summary": summary, "results": results}, fh, indent=2)
-    with open(os.path.join(HERE, "results", f"run-{ts}.json"), "w", encoding="utf-8") as fh:
+    with open(
+        os.path.join(HERE, "results", f"run-{ts}.json"), "w", encoding="utf-8"
+    ) as fh:
         json.dump({"summary": summary, "results": results}, fh, indent=2)
     if args.write_baseline:
-        with open(os.path.join(HERE, "results", "baseline.json"), "w", encoding="utf-8") as fh:
+        with open(
+            os.path.join(HERE, "results", "baseline.json"), "w", encoding="utf-8"
+        ) as fh:
             json.dump({"summary": summary, "results": results}, fh, indent=2)
-        with open(os.path.join(HERE, "results", "baseline.md"), "w", encoding="utf-8") as fh:
+        with open(
+            os.path.join(HERE, "results", "baseline.md"), "w", encoding="utf-8"
+        ) as fh:
             fh.write(render_report(summary, results))
         print("baseline written")
     return 0 if summary["unexpected_failures"] == 0 else 1
@@ -86,8 +107,11 @@ def main() -> int:
 # execution
 # --------------------------------------------------------------------------
 
+
 def _git(path, *args):
-    return subprocess.run(["git", *args], cwd=path, capture_output=True, text=True, timeout=60)
+    return subprocess.run(
+        ["git", *args], cwd=path, capture_output=True, text=True, timeout=60
+    )
 
 
 def _fixture_remote(parent, spec):
@@ -105,8 +129,12 @@ def _fixture_remote(parent, spec):
     _git(work, "add", "-A")
     _git(work, "commit", "-m", "fixture")
     _git(work, "push", "-u", "origin", "HEAD:main")
-    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"],
-                   cwd=remote, capture_output=True, timeout=30)
+    subprocess.run(
+        ["git", "symbolic-ref", "HEAD", "refs/heads/main"],
+        cwd=remote,
+        capture_output=True,
+        timeout=30,
+    )
     shutil.rmtree(work, ignore_errors=True)
     return remote
 
@@ -128,7 +156,7 @@ def _pin_python(script):
 
                 cmd = args.get("command", "")
                 if cmd.startswith("python ") or cmd == "python":
-                    args["command"] = f'"{sys.executable}"' + cmd[len("python"):]
+                    args["command"] = f'"{sys.executable}"' + cmd[len("python") :]
                 tc = _TC(tc.id, tc.name, args)
             calls.append(tc)
         out.append(AssistantMessage(m.content, calls))
@@ -161,7 +189,9 @@ def _new_db():
     from app.db.database import Base
 
     # Reuse the process DATABASE_URL file; fresh tables per scenario file set.
-    eng = create_engine(os.environ["DATABASE_URL"], connect_args={"check_same_thread": False})
+    eng = create_engine(
+        os.environ["DATABASE_URL"], connect_args={"check_same_thread": False}
+    )
     Base.metadata.drop_all(bind=eng)
     Base.metadata.create_all(bind=eng)
     sess = sessionmaker(bind=eng, autoflush=False, autocommit=False)
@@ -183,23 +213,44 @@ def run_scenario(root, spec):
         else:
             data = _run_lifecycle_scenario(root, spec)
     except Exception as exc:  # harness failure, never a silent pass
-        data = {"ok": False, "category": "OTHER",
-                "evidence": f"harness exception: {type(exc).__name__}: {exc}"[:500]}
+        data = {
+            "ok": False,
+            "category": "OTHER",
+            "evidence": f"harness exception: {type(exc).__name__}: {exc}"[:500],
+        }
     data["runtime_s"] = round(time.monotonic() - t0, 1)
-    data.update({"scenario_id": spec["id"], "stack": spec.get("stack", "?"),
-                 "trigger_type": spec.get("trigger", "issue"),
-                 "tokens": None})
+    data.update(
+        {
+            "scenario_id": spec["id"],
+            "stack": spec.get("stack", "?"),
+            "trigger_type": spec.get("trigger", "issue"),
+            "tokens": None,
+        }
+    )
     return _finalize(spec, data)
 
 
 def _skipped(spec, reason):
-    return {"scenario_id": spec["id"], "stack": spec.get("stack", "?"),
-            "trigger_type": spec.get("trigger", "issue"), "result": "SKIP",
-            "agent_steps": 0, "tool_calls": 0, "duplicate_calls_blocked": 0,
-            "failed_tool_calls": 0, "command_count": 0, "validation_attempts": 0,
-            "repair_rounds": 0, "files_read": [], "files_changed": [],
-            "runtime_s": 0.0, "final_status": "SKIP", "failure_category": "",
-            "tokens": None, "note": reason}
+    return {
+        "scenario_id": spec["id"],
+        "stack": spec.get("stack", "?"),
+        "trigger_type": spec.get("trigger", "issue"),
+        "result": "SKIP",
+        "agent_steps": 0,
+        "tool_calls": 0,
+        "duplicate_calls_blocked": 0,
+        "failed_tool_calls": 0,
+        "command_count": 0,
+        "validation_attempts": 0,
+        "repair_rounds": 0,
+        "files_read": [],
+        "files_changed": [],
+        "runtime_s": 0.0,
+        "final_status": "SKIP",
+        "failure_category": "",
+        "tokens": None,
+        "note": reason,
+    }
 
 
 def _run_loop_scenario(root, spec):
@@ -220,6 +271,7 @@ def _run_loop_scenario(root, spec):
         def is_cancelled():
             n["i"] += 1
             return n["i"] > spec["cancel_after"]
+
     timeout_prev = None
     if "timeout" in spec:
         from app.config import settings as _settings
@@ -228,10 +280,28 @@ def _run_loop_scenario(root, spec):
         _settings.COMMAND_TIMEOUT_S = spec["timeout"]
     live = []
     try:
-        out = _loop.run_agent(
-            workspace=ws, trigger_type="issue", repository="bench/repo",
-            issue_title=spec["issue"]["issue_title"], issue_body=spec["issue"]["issue_body"],
-            on_tool=live.append, is_cancelled=is_cancelled)
+        trig = spec.get("trigger", "issue")
+        if trig == "ci" and "ci" in spec:
+            ci = spec["ci"]
+            out = _loop.run_agent(
+                workspace=ws,
+                trigger_type="ci",
+                repository="bench/repo",
+                ci_info=ci.get("ci_excerpt", ""),
+                on_tool=live.append,
+                is_cancelled=is_cancelled,
+            )
+        else:
+            issue = spec.get("issue", {"issue_title": "probe", "issue_body": "t"})
+            out = _loop.run_agent(
+                workspace=ws,
+                trigger_type="issue",
+                repository="bench/repo",
+                issue_title=issue["issue_title"],
+                issue_body=issue["issue_body"],
+                on_tool=live.append,
+                is_cancelled=is_cancelled,
+            )
     finally:
         _loop._llm.chat_completion = prev_chat
         if timeout_prev is not None:
@@ -254,13 +324,19 @@ def _run_lifecycle_scenario(root, spec):
         repo = None
         gh_mocks = []
         if spec.get("mock_github"):
-            repo = Repository(github_full_name="bench/repo", installation_id="bench-inst")
+            repo = Repository(
+                github_full_name="bench/repo", installation_id="bench-inst"
+            )
             db.add(repo)
             db.commit()
             gh_mocks = _install_github_mocks()
         trig = spec.get("trigger", "issue")
-        fields = {"repository": "bench/repo", "repository_id": repo.id if repo else None,
-                  "trigger_type": trig, "status": "RUNNING"}
+        fields = {
+            "repository": "bench/repo",
+            "repository_id": repo.id if repo else None,
+            "trigger_type": trig,
+            "status": "RUNNING",
+        }
         if trig == "issue":
             fields.update(spec["issue"])
         else:
@@ -277,17 +353,38 @@ def _run_lifecycle_scenario(root, spec):
             from app.agent import loop as _loop
 
             _loop._llm.chat_completion = prev_chat
-        if spec.get("id") == "J-repair":
-            out = _repair_phase(db, sess, remote, spec, tid, out, gh_calls)
+        if spec.get("script2"):
+            if spec.get("repair_flow") == "ciwatch":
+                out = _repair_phase_ciwatch(
+                    db, sess, remote, spec, tid, out, gh_calls, gh_mocks
+                )
+            else:
+                out = _repair_phase(db, sess, remote, spec, tid, out, gh_calls)
+            # A failed intermediate phase must fail loudly: never let the
+            # final snapshot re-wrap an error into a vacuous PASS.
+            if isinstance(out, dict) and out.get("ok") is False:
+                return {
+                    "ok": False,
+                    "category": out.get("category", "OTHER"),
+                    "evidence": out.get("note", "")[:500],
+                }
         _remove_github_mocks(gh_mocks)
         events = db.query(TaskEvent).filter(TaskEvent.task_id == tid).all()
         db.expire_all()
         row = db.query(Task).filter(Task.id == tid).first()
-        return {"result": out, "events": [(e.type, e.data_json) for e in events],
-                "task": {"id": row.id, "status": row.status, "branch": row.branch,
-                         "commit_sha": row.commit_sha, "pr_url": row.pr_url,
-                         "error": row.error},
-                "remote": remote}
+        return {
+            "result": out,
+            "events": [(e.type, e.data_json) for e in events],
+            "task": {
+                "id": row.id,
+                "status": row.status,
+                "branch": row.branch,
+                "commit_sha": row.commit_sha,
+                "pr_url": row.pr_url,
+                "error": row.error,
+            },
+            "remote": remote,
+        }
     finally:
         db.close()
 
@@ -300,8 +397,14 @@ def _install_github_mocks():
     prev = {}
     prev["token"] = _auth.installation_token
     _auth.installation_token = lambda iid: "tok"
-    for name in ("list_open_pulls", "create_pull_request", "update_pull",
-                 "sha_check_conclusion", "failed_log_tail", "pull_files"):
+    for name in (
+        "list_open_pulls",
+        "create_pull_request",
+        "update_pull",
+        "sha_check_conclusion",
+        "failed_log_tail",
+        "pull_files",
+    ):
         prev[name] = getattr(_gh, name, None)
 
     def _create(**k):
@@ -317,17 +420,30 @@ def _install_github_mocks():
         # Faithful to production: the created PR lives on the pushed branch.
         if not calls["create"]:
             return []
-        return [{"number": 101, "url": "http://pr/101",
-                 "head_branch": calls["create"][0]["head"],
-                 "head_sha": "x", "body": ""}]
+        return [
+            {
+                "number": 101,
+                "url": "http://pr/101",
+                "head_branch": calls["create"][0]["head"],
+                "head_sha": "x",
+                "body": "",
+            }
+        ]
 
     _gh.list_open_pulls = _open
     _gh.create_pull_request = _create
     _gh.update_pull = _update
-    _gh.sha_check_conclusion = lambda **k: "success"
+    conclusion = {"value": "success"}
+    _gh.sha_check_conclusion = lambda **k: conclusion["value"]
     _gh.failed_log_tail = lambda **k: ""
     _gh.pull_files = lambda **k: []
-    return {"prev": prev, "calls": calls, "auth": _auth, "gh": _gh}
+    return {
+        "prev": prev,
+        "calls": calls,
+        "auth": _auth,
+        "gh": _gh,
+        "conclusion": conclusion,
+    }
 
 
 def _remove_github_mocks(handle):
@@ -354,18 +470,104 @@ def _repair_phase(db, sess, remote, spec, tid, out1, gh_calls):
     events = db.query(TaskEvent).filter(TaskEvent.task_id == tid).all()
     db.expire_all()
     row = db.query(Task).filter(Task.id == tid).first()
-    return {"result": out, "events": [(e.type, e.data_json) for e in events],
-            "task": {"id": row.id, "status": row.status, "branch": row.branch,
-                     "commit_sha": row.commit_sha, "pr_url": row.pr_url,
-                     "error": row.error},
-            "remote": remote, "phase1": out1,
+    return {
+        "result": out,
+        "events": [(e.type, e.data_json) for e in events],
+        "task": {
+            "id": row.id,
+            "status": row.status,
+            "branch": row.branch,
+            "commit_sha": row.commit_sha,
+            "pr_url": row.pr_url,
+            "error": row.error,
+        },
+        "remote": remote,
+        "phase1": out1,
+        "gh_creates": len(gh_calls["create"]) if gh_calls else 0,
+        "repair_rounds": 1,
+    }
+
+
+def _repair_phase_ciwatch(db, sess, remote, spec, tid, out1, gh_calls, gh_mocks):
+    """Phase 4.5 live CI repair E2E: publish -> watcher(failure) -> repair on
+    the same branch -> watcher(success) -> COMPLETED, exactly one PR.
+
+    The RQ hop is stubbed as delivered (queue determinism is covered by unit
+    tests); everything else — ciwatch transitions, same-branch repair,
+    single-PR reuse, final completion — executes for real.
+    """
+    from app.agent import loop as _loop
+    from app.db.models import Task, TaskEvent
+    from app.tasks import ciwatch as _ciwatch
+    from app.tasks import queue as _queue
+    from app.tasks import service as _svc
+
+    def _snapshot(out):
+        db.expire_all()
+        row = db.query(Task).filter(Task.id == tid).first()
+        events = db.query(TaskEvent).filter(TaskEvent.task_id == tid).all()
+        return {
+            "result": out,
+            "events": [(e.type, e.data_json) for e in events],
+            "task": {
+                "id": row.id,
+                "status": row.status,
+                "branch": row.branch,
+                "commit_sha": row.commit_sha,
+                "pr_url": row.pr_url,
+                "error": row.error,
+            },
+            "remote": remote,
+            "phase1": out1,
             "gh_creates": len(gh_calls["create"]) if gh_calls else 0,
-            "repair_rounds": 1}
+            "repair_rounds": 1,
+        }
+
+    if out1.get("status") != "AWAITING_CI":
+        return {
+            "ok": False,
+            "category": "LIFECYCLE_FAILURE",
+            "note": f"phase1 did not publish: {out1}",
+        }
+    gh_mocks["conclusion"]["value"] = "failure"
+    prev_enqueue = _queue.enqueue_repair
+    _queue.enqueue_repair = lambda task_id: {"enqueued": True, "job_id": "bench"}
+    try:
+        watch1 = _ciwatch.check_awaiting_ci()
+    finally:
+        _queue.enqueue_repair = prev_enqueue
+    if watch1.get("repair_enqueued") != 1:
+        return {
+            "ok": False,
+            "category": "LIFECYCLE_FAILURE",
+            "note": f"watcher did not enqueue repair: {watch1}",
+        }
+    prev_chat = _install_scripted_llm(spec["script2"])
+    try:
+        out2 = _svc.run_task_inline(tid, source=remote, repair=True)
+    finally:
+        _loop._llm.chat_completion = prev_chat
+    if out2.get("status") != "AWAITING_CI":
+        return {
+            "ok": False,
+            "category": "LIFECYCLE_FAILURE",
+            "note": f"repair did not republish: {out2}",
+        }
+    gh_mocks["conclusion"]["value"] = "success"
+    watch2 = _ciwatch.check_awaiting_ci()
+    if watch2.get("completed") != 1:
+        return {
+            "ok": False,
+            "category": "LIFECYCLE_FAILURE",
+            "note": f"watcher did not complete: {watch2}",
+        }
+    return _snapshot(out2)
 
 
 # --------------------------------------------------------------------------
 # evaluation
 # --------------------------------------------------------------------------
+
 
 def _tool_events(events):
     return [json_load(d) for (t, d) in events if t == "TOOL_CALL"]
@@ -382,22 +584,40 @@ def json_load(s):
 
 def _finalize(spec, data):
     exp = spec.get("expect", {})
-    base = {"scenario_id": spec["id"], "stack": spec.get("stack", "?"),
-            "trigger_type": spec.get("trigger", "issue"), "tokens": None,
-            "runtime_s": data.get("runtime_s", 0.0)}
+    base = {
+        "scenario_id": spec["id"],
+        "stack": spec.get("stack", "?"),
+        "trigger_type": spec.get("trigger", "issue"),
+        "tokens": None,
+        "runtime_s": data.get("runtime_s", 0.0),
+    }
     if data.get("ok") is False and "category" in data and "events" not in data:
-        return {**base, **_empty_metrics(), **data, "result": "FAIL",
-                "failure_category": data["category"], "final_status": "HARNESS_ERROR"}
+        return {
+            **base,
+            **_empty_metrics(),
+            **data,
+            "result": "FAIL",
+            "failure_category": data["category"],
+            "final_status": "HARNESS_ERROR",
+        }
     if spec["kind"] == "loop":
         return {**base, **_evaluate_loop(spec, data)}
     return {**base, **_evaluate_lifecycle(spec, data)}
 
 
 def _empty_metrics():
-    return {"agent_steps": 0, "tool_calls": 0, "duplicate_calls_blocked": 0,
-            "failed_tool_calls": 0, "command_count": 0, "validation_attempts": 0,
-            "repair_rounds": 0, "files_read": [], "files_changed": [],
-            "final_status": "?"}
+    return {
+        "agent_steps": 0,
+        "tool_calls": 0,
+        "duplicate_calls_blocked": 0,
+        "failed_tool_calls": 0,
+        "command_count": 0,
+        "validation_attempts": 0,
+        "repair_rounds": 0,
+        "files_read": [],
+        "files_changed": [],
+        "final_status": "?",
+    }
 
 
 def _evaluate_loop(spec, data):
@@ -406,18 +626,31 @@ def _evaluate_loop(spec, data):
     blocked = sum(1 for e in events if e.get("blocked") or e.get("cached"))
     failed = sum(1 for e in events if not e.get("ok", True))
     writes = sum(1 for e in events if e["tool"] in ("write_file", "edit_file"))
-    res = {**_empty_metrics(),
-           "agent_steps": out.iterations, "tool_calls": out.tool_calls,
-           "duplicate_calls_blocked": blocked, "failed_tool_calls": failed,
-           "command_count": tools.count("run_command"),
-           "files_read": sorted({e["args"].get("path", "") for e in events
-                                 if e["tool"] == "read_file" and e["args"].get("path")}),
-           "final_status": "CANCELLED" if out.cancelled else ("FINISHED" if out.finished else "UNFINISHED")}
+    res = {
+        **_empty_metrics(),
+        "agent_steps": out.iterations,
+        "tool_calls": out.tool_calls,
+        "duplicate_calls_blocked": blocked,
+        "failed_tool_calls": failed,
+        "command_count": tools.count("run_command"),
+        "files_read": sorted(
+            {
+                e["args"].get("path", "")
+                for e in events
+                if e["tool"] == "read_file" and e["args"].get("path")
+            }
+        ),
+        "final_status": "CANCELLED"
+        if out.cancelled
+        else ("FINISHED" if out.finished else "UNFINISHED"),
+    }
     fails = []
     if exp.get("cancelled") and not out.cancelled:
         fails.append(("OTHER", "cancel flag ignored"))
     if "blocked" in exp and blocked < exp["blocked"]:
-        fails.append(("OTHER", f"only {blocked} blocked/redirected, want >={exp['blocked']}"))
+        fails.append(
+            ("OTHER", f"only {blocked} blocked/redirected, want >={exp['blocked']}")
+        )
     if "failed" in exp and failed != exp["failed"]:
         fails.append(("TOOL_FAILURE", f"{failed} failed calls, want {exp['failed']}"))
     if "writes" in exp and writes != exp["writes"]:
@@ -426,12 +659,19 @@ def _evaluate_loop(spec, data):
         timed = any(e.get("timed_out") is True for e in events)
         if exp["timed_out"] and not timed:
             fails.append(("TIMEOUT", "no timed_out recorded"))
-    if "dup_blocked" in exp and not any(e.get("blocked") or e.get("cached") for e in events):
+    if "dup_blocked" in exp and not any(
+        e.get("blocked") or e.get("cached") for e in events
+    ):
         fails.append(("LOOPING", "no duplicate protection engaged"))
     if "max_tool_calls" in exp and out.tool_calls > exp["max_tool_calls"]:
         fails.append(("LOOPING", f"{out.tool_calls} calls > cap"))
     if "max_runtime_s" in exp and (data.get("runtime_s") or 0) > exp["max_runtime_s"]:
-        fails.append(("TIMEOUT", f"runtime {data.get('runtime_s')}s > cap {exp['max_runtime_s']}s"))
+        fails.append(
+            (
+                "TIMEOUT",
+                f"runtime {data.get('runtime_s')}s > cap {exp['max_runtime_s']}s",
+            )
+        )
     return _verdict(spec, res, fails, safe_ok=True)
 
 
@@ -442,21 +682,41 @@ def _evaluate_lifecycle(spec, data):
     t, remote = data["task"], data["remote"]
     res = {**_empty_metrics(), "final_status": t["status"]}
     ev_types = [ty for (ty, _) in data["events"]]
-    tools = [e for (ty, e) in [ (ty, json_load(d)) for (ty, d) in data["events"]] if ty == "TOOL_CALL"]
+    tools = [
+        e
+        for (ty, e) in [(ty, json_load(d)) for (ty, d) in data["events"]]
+        if ty == "TOOL_CALL"
+    ]
     res["tool_calls"] = len(tools)
-    res["duplicate_calls_blocked"] = sum(1 for e in tools if e.get("blocked") or e.get("cached"))
+    res["duplicate_calls_blocked"] = sum(
+        1 for e in tools if e.get("blocked") or e.get("cached")
+    )
     res["failed_tool_calls"] = sum(1 for e in tools if not e.get("ok", True))
     res["command_count"] = sum(1 for e in tools if e["tool"] == "run_command")
-    res["validation_attempts"] = sum(1 for ty in ev_types if ty in ("VALIDATION_STARTED", "VALIDATION_FAILED"))
+    res["validation_attempts"] = sum(
+        1 for ty in ev_types if ty in ("VALIDATION_STARTED", "VALIDATION_FAILED")
+    )
     res["repair_rounds"] = sum(1 for ty in ev_types if ty == "VALIDATION_FAILED")
-    res["files_read"] = sorted({e["args"].get("path", "") for e in tools
-                                if e["tool"] == "read_file" and e["args"].get("path")})
-    res["files_changed"] = sorted({e["args"].get("path", "") for e in tools
-                                   if e["tool"] in ("write_file", "edit_file")})
+    res["files_read"] = sorted(
+        {
+            e["args"].get("path", "")
+            for e in tools
+            if e["tool"] == "read_file" and e["args"].get("path")
+        }
+    )
+    res["files_changed"] = sorted(
+        {
+            e["args"].get("path", "")
+            for e in tools
+            if e["tool"] in ("write_file", "edit_file")
+        }
+    )
     res["agent_steps"] = res["tool_calls"]  # 1:1 in scripted runs
     fails = []
     if t["status"] != exp.get("status", "COMPLETED"):
-        fails.append(("LIFECYCLE_FAILURE", f"status {t['status']} != {exp.get('status')}"))
+        fails.append(
+            ("LIFECYCLE_FAILURE", f"status {t['status']} != {exp.get('status')}")
+        )
         return _verdict(spec, res, fails, safe_ok=bool(exp.get("safe")))
     if exp.get("diff_paths") is not None and t["branch"]:
         scope = _branch_diff_files(remote, t["branch"])
@@ -467,7 +727,12 @@ def _evaluate_lifecycle(spec, data):
             if extra:
                 fails.append(("WRONG_FILE", f"out-of-scope files: {sorted(extra)}"))
             if set(exp["diff_paths"]) - set(scope):
-                fails.append(("BAD_EDIT", f"expected files untouched: {sorted(set(exp['diff_paths']) - set(scope))}"))
+                fails.append(
+                    (
+                        "BAD_EDIT",
+                        f"expected files untouched: {sorted(set(exp['diff_paths']) - set(scope))}",
+                    )
+                )
     if not exp.get("diff_paths") and t["branch"]:
         fails.append(("OTHER", "branch created but no diff expected"))
     validate_cmd = exp.get("validate", "python -m pytest tests/ -q")
@@ -480,27 +745,46 @@ def _evaluate_lifecycle(spec, data):
     if "single_pr" in exp and data.get("phase1"):
         creates = data.get("gh_creates", 0)
         if creates != 1:
-            fails.append(("LIFECYCLE_FAILURE", f"{creates} PRs created, want exactly 1"))
+            fails.append(
+                ("LIFECYCLE_FAILURE", f"{creates} PRs created, want exactly 1")
+            )
     if data.get("repair_rounds"):
         res["repair_rounds"] = data["repair_rounds"]
     return _verdict(spec, res, fails, safe_ok=bool(exp.get("safe")))
 
 
 def _branch_diff_files(remote, branch):
-    r = subprocess.run(["git", "ls-remote", remote, branch], capture_output=True, text=True, timeout=30)
+    r = subprocess.run(
+        ["git", "ls-remote", remote, branch], capture_output=True, text=True, timeout=30
+    )
     if branch not in r.stdout:
         return None
     tmp = tempfile.mkdtemp(prefix="verify-")
     try:
-        subprocess.run(["git", "clone", "--quiet", remote, tmp + "/c"], capture_output=True, timeout=60)
-        subprocess.run(["git", "-C", tmp + "/c", "checkout", "--quiet", branch],
-                       capture_output=True, timeout=30)
-        base = subprocess.run(["git", "-C", tmp + "/c", "merge-base", branch, "main"],
-                              capture_output=True, text=True, timeout=30).stdout.strip()
+        subprocess.run(
+            ["git", "clone", "--quiet", remote, tmp + "/c"],
+            capture_output=True,
+            timeout=60,
+        )
+        subprocess.run(
+            ["git", "-C", tmp + "/c", "checkout", "--quiet", branch],
+            capture_output=True,
+            timeout=30,
+        )
+        base = subprocess.run(
+            ["git", "-C", tmp + "/c", "merge-base", branch, "main"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout.strip()
         if not base:
             base = "main"
-        d = subprocess.run(["git", "-C", tmp + "/c", "diff", "--name-only", f"{base}..{branch}"],
-                           capture_output=True, text=True, timeout=30)
+        d = subprocess.run(
+            ["git", "-C", tmp + "/c", "diff", "--name-only", f"{base}..{branch}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
         return [ln.strip().strip('"') for ln in d.stdout.splitlines() if ln.strip()]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -508,13 +792,18 @@ def _branch_diff_files(remote, branch):
 
 def _run_validation(remote, branch, cmd):
     if cmd.startswith("python ") or cmd == "python":
-        cmd = f'"{sys.executable}"' + cmd[len("python"):]
+        cmd = f'"{sys.executable}"' + cmd[len("python") :]
     tmp = tempfile.mkdtemp(prefix="val-")
     try:
         c = os.path.join(tmp, "c")
-        subprocess.run(["git", "clone", "--quiet", "--branch", branch, remote, c],
-                       capture_output=True, timeout=120)
-        r = subprocess.run(cmd, cwd=c, shell=True, capture_output=True, text=True, timeout=300)
+        subprocess.run(
+            ["git", "clone", "--quiet", "--branch", branch, remote, c],
+            capture_output=True,
+            timeout=120,
+        )
+        r = subprocess.run(
+            cmd, cwd=c, shell=True, capture_output=True, text=True, timeout=300
+        )
         return r.returncode == 0, (r.stdout + r.stderr)[-2000:]
     except Exception as exc:
         return False, f"validation harness error: {exc}"[:500]
@@ -529,13 +818,18 @@ def _verdict(spec, res, fails, safe_ok):
         category = "EXPECTED_SAFE_FAILURE" if spec.get("expect", {}).get("safe") else ""
         return {**res, "result": "PASS", "failure_category": category}
     primary = sorted(fails)[0]
-    return {**res, "result": "FAIL", "failure_category": primary[0],
-            "evidence": primary[1][:400]}
+    return {
+        **res,
+        "result": "FAIL",
+        "failure_category": primary[0],
+        "evidence": primary[1][:400],
+    }
 
 
 # --------------------------------------------------------------------------
 # summary + report
 # --------------------------------------------------------------------------
+
 
 def _bucket(r):
     sid = r["scenario_id"]
@@ -587,41 +881,73 @@ def summarize(results):
         "average_repair_rounds": avg("repair_rounds"),
         "average_runtime_s": avg("runtime_s"),
         "average_files_read": round(
-            sum(len(r["files_read"]) for r in ran) / len(ran), 1) if ran else 0.0,
+            sum(len(r["files_read"]) for r in ran) / len(ran), 1
+        )
+        if ran
+        else 0.0,
         "average_files_changed": round(
-            sum(len(r["files_changed"]) for r in ran) / len(ran), 1) if ran else 0.0,
+            sum(len(r["files_changed"]) for r in ran) / len(ran), 1
+        )
+        if ran
+        else 0.0,
         "failure_breakdown": by_cat,
     }
 
 
 def render_report(summary, results):
-    lines = ["FixHub Agent Benchmark", "======================", "",
-             f"Scenarios: {summary['total_scenarios']} (ran {summary['ran']}, "
-             f"skipped {summary['skipped']})", "",
-             f"Bug-fix success: {summary['bug_fix_success']}",
-             f"Safe failures: {summary['safe_failures']}",
-             f"Reliability probes: {summary['reliability_probes']}",
-             f"Unexpected failures: {summary['unexpected_failures']}", "",
-             f"Success rate: {summary['bug_fix_rate'] * 100:.0f}%", "",
-             f"Average steps: {summary['average_steps']}",
-             f"Median steps: {summary['median_steps']}",
-             f"Average tool calls: {summary['average_tool_calls']}",
-             f"Blocked duplicate calls: {sum(r['duplicate_calls_blocked'] for r in results)}",
-             f"Average repair rounds: {summary['average_repair_rounds']}",
-             f"Average runtime: {summary['average_runtime_s']}s", "",
-             "Failure breakdown:"]
-    cats = ["WRONG_DIAGNOSIS", "WRONG_FILE", "BAD_EDIT", "TEST_FAILURE",
-            "VALIDATION_FAILURE", "TOOL_FAILURE", "PATH_FAILURE", "COMMAND_FAILURE",
-            "LOOPING", "TIMEOUT", "MEMORY_FAILURE", "LIFECYCLE_FAILURE",
-            "SANDBOX_FAILURE", "OTHER", "EXPECTED_SAFE_FAILURE"]
+    lines = [
+        "FixHub Agent Benchmark",
+        "======================",
+        "",
+        f"Scenarios: {summary['total_scenarios']} (ran {summary['ran']}, "
+        f"skipped {summary['skipped']})",
+        "",
+        f"Bug-fix success: {summary['bug_fix_success']}",
+        f"Safe failures: {summary['safe_failures']}",
+        f"Reliability probes: {summary['reliability_probes']}",
+        f"Unexpected failures: {summary['unexpected_failures']}",
+        "",
+        f"Success rate: {summary['bug_fix_rate'] * 100:.0f}%",
+        "",
+        f"Average steps: {summary['average_steps']}",
+        f"Median steps: {summary['median_steps']}",
+        f"Average tool calls: {summary['average_tool_calls']}",
+        f"Blocked duplicate calls: {sum(r['duplicate_calls_blocked'] for r in results)}",
+        f"Average repair rounds: {summary['average_repair_rounds']}",
+        f"Average runtime: {summary['average_runtime_s']}s",
+        "",
+        "Failure breakdown:",
+    ]
+    cats = [
+        "WRONG_DIAGNOSIS",
+        "WRONG_FILE",
+        "BAD_EDIT",
+        "TEST_FAILURE",
+        "VALIDATION_FAILURE",
+        "TOOL_FAILURE",
+        "PATH_FAILURE",
+        "COMMAND_FAILURE",
+        "LOOPING",
+        "TIMEOUT",
+        "MEMORY_FAILURE",
+        "LIFECYCLE_FAILURE",
+        "SANDBOX_FAILURE",
+        "OTHER",
+        "EXPECTED_SAFE_FAILURE",
+    ]
     for c in cats:
         lines.append(f"{c}: {summary['failure_breakdown'].get(c, 0)}")
-    lines += ["", "Per-scenario:",
-              f"{'ID':22s} {'Result':6s} {'Steps':5s} {'Tools':5s} {'Repairs':7s} {'Runtime':7s} Failure"]
+    lines += [
+        "",
+        "Per-scenario:",
+        f"{'ID':22s} {'Result':6s} {'Steps':5s} {'Tools':5s} {'Repairs':7s} {'Runtime':7s} Failure",
+    ]
     for r in results:
-        lines.append(f"{r['scenario_id']:22s} {r['result']:6s} {r['agent_steps']:<5d} "
-                     f"{r['tool_calls']:<5d} {r['repair_rounds']:<7d} "
-                     f"{r['runtime_s']:<7.0f} {r['failure_category'] or '-'}")
+        lines.append(
+            f"{r['scenario_id']:22s} {r['result']:6s} {r['agent_steps']:<5d} "
+            f"{r['tool_calls']:<5d} {r['repair_rounds']:<7d} "
+            f"{r['runtime_s']:<7.0f} {r['failure_category'] or '-'}"
+        )
     return "\n".join(lines) + "\n"
 
 

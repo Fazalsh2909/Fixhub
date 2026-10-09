@@ -17,4 +17,37 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run tests
         working-directory: backend
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests/ -q --ignore=tests/test_sandbox_firecracker.py
+      - name: Sandbox unit tests (no KVM)
+        working-directory: backend
+        run: python -m pytest tests/test_sandbox_backend.py -q
+
+  # Phase 5 M6: REAL microVM security gate. Self-hosted Linux/KVM runner with
+  # Firecracker binaries + kernel/rootfs + nft. Missing prerequisites MUST fail
+  # (never skip, never mock). Runs the 14 real-VM probes.
+  firecracker-kvm:
+    runs-on: [self-hosted, kvm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y git ripgrep iproute2 nftables acl e2fsprogs
+      - name: Verify KVM + artifacts (fail closed)
+        run: |
+          test -r /dev/kvm && test -w /dev/kvm || { echo "FAIL: /dev/kvm not usable"; exit 1; }
+          test -x /usr/local/bin/firecracker || { echo "FAIL: firecracker binary missing"; exit 1; }
+          test -x /usr/local/bin/jailer || { echo "FAIL: jailer binary missing"; exit 1; }
+          test -s /srv/firecracker/kernel/vmlinux || { echo "FAIL: guest kernel missing"; exit 1; }
+          test -s /srv/firecracker/rootfs/base.ext4 || { echo "FAIL: guest rootfs missing"; exit 1; }
+      - name: Install backend deps
+        working-directory: backend
+        run: pip install -r requirements.txt
+      - name: Real-VM security suite (no mocks)
+        working-directory: backend
+        env:
+          FIXHUB_FIRECRACKER_TEST: "1"
+          FC_REQUIRE_KVM: "1"
+          SANDBOX_BACKEND: firecracker
+        run: python -m pytest tests/test_sandbox_firecracker.py -q

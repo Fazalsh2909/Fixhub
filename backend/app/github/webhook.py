@@ -3,6 +3,7 @@
 Events: issues.opened/reopened (+ optional `fixhub-fix` label gate),
 workflow_run.completed/failed, check_run.completed/failure.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -101,39 +102,56 @@ def build_ci_context(*, event_type: str, payload: dict, repo_name: str) -> dict:
     annotations, changed_files, url. Missing pieces stay "".
     """
     ctx: dict = {
-        "provider": "github", "workflow_name": "", "workflow_file": "",
-        "workflow_content": "", "run_id": "", "commit_sha": "", "branch": "",
-        "job": "", "step": "", "exit_code": "", "failure_logs": "",
-        "annotations": "", "changed_files": "", "url": "",
+        "provider": "github",
+        "workflow_name": "",
+        "workflow_file": "",
+        "workflow_content": "",
+        "run_id": "",
+        "commit_sha": "",
+        "branch": "",
+        "job": "",
+        "step": "",
+        "exit_code": "",
+        "failure_logs": "",
+        "annotations": "",
+        "changed_files": "",
+        "url": "",
     }
     try:
         token = _repo_token(repo_name)
         if event_type == "workflow_run":
             run = payload.get("workflow_run", {})
-            ctx.update({
-                "workflow_name": run.get("name", ""),
-                "workflow_file": run.get("path", ""),
-                "run_id": str(run.get("id", "")),
-                "commit_sha": run.get("head_sha", ""),
-                "branch": run.get("head_branch", ""),
-                "job": run.get("name", ""),
-                "url": run.get("html_url", ""),
-            })
+            ctx.update(
+                {
+                    "workflow_name": run.get("name", ""),
+                    "workflow_file": run.get("path", ""),
+                    "run_id": str(run.get("id", "")),
+                    "commit_sha": run.get("head_sha", ""),
+                    "branch": run.get("head_branch", ""),
+                    "job": run.get("name", ""),
+                    "url": run.get("html_url", ""),
+                }
+            )
             if token:
                 try:
                     steps = _gh_steps(token, repo_name, ctx["run_id"])
                     if steps:
                         ctx["job"] = steps[0]["job"]
                         ctx["step"] = "; ".join(
-                            f"{s['step']} ({s['conclusion']})" for s in steps[:4])
+                            f"{s['step']} ({s['conclusion']})" for s in steps[:4]
+                        )
                 except Exception:
                     pass
                 if ctx["workflow_file"]:
                     try:
                         from app.github import client as _ghc
+
                         ctx["workflow_content"] = _ghc.get_workflow_content(
-                            token=token, full_name=repo_name,
-                            path=ctx["workflow_file"], ref=ctx["commit_sha"])[:6000]
+                            token=token,
+                            full_name=repo_name,
+                            path=ctx["workflow_file"],
+                            ref=ctx["commit_sha"],
+                        )[:6000]
                     except Exception:
                         pass
                 pr_files = _pr_files_for_run(payload, token, repo_name)
@@ -142,13 +160,15 @@ def build_ci_context(*, event_type: str, payload: dict, repo_name: str) -> dict:
         elif event_type == "check_run":
             run = payload.get("check_run", {})
             suite = run.get("check_suite") or {}
-            ctx.update({
-                "run_id": _run_id_from_url(run.get("html_url", "")),
-                "commit_sha": run.get("head_sha", ""),
-                "branch": suite.get("head_branch", ""),
-                "job": run.get("name", ""),
-                "url": run.get("html_url", ""),
-            })
+            ctx.update(
+                {
+                    "run_id": _run_id_from_url(run.get("html_url", "")),
+                    "commit_sha": run.get("head_sha", ""),
+                    "branch": suite.get("head_branch", ""),
+                    "job": run.get("name", ""),
+                    "url": run.get("html_url", ""),
+                }
+            )
             output = run.get("output") or {}
             title = str(output.get("title") or "")
             summary = str(output.get("summary") or "")[:1500]
@@ -157,20 +177,26 @@ def build_ci_context(*, event_type: str, payload: dict, repo_name: str) -> dict:
             if token and run.get("id") is not None:
                 try:
                     from app.github import client as _ghc
+
                     anns = _ghc.check_annotations(
-                        token=token, full_name=repo_name, check_run_id=run.get("id"))
+                        token=token, full_name=repo_name, check_run_id=run.get("id")
+                    )
                     if anns:
                         ctx["annotations"] = "; ".join(
                             f"{a['path']}:{a['line'] or '?'} [{a['level']}] "
-                            f"{a['message'][:200]}" for a in anns[:5])[:2000]
+                            f"{a['message'][:200]}"
+                            for a in anns[:5]
+                        )[:2000]
                 except Exception:
                     pass
             prs = run.get("pull_requests") or []
             if token and prs and prs[0].get("number"):
                 try:
                     from app.github import client as _ghc
-                    files = _ghc.pull_files(token=token, full_name=repo_name,
-                                            number=prs[0]["number"])
+
+                    files = _ghc.pull_files(
+                        token=token, full_name=repo_name, number=prs[0]["number"]
+                    )
                     ctx["changed_files"] = ", ".join(files[:20])
                 except Exception:
                     pass
@@ -195,7 +221,9 @@ def _pr_files_for_run(payload: dict, token: str, repo_name: str) -> list[str]:
         prs = run.get("pull_requests") or []
         if not prs or not prs[0].get("number"):
             return []
-        return _ghc.pull_files(token=token, full_name=repo_name, number=prs[0]["number"])
+        return _ghc.pull_files(
+            token=token, full_name=repo_name, number=prs[0]["number"]
+        )
     except Exception:
         return []
 
@@ -216,7 +244,12 @@ def _maybe_enqueue(db: Session, task_id: int) -> dict:
         if out.get("enqueued"):
             _event(db, task_id, "QUEUED", {"job": out.get("job_id", "")})
         else:
-            _event(db, task_id, "QUEUE_FAILED", {"error": out.get("error", "unavailable")[:300]})
+            _event(
+                db,
+                task_id,
+                "QUEUE_FAILED",
+                {"error": out.get("error", "unavailable")[:300]},
+            )
         db.commit()
     except Exception:
         pass
@@ -224,18 +257,18 @@ def _maybe_enqueue(db: Session, task_id: int) -> dict:
 
 
 def _active_ci_task(db: Session, *, repo_name: str, sha: str, job: str) -> Task | None:
-    """An already-RUNNING CI task for the same repo+sha+job.
+    """An already-live CI task for the same repo+sha+job.
 
-    Statuses flip to terminal only when a run ends, so RUNNING also covers
-    queued-not-started jobs. Creating another task for the same failure would
-    just burn a second full agent run for the same fix.
+    Covers QUEUED (not yet claimed), RUNNING, and AWAITING_CI (repair window):
+    creating another task for the same failure would just burn a second full
+    agent run for the same fix.
     """
     if not sha:
         return None
     q = db.query(Task).filter(
         Task.repository == repo_name,
         Task.trigger_type == "ci",
-        Task.status == "RUNNING",
+        Task.status.in_(["QUEUED", "RUNNING", "AWAITING_CI"]),
         Task.ci_sha == sha,
     )
     if job:
@@ -243,7 +276,28 @@ def _active_ci_task(db: Session, *, repo_name: str, sha: str, job: str) -> Task 
     return q.order_by(Task.id.desc()).first()
 
 
-def _get_or_create_repo(db: Session, full_name: str, default_branch: str = "main") -> Repository:
+def _active_issue_task(
+    db: Session, *, repo_name: str, number: int | None
+) -> Task | None:
+    """Phase 4: an already-live task for the same repo+issue (issue dedupe)."""
+    if not number:
+        return None
+    return (
+        db.query(Task)
+        .filter(
+            Task.repository == repo_name,
+            Task.trigger_type == "issue",
+            Task.issue_number == number,
+            Task.status.in_(["QUEUED", "RUNNING", "AWAITING_CI", "NEEDS_REVIEW"]),
+        )
+        .order_by(Task.id.desc())
+        .first()
+    )
+
+
+def _get_or_create_repo(
+    db: Session, full_name: str, default_branch: str = "main"
+) -> Repository:
     repo = db.query(Repository).filter(Repository.github_full_name == full_name).first()
     if not repo:
         repo = Repository(github_full_name=full_name, default_branch=default_branch)
@@ -251,6 +305,38 @@ def _get_or_create_repo(db: Session, full_name: str, default_branch: str = "main
         db.commit()
         db.refresh(repo)
     return repo
+
+
+def _resolve_owner_id(
+    db: Session, *, installation_id: str = "", repo_name: str = ""
+) -> int | None:
+    """Phase 2: derive the owning FixHub user from trusted server-side state.
+
+    Prefers the explicit user->installation mapping (github_connections);
+    falls back to the repository row's owner. Returns None when the
+    installation/repository is not connected to any user — callers must then
+    refuse to create an orphaned task. Never trusts client-supplied user IDs.
+    """
+    from app.db.models import GitHubConnection
+
+    inst = str(installation_id or "").strip()
+    if inst:
+        conn = (
+            db.query(GitHubConnection)
+            .filter(GitHubConnection.installation_id == inst)
+            .first()
+        )
+        if conn:
+            return conn.user_id
+    if repo_name:
+        row = (
+            db.query(Repository)
+            .filter(Repository.github_full_name == repo_name)
+            .first()
+        )
+        if row and row.owner_id is not None:
+            return row.owner_id
+    return None
 
 
 @router.post("/webhooks/github")
@@ -270,10 +356,25 @@ async def github_webhook(
 
     db = SessionLocal()
     try:
-        if db.query(WebhookDelivery).filter(WebhookDelivery.delivery_id == x_github_delivery).first():
+        # Phase 4: durable idempotency. The pre-check is fast-path only; the
+        # UNIQUE constraint is the arbiter — a concurrent twin delivery loses
+        # here with IntegrityError and is reported as duplicate (no 500).
+        if (
+            db.query(WebhookDelivery)
+            .filter(WebhookDelivery.delivery_id == x_github_delivery)
+            .first()
+        ):
             return {"ok": True, "duplicate": True}
         db.add(WebhookDelivery(delivery_id=x_github_delivery))
-        db.commit()
+        try:
+            db.commit()
+        except Exception as exc:
+            from sqlalchemy.exc import IntegrityError
+
+            db.rollback()
+            if isinstance(exc, IntegrityError):
+                return {"ok": True, "duplicate": True}
+            raise
 
         payload = json.loads(body.decode("utf-8") or "{}")
         if x_github_event == "issues":
@@ -299,20 +400,36 @@ def _handle_issue(db: Session, payload: dict) -> dict:
     if not repo_name:
         return {"ok": False, "error": "missing repository"}
     issue = payload.get("issue", {})
-    _get_or_create_repo(db, repo_name)
+    installation_id = str((payload.get("installation") or {}).get("id", ""))
+    owner_id = _resolve_owner_id(
+        db, installation_id=installation_id, repo_name=repo_name
+    )
+    if owner_id is None:
+        # Unconnected installation: fail safe, no orphaned task.
+        return {"ok": True, "ignored": "unconnected_installation"}
+    repo = _get_or_create_repo(db, repo_name)
+    if repo.owner_id is None:
+        repo.owner_id = owner_id
+        db.commit()
+    dup = _active_issue_task(db, repo_name=repo_name, number=issue.get("number"))
+    if dup is not None:
+        return {"ok": True, "task_id": dup.id, "duplicate": "active_task"}
     task = Task(
         repository=repo_name,
+        owner_id=owner_id,
         trigger_type="issue",
         issue_number=issue.get("number"),
         issue_title=issue.get("title", "")[:500],
         issue_body=(issue.get("body") or "")[:8000],
         issue_url=issue.get("html_url", ""),
-        status="RUNNING",
+        status="QUEUED",
     )
     db.add(task)
     db.commit()
     db.refresh(task)
-    _event(db, task.id, "TASK_CREATED", {"trigger": "issue", "issue": task.issue_number})
+    _event(
+        db, task.id, "TASK_CREATED", {"trigger": "issue", "issue": task.issue_number}
+    )
     db.commit()
     queue = _maybe_enqueue(db, task.id)
     return {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}
@@ -326,30 +443,52 @@ def _handle_workflow_run(db: Session, payload: dict) -> dict:
     repo_name = payload.get("repository", {}).get("full_name", "")
     if not repo_name:
         return {"ok": False, "error": "missing repository"}
-    _get_or_create_repo(db, repo_name)
-    dup = _active_ci_task(db, repo_name=repo_name, sha=run.get("head_sha", ""),
-                          job=run.get("name", ""))
+    installation_id = str((payload.get("installation") or {}).get("id", ""))
+    owner_id = _resolve_owner_id(
+        db, installation_id=installation_id, repo_name=repo_name
+    )
+    if owner_id is None:
+        return {"ok": True, "ignored": "unconnected_installation"}
+    repo = _get_or_create_repo(db, repo_name)
+    if repo.owner_id is None:
+        repo.owner_id = owner_id
+        db.commit()
+    dup = _active_ci_task(
+        db, repo_name=repo_name, sha=run.get("head_sha", ""), job=run.get("name", "")
+    )
     if dup is not None:
         return {"ok": True, "task_id": dup.id, "duplicate": "active_task"}
     base_excerpt = f"workflow {run.get('name')} failed on {run.get('head_branch')}"
-    logs = _ci_log_excerpt(repo_name=repo_name, run_id=str(run.get("id", "")),
-                           check_name=run.get("name", ""))
+    logs = _ci_log_excerpt(
+        repo_name=repo_name,
+        run_id=str(run.get("id", "")),
+        check_name=run.get("name", ""),
+    )
     task = Task(
         repository=repo_name,
+        owner_id=owner_id,
         trigger_type="ci",
         ci_run_id=str(run.get("id", "")),
         ci_sha=run.get("head_sha", ""),
         ci_workflow=run.get("name", ""),
         ci_url=run.get("html_url", ""),
-        ci_excerpt=(f"{base_excerpt}\n--- failing logs ---\n{logs}" if logs else base_excerpt),
-        status="RUNNING",
+        ci_excerpt=(
+            f"{base_excerpt}\n--- failing logs ---\n{logs}" if logs else base_excerpt
+        ),
+        status="QUEUED",
     )
     db.add(task)
     db.commit()
     db.refresh(task)
     _event(db, task.id, "TASK_CREATED", {"trigger": "ci", "run": task.ci_run_id})
-    _event(db, task.id, "CI_CONTEXT_LOADED",
-           build_ci_context(event_type="workflow_run", payload=payload, repo_name=repo_name))
+    _event(
+        db,
+        task.id,
+        "CI_CONTEXT_LOADED",
+        build_ci_context(
+            event_type="workflow_run", payload=payload, repo_name=repo_name
+        ),
+    )
     db.commit()
     queue = _maybe_enqueue(db, task.id)
     return {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}
@@ -364,30 +503,49 @@ def _handle_check_run(db: Session, payload: dict) -> dict:
     repo_name = payload.get("repository", {}).get("full_name", "")
     if not repo_name:
         return {"ok": False, "error": "missing repository"}
-    _get_or_create_repo(db, repo_name)
-    dup = _active_ci_task(db, repo_name=repo_name, sha=run.get("head_sha", ""),
-                          job=run.get("name", ""))
+    installation_id = str((payload.get("installation") or {}).get("id", ""))
+    owner_id = _resolve_owner_id(
+        db, installation_id=installation_id, repo_name=repo_name
+    )
+    if owner_id is None:
+        return {"ok": True, "ignored": "unconnected_installation"}
+    repo = _get_or_create_repo(db, repo_name)
+    if repo.owner_id is None:
+        repo.owner_id = owner_id
+        db.commit()
+    dup = _active_ci_task(
+        db, repo_name=repo_name, sha=run.get("head_sha", ""), job=run.get("name", "")
+    )
     if dup is not None:
         return {"ok": True, "task_id": dup.id, "duplicate": "active_task"}
     base_excerpt = f"check {run.get('name')} failed"
-    logs = _ci_log_excerpt(repo_name=repo_name,
-                           run_id=_run_id_from_url(run.get("html_url", "")),
-                           check_name=run.get("name", ""))
+    logs = _ci_log_excerpt(
+        repo_name=repo_name,
+        run_id=_run_id_from_url(run.get("html_url", "")),
+        check_name=run.get("name", ""),
+    )
     task = Task(
         repository=repo_name,
+        owner_id=owner_id,
         trigger_type="ci",
         ci_sha=run.get("head_sha", ""),
         ci_job=run.get("name", ""),
         ci_url=run.get("html_url", ""),
-        ci_excerpt=(f"{base_excerpt}\n--- failing logs ---\n{logs}" if logs else base_excerpt),
-        status="RUNNING",
+        ci_excerpt=(
+            f"{base_excerpt}\n--- failing logs ---\n{logs}" if logs else base_excerpt
+        ),
+        status="QUEUED",
     )
     db.add(task)
     db.commit()
     db.refresh(task)
     _event(db, task.id, "TASK_CREATED", {"trigger": "ci-check"})
-    _event(db, task.id, "CI_CONTEXT_LOADED",
-           build_ci_context(event_type="check_run", payload=payload, repo_name=repo_name))
+    _event(
+        db,
+        task.id,
+        "CI_CONTEXT_LOADED",
+        build_ci_context(event_type="check_run", payload=payload, repo_name=repo_name),
+    )
     db.commit()
     queue = _maybe_enqueue(db, task.id)
     return {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}

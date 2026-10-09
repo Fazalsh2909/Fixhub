@@ -342,7 +342,9 @@ def test_m_ci_failure_same_task_repair(db, monkeypatch):
     from app.db.models import Task as _T
 
     row = db.query(_T).filter(_T.id == t.id).first()
-    assert row.status == "RUNNING" and row.ci_attempt_count == 1
+    # Phase 4: repair re-enters through QUEUED + atomic claim (worker moves it
+    # to RUNNING); the repair job is enqueued exactly once, same task/PR.
+    assert row.status == "QUEUED" and row.ci_attempt_count == 1
 
 
 def test_n_max_three_attempts(db, monkeypatch):

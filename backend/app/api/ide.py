@@ -22,11 +22,12 @@ import json
 import os
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.db.models import Task, TaskEvent
+from app.api.deps import get_current_user, require_csrf
+from app.db.models import Task, TaskEvent, User
 from app.repo import workspace as _ws
 
 router = APIRouter()
@@ -49,8 +50,16 @@ def _db():
         db.close()
 
 
-def _task_or_404(db: Session, task_id: int) -> Task:
-    t = db.query(Task).filter(Task.id == task_id).first()
+def _task_or_404(db: Session, task_id: int, user: User | None = None) -> Task:
+    """Task lookup scoped to the authenticated user (Phase 2).
+
+    Unknown IDs and other users' tasks both 404 (no existence leak).
+    Callers without a user (none remain in production) get the legacy lookup.
+    """
+    q = db.query(Task).filter(Task.id == task_id)
+    if user is not None:
+        q = q.filter(Task.owner_id == user.id)
+    t = q.first()
     if not t:
         raise HTTPException(status_code=404, detail="task not found")
     return t
@@ -82,8 +91,10 @@ def _event(db: Session, task_id: int, type_: str, data: dict) -> None:
 
 
 @router.get("/api/tasks/{task_id}/files")
-def list_files(task_id: int, path: str = Query(default="."), db: Session = Depends(_db)) -> dict:
-    t = _task_or_404(db, task_id)
+def list_files(task_id: int, path: str = Query(default="."),
+               user: User = Depends(get_current_user),
+               db: Session = Depends(_db)) -> dict:
+    t = _task_or_404(db, task_id, user)
     ws = _workspace_or_410(t)
     full = _resolve(ws, path)
     if not os.path.isdir(full):
@@ -112,13 +123,14 @@ def read_file(
     path: str = Query(default=""),
     offset: int = Query(default=1, ge=1),
     limit: int = Query(default=500, ge=1, le=2000),
+    user: User = Depends(get_current_user),
     db: Session = Depends(_db),
 ) -> dict:
     if not path:
         raise HTTPException(status_code=400, detail="path is required")
     if _is_sensitive(path):
         raise HTTPException(status_code=403, detail="access to sensitive file is blocked")
-    t = _task_or_404(db, task_id)
+    t = _task_or_404(db, task_id, user)
     ws = _workspace_or_410(t)
     full = _resolve(ws, path)
     if not os.path.isfile(full):
@@ -143,7 +155,10 @@ def read_file(
 
 
 @router.put("/api/tasks/{task_id}/file")
-def save_file(task_id: int, payload: dict, db: Session = Depends(_db)) -> dict:
+def save_file(task_id: int, payload: dict, request: Request,
+              user: User = Depends(get_current_user),
+              db: Session = Depends(_db)) -> dict:
+    require_csrf(request)
     path = str(payload.get("path", ""))
     content = payload.get("content", "")
     if not path:
@@ -154,7 +169,7 @@ def save_file(task_id: int, payload: dict, db: Session = Depends(_db)) -> dict:
         raise HTTPException(status_code=403, detail="writing to sensitive file is blocked")
     if len(content) > 500_000:
         raise HTTPException(status_code=413, detail="file too large (500KB max via UI)")
-    t = _task_or_404(db, task_id)
+    t = _task_or_404(db, task_id, user)
     ws = _workspace_or_410(t)
     full = _resolve(ws, path)
     try:
@@ -169,12 +184,13 @@ def save_file(task_id: int, payload: dict, db: Session = Depends(_db)) -> dict:
 
 
 @router.get("/api/tasks/{task_id}/diff")
-def task_diff(task_id: int, db: Session = Depends(_db)) -> dict:
+def task_diff(task_id: int, user: User = Depends(get_current_user),
+              db: Session = Depends(_db)) -> dict:
     import subprocess as _sp
 
     from app.github import publisher as _pub
 
-    t = _task_or_404(db, task_id)
+    t = _task_or_404(db, task_id, user)
     ws = _workspace_or_410(t)
     try:
         files = _pub.changed_files(ws)
@@ -203,9 +219,10 @@ def task_events(
     task_id: int,
     after: int = Query(default=0, ge=0),
     limit: int = Query(default=200, ge=1, le=500),
+    user: User = Depends(get_current_user),
     db: Session = Depends(_db),
 ) -> dict:
-    _task_or_404(db, task_id)
+    _task_or_404(db, task_id, user)
     rows = (
         db.query(TaskEvent)
         .filter(TaskEvent.task_id == task_id, TaskEvent.id > after)
@@ -221,17 +238,23 @@ def task_events(
 
 
 @router.post("/api/tasks/{task_id}/terminal")
-def run_terminal(task_id: int, payload: dict, db: Session = Depends(_db)) -> dict:
+def run_terminal(task_id: int, payload: dict, request: Request,
+                 user: User = Depends(get_current_user),
+                 db: Session = Depends(_db)) -> dict:
     from app.sandbox import sandbox as _sandbox
+    from app.sandbox.backend import run_command as _dispatch
 
+    require_csrf(request)
     command = str(payload.get("command", ""))
     if not command.strip():
         raise HTTPException(status_code=400, detail="command is required")
-    t = _task_or_404(db, task_id)
+    t = _task_or_404(db, task_id, user)
     ws = _workspace_or_410(t)
     try:
-        res = _sandbox.run_command(ws, command)
+        res = _dispatch(ws, command)
     except _sandbox.SandboxBlockedError as exc:
+        raise HTTPException(status_code=403, detail=f"blocked: {exc}")
+    except Exception as exc:
         raise HTTPException(status_code=403, detail=f"blocked: {exc}")
     _event(db, t.id, "COMMAND_RUN", {"tool": "ide_terminal", "command": command[:200],
                                      "exit": res.exit_code})
@@ -242,24 +265,29 @@ def run_terminal(task_id: int, payload: dict, db: Session = Depends(_db)) -> dic
 
 
 @router.post("/api/tasks/{task_id}/chat")
-def post_chat(task_id: int, payload: dict, db: Session = Depends(_db)) -> dict:
+def post_chat(task_id: int, payload: dict, request: Request,
+              user: User = Depends(get_current_user),
+              db: Session = Depends(_db)) -> dict:
+    require_csrf(request)
     message = str(payload.get("message", "")).strip()
     if not message:
         raise HTTPException(status_code=400, detail="message is required")
-    t = _task_or_404(db, task_id)
+    t = _task_or_404(db, task_id, user)
     _event(db, t.id, "CHAT_MSG", {"message": message[:2000]})
     db.commit()
     return {"ok": True}
 
 
 @router.get("/api/tasks/{task_id}/chat/stream")
-def chat_stream(task_id: int, after: int = Query(default=0, ge=0), db: Session = Depends(_db)):
+def chat_stream(task_id: int, after: int = Query(default=0, ge=0),
+                user: User = Depends(get_current_user),
+                db: Session = Depends(_db)):
     """SSE stream of task events (chat + trace). Polls DB for ~60s.
 
     Frontend uses this for live TraceView updates while the worker runs.
     Event format: `data: {json}\n\n`, with `: ping` keepalives.
     """
-    _task_or_404(db, task_id)
+    _task_or_404(db, task_id, user)
 
     def _gen():
         from app.db.database import SessionLocal as _SessionLocal
@@ -293,11 +321,14 @@ def chat_stream(task_id: int, after: int = Query(default=0, ge=0), db: Session =
 
 
 @router.post("/api/tasks/{task_id}/approve")
-def approve(task_id: int, payload: dict | None = None, db: Session = Depends(_db)) -> dict:
+def approve(task_id: int, request: Request, payload: dict | None = None,
+            user: User = Depends(get_current_user),
+            db: Session = Depends(_db)) -> dict:
     """ReviewPanel Approve & Commit: publish pending NEEDS_REVIEW changes."""
     from app.tasks.service import approve_task as _approve
 
-    _task_or_404(db, task_id)
+    require_csrf(request)
+    _task_or_404(db, task_id, user)
     title = str((payload or {}).get("title", ""))
     body = str((payload or {}).get("body", ""))
     # approve_task manages its own session (needs fresh state after agent run).
@@ -308,11 +339,12 @@ def approve(task_id: int, payload: dict | None = None, db: Session = Depends(_db
 
 
 @router.get("/api/tasks/{task_id}/verification")
-def verification(task_id: int, db: Session = Depends(_db)) -> dict:
+def verification(task_id: int, user: User = Depends(get_current_user),
+                 db: Session = Depends(_db)) -> dict:
     """VerificationView: test/verification signals from COMMAND_RUN events + status."""
     import json as _json
 
-    t = _task_or_404(db, task_id)
+    t = _task_or_404(db, task_id, user)
     rows = (
         db.query(TaskEvent)
         .filter(TaskEvent.task_id == task_id)

@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { TaskSummary, Verification } from "../types";
+import { Check, Circle } from "lucide-react";
+import { TaskStatus } from "./ui";
 
 interface Props {
   task: TaskSummary | null;
@@ -32,7 +34,7 @@ export default function ReviewPanel({ task, onChanged, onDiffRefresh }: Props) {
     setMsg("");
     try {
       const r = await api.approve(task.id, title, body);
-      setMsg(`Published ✓ ${r.branch || ""} ${r.pr || ""}`);
+      setMsg(`Published ${r.branch || ""} ${r.pr || ""}`.trim());
       onChanged();
       onDiffRefresh();
     } catch (e) {
@@ -46,7 +48,7 @@ export default function ReviewPanel({ task, onChanged, onDiffRefresh }: Props) {
     setMsg("");
     try {
       const r = await api.runTask(task.id, sync);
-      setMsg(r.queued ? `Queued ✓ job ${r.job_id}` : `Finished: ${r.result?.status || "?"}`);
+      setMsg(r.queued ? `Queued job ${r.job_id}` : `Finished: ${r.result?.status || "?"}`);
       onChanged();
       onDiffRefresh();
     } catch (e) {
@@ -58,18 +60,18 @@ export default function ReviewPanel({ task, onChanged, onDiffRefresh }: Props) {
   return (
     <div className="review">
       <div className="review-status">
-        <span className={`pill ${task.status}`}>{task.status}</span>
+        <TaskStatus status={task.status} />
         {task.pr_url && (
           <a href={task.pr_url} target="_blank" rel="noreferrer">
             Open PR #{task.pr_number}
           </a>
         )}
       </div>
-      {ver && (
-        <ul className="checks">
+      {ver && ver.checks.length > 0 && (
+        <ul className="checks" aria-label="Verification checks">
           {ver.checks.map((c) => (
             <li key={c.name} className={c.passed ? "pass" : "fail"}>
-              {c.passed ? "✓" : "○"} {c.name}
+              {c.passed ? <Check size={14} /> : <Circle size={14} />} {c.name}
             </li>
           ))}
         </ul>

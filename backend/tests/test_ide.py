@@ -8,6 +8,7 @@ from app.db.models import Task, TaskEvent
 from app.llm.client import AssistantMessage, ToolCall
 from app.main import app
 from app.tasks import service as _svc
+from tests.conftest import make_user, session_cookies
 
 
 def _git(path, *args):
@@ -35,8 +36,9 @@ def _fixture_repo(tmp_path):
 
 def _scripted_llm(monkeypatch):
     script = [
-        AssistantMessage("", [ToolCall("1", "read_file", {"path": "calc.py"})]),
-        AssistantMessage("", [ToolCall("2", "edit_file", {"path": "calc.py",
+        AssistantMessage("", [ToolCall("1", "read_file", {"path": "test_calc.py"})]),
+        AssistantMessage("", [ToolCall("2", "read_file", {"path": "calc.py"})]),
+        AssistantMessage("", [ToolCall("3", "edit_file", {"path": "calc.py",
             "old": "return a - b  # BUG", "new": "return a + b"})]),
         AssistantMessage("Fixed add().", []),
     ]
@@ -55,19 +57,26 @@ def _make_review_task(db, tmp_path, monkeypatch):
 
     monkeypatch.setattr(_settings, "WORKSPACE_ROOT", str(tmp_path / "workspaces"))
     remote = _fixture_repo(tmp_path)
+    user = make_user(db, email="ide@example.com")
+    from app.llm import credentials as _creds
+
+    _creds.create_or_update_credential(db, user_id=user.id, provider="openai",
+                                       api_key="TEST_IDE_KEY_12345678", model="gpt-4o-mini")
     db.add(Task(repository="acme/ide", trigger_type="issue", issue_number=5,
-                issue_title="add broken", issue_body="fix me", status="RUNNING"))
+                issue_title="add broken", issue_body="fix me", status="RUNNING",
+                owner_id=user.id))
     db.commit()
     task = db.query(Task).order_by(Task.id.desc()).first()
     _scripted_llm(monkeypatch)
     out = _svc.run_task_inline(task.id, source=remote, auto_publish=False)
     assert out["status"] == "NEEDS_REVIEW", out
     db.expire_all()
-    return db.query(Task).filter(Task.id == task.id).first()
+    t = db.query(Task).filter(Task.id == task.id).first()
+    return t, session_cookies(db, user)
 
 
 def test_review_gate_then_approve(db, tmp_path, monkeypatch):
-    t = _make_review_task(db, tmp_path, monkeypatch)
+    t, _ = _make_review_task(db, tmp_path, monkeypatch)
     assert t.status == "NEEDS_REVIEW"
     assert t.branch == f"fixhub-fixes/issue-5-task-{t.id}"
 
@@ -85,62 +94,64 @@ def test_review_gate_then_approve(db, tmp_path, monkeypatch):
 
 
 def test_ide_files_and_read_and_diff(db, tmp_path, monkeypatch):
-    t = _make_review_task(db, tmp_path, monkeypatch)
+    t, cookies = _make_review_task(db, tmp_path, monkeypatch)
     c = TestClient(app)
-    r = c.get(f"/api/tasks/{t.id}/files", params={"path": "."})
+    r = c.get(f"/api/tasks/{t.id}/files", params={"path": "."}, cookies=cookies)
     assert r.status_code == 200, r.text
     names = [e["name"] for e in r.json()["entries"]]
     assert "calc.py" in names
 
-    r = c.get(f"/api/tasks/{t.id}/file", params={"path": "calc.py"})
+    r = c.get(f"/api/tasks/{t.id}/file", params={"path": "calc.py"}, cookies=cookies)
     assert r.status_code == 200, r.text
     assert "return a + b" in r.json()["content"]
 
-    r = c.get(f"/api/tasks/{t.id}/diff")
+    r = c.get(f"/api/tasks/{t.id}/diff", cookies=cookies)
     assert r.status_code == 200, r.text
     assert "calc.py" in " ".join(r.json()["files"])
 
-    r = c.get(f"/api/tasks/{t.id}/events")
+    r = c.get(f"/api/tasks/{t.id}/events", cookies=cookies)
     assert r.status_code == 200, r.text
     assert any(e["type"] == "NEEDS_REVIEW" for e in r.json()["events"])
 
-    r = c.get(f"/api/tasks/{t.id}/verification")
+    r = c.get(f"/api/tasks/{t.id}/verification", cookies=cookies)
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "NEEDS_REVIEW"
 
 
 def test_ide_save_and_terminal(db, tmp_path, monkeypatch):
-    t = _make_review_task(db, tmp_path, monkeypatch)
+    t, cookies = _make_review_task(db, tmp_path, monkeypatch)
     c = TestClient(app)
-    r = c.put(f"/api/tasks/{t.id}/file", json={"path": "note.txt", "content": "hello ide"})
+    r = c.put(f"/api/tasks/{t.id}/file", json={"path": "note.txt", "content": "hello ide"},
+              cookies=cookies)
     assert r.status_code == 200, r.text
-    r = c.get(f"/api/tasks/{t.id}/file", params={"path": "note.txt"})
+    r = c.get(f"/api/tasks/{t.id}/file", params={"path": "note.txt"}, cookies=cookies)
     assert "hello ide" in r.json()["content"]
 
-    r = c.post(f"/api/tasks/{t.id}/terminal", json={"command": "echo hi"})
+    r = c.post(f"/api/tasks/{t.id}/terminal", json={"command": "echo hi"}, cookies=cookies)
     assert r.status_code == 200, r.text
     assert "hi" in r.json()["stdout"]
 
-    r = c.post(f"/api/tasks/{t.id}/chat", json={"message": "looks good"})
+    r = c.post(f"/api/tasks/{t.id}/chat", json={"message": "looks good"}, cookies=cookies)
     assert r.status_code == 200, r.text
     assert db.query(TaskEvent).filter(TaskEvent.task_id == t.id,
                                       TaskEvent.type == "CHAT_MSG").count() == 1
 
 
 def test_ide_blocks_sensitive_and_escapes(db, tmp_path, monkeypatch):
-    t = _make_review_task(db, tmp_path, monkeypatch)
+    t, cookies = _make_review_task(db, tmp_path, monkeypatch)
     c = TestClient(app)
-    r = c.get(f"/api/tasks/{t.id}/file", params={"path": ".env"})
+    r = c.get(f"/api/tasks/{t.id}/file", params={"path": ".env"}, cookies=cookies)
     assert r.status_code == 403
-    r = c.get(f"/api/tasks/{t.id}/file", params={"path": "../outside.txt"})
+    r = c.get(f"/api/tasks/{t.id}/file", params={"path": "../outside.txt"}, cookies=cookies)
     assert r.status_code == 400
-    r = c.post(f"/api/tasks/{t.id}/terminal", json={"command": "ssh somewhere"})
+    r = c.post(f"/api/tasks/{t.id}/terminal", json={"command": "ssh somewhere"},
+               cookies=cookies)
     assert r.status_code == 403
 
 
 def test_approve_endpoint_publishes(db, tmp_path, monkeypatch):
-    t = _make_review_task(db, tmp_path, monkeypatch)
+    t, cookies = _make_review_task(db, tmp_path, monkeypatch)
     c = TestClient(app)
-    r = c.post(f"/api/tasks/{t.id}/approve", json={})
+    r = c.post(f"/api/tasks/{t.id}/approve", json={}, cookies=cookies)
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "COMPLETED"

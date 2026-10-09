@@ -1,8 +1,15 @@
 """RQ worker entrypoint: python -m app.tasks.worker.
 
 Listens on QUEUE_NAME and runs run_task_job. One worker handles one job at a
-time; scale with `docker compose up --scale worker=N`.
+time; scale with `docker compose up --scale worker=N` (Phase 4: the DB claim
+guard keeps multi-worker execution safe).
+
+Shutdown: RQ stops after the current job on SIGTERM; hung jobs die at
+JOB_TIMEOUT_S via on_failure -> FAILED. A SIGKILLed worker's RUNNING task
+holds a lease (TASK_LEASE_S); the recovery sweep re-queues it on expiry, and
+the next claim reuses the same task branch (never a second branch/PR).
 """
+
 from __future__ import annotations
 
 import logging
@@ -19,14 +26,20 @@ def main() -> None:
 
     conn = Redis.from_url(settings.REDIS_URL)
     conn.ping()
-    # Ensure tables exist on the shared DB (idempotent; backend does the same).
+    # Production schema path first (Alembic); dev/test fall back to create_all.
+    from app.db import migrate as _migrate
     from app.db.database import Base, engine, ensure_columns
 
+    _migrate.upgrade_head()
     Base.metadata.create_all(bind=engine)
     ensure_columns()
     with Connection(conn):
         q = Queue(settings.QUEUE_NAME)
-        log.info("fixhub worker listening on queue=%s redis=%s", q.name, settings.REDIS_URL.split("@")[-1])
+        log.info(
+            "fixhub worker listening on queue=%s redis=%s",
+            q.name,
+            settings.REDIS_URL.split("@")[-1],
+        )
         worker: Worker = SimpleWorker([q]) if settings.ENV == "dev" else Worker([q])
         worker.work()
 

@@ -48,6 +48,11 @@ class TaskContext:
     base_commit: str = ""
     default_branch: str = "main"
     memory_overview: str = ""
+    # Phase 1 skill routing (context + event persistence, no DB migration).
+    # Resolved deterministically from trigger_type: issue -> fix-issues,
+    # ci -> fix-ci-cd. Stored here + SKILL_SELECTED event for auditability.
+    skill: str = ""  # fix-issues | fix-ci-cd
+    skill_instructions: str = ""  # task-specific instructions layered on baseline
 
 
 def build_task_message(ctx: TaskContext) -> str:
@@ -88,9 +93,15 @@ def build_task_message(ctx: TaskContext) -> str:
             ] if line
         )
         wf = f"\nWorkflow content:\n{ci.workflow_content}\n" if ci.workflow_content else ""
-        return f"{head}\n{block}\n{wf}{mem}"
+        base = f"{head}\n{block}\n{wf}{mem}"
+        if ctx.skill_instructions:
+            base += f"\nActive skill ({ctx.skill or 'fix-ci-cd'}):\n{ctx.skill_instructions}\n"
+        return base
     issue = ctx.issue
-    return (
+    base = (
         f"{head}\nIssue #{issue.number}: {issue.title}\n"
         f"Issue body:\n{issue.body}\n\nURL: {issue.url}\n{mem}"
     )
+    if ctx.skill_instructions:
+        base += f"\nActive skill ({ctx.skill or 'fix-issues'}):\n{ctx.skill_instructions}\n"
+    return base

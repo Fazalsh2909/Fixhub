@@ -87,7 +87,7 @@ export default function TraceView({ taskId }: Props) {
       <div className="trace-head">
         <strong>Agent trace</strong>
         <label>
-          <input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} /> live
+          <input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} aria-label="Follow live agent events" /> live
         </label>
       </div>
       <div className="trace-list">

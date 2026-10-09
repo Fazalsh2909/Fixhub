@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import type { FileEntry } from "../types";
+import { File, Folder, RefreshCw } from "lucide-react";
 
 interface Props {
   taskId: number | null;
@@ -54,28 +55,28 @@ export default function DirTree({ taskId, onOpenFile, onExpired }: Props) {
     <div className="dirtree">
       <div className="dirtree-head">
         <span title={path}>{path}</span>
-        <button onClick={() => load(true)} title="Refresh">↻</button>
+        <button onClick={() => load(true)} title="Refresh" aria-label="Refresh directory"><RefreshCw size={14} /></button>
       </div>
-      {error && <div className="err">{error}</div>}
+      {error && <div className="err" role="alert">{error}</div>}
       {up && (
-        <div className="dirtree-row" onClick={() => setPath(up)}>
-          <span>📁 ..</span>
-        </div>
+        <button className="dirtree-row" onClick={() => setPath(up)} aria-label="Go to parent directory">
+          <Folder size={15} /><span>..</span>
+        </button>
       )}
       {entries.map((e) => {
         const full = path === "." ? e.name : `${path}/${e.name}`;
         return (
-          <div
+          <button
             key={full}
             className="dirtree-row"
             onClick={() => (e.is_dir ? setPath(full) : onOpenFile(full))}
             title={full}
+            aria-label={e.is_dir ? `Open folder ${e.name}` : `Open file ${e.name}`}
           >
-            <span>
-              {e.is_dir ? "📁" : "📄"} {e.name}
-            </span>
+            {e.is_dir ? <Folder size={15} /> : <File size={15} />}
+            <span>{e.name}</span>
             {!e.is_dir && e.size > 1024 && <small>{(e.size / 1024).toFixed(1)}k</small>}
-          </div>
+          </button>
         );
       })}
       {entries.length === 0 && !error && <div className="pane-hint">(empty — run the task first)</div>}

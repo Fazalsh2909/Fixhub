@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
+import { File, Folder, RefreshCw } from "lucide-react";
 
 interface Props {
   repo: string;
@@ -48,18 +49,18 @@ export default function RepoExplorer({ repo, gitRef, contextLabel, onOpenFile }:
     <div className="dirtree">
       <div className="dirtree-head">
         <span title={`${repo}@${gitRef || "default"}:${path}`}>{contextLabel} · {path}</span>
-        <button onClick={loadDir} title="Refresh">↻</button>
+        <button onClick={loadDir} title="Refresh" aria-label="Refresh directory"><RefreshCw size={14} /></button>
       </div>
-      {error && <div className="err">{error}</div>}
+      {error && <div className="err" role="alert">{error}</div>}
       {up && (
-        <div className="dirtree-row" onClick={() => setPath(up)}>
-          <span>📁 ..</span>
-        </div>
+        <button className="dirtree-row" onClick={() => setPath(up)} aria-label="Go to parent directory">
+          <Folder size={15} /><span>..</span>
+        </button>
       )}
       {entries.map((e) => {
         const full = path === "." ? e.name : `${path}/${e.name}`;
         return (
-          <div
+          <button
             key={full}
             className="dirtree-row"
             onClick={() => {
@@ -70,12 +71,12 @@ export default function RepoExplorer({ repo, gitRef, contextLabel, onOpenFile }:
               }
             }}
             title={full}
+            aria-label={e.type === "dir" ? `Open folder ${e.name}` : `Open file ${e.name}`}
           >
-            <span>
-              {e.type === "dir" ? "📁" : "📄"} {e.name}
-            </span>
+            {e.type === "dir" ? <Folder size={15} /> : <File size={15} />}
+            <span>{e.name}</span>
             {e.type === "file" && e.size > 1024 && <small>{(e.size / 1024).toFixed(1)}k</small>}
-          </div>
+          </button>
         );
       })}
       {entries.length === 0 && !error && <div className="pane-hint">(empty directory)</div>}

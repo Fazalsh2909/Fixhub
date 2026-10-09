@@ -66,10 +66,11 @@ export default function ChatPanel({ taskId }: Props) {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && send()}
-          placeholder={taskId ? "Add a review note…" : "select a task"}
+          placeholder={taskId ? "Add a review note…" : "Select a task first"}
+          aria-label="Add a review note for the agent"
           disabled={!taskId}
         />
-        <button onClick={send} disabled={!taskId || !input.trim()}>
+        <button onClick={send} disabled={!taskId || !input.trim()} aria-label="Send review note">
           Send
         </button>
       </div>

@@ -19,13 +19,17 @@ def test_nudge_continues_until_write(monkeypatch, tmp_path):
     exec_log: list[str] = []
     _seq(monkeypatch, [
         AssistantMessage("I will now create the test file.", []),
-        AssistantMessage("", [ToolCall("1", "write_file", {"path": "t.py", "content": "x"})]),
+        # Phase 4.5 depth: two distinct evidence pieces before write.
+        AssistantMessage("", [ToolCall("0", "read_file", {"path": "t.py"})]),
+        AssistantMessage("", [ToolCall("1", "search_code", {"pattern": "t"})]),
+        AssistantMessage("", [ToolCall("2", "write_file", {"path": "t.py", "content": "x"})]),
         AssistantMessage("Done, wrote the file.", []),
     ], exec_log)
     out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
                           issue_title="t", issue_body="b")
     assert out.finished is True
-    assert exec_log == ["write_file"]
+    assert "write_file" in exec_log
+    assert exec_log.count("write_file") == 1
     assert any(e.get("tool") == "nudge_no_changes" for e in out.events)
 
 
@@ -74,17 +78,21 @@ def test_thrash_guard_stops_rewrites(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_settings, "LLM_MAX_REWRITES_PER_PATH", 3)
     exec_log: list[str] = []
+    # Phase 4.5 depth: read + search first so the edit is allowed, then thrash guard engages.
     _seq(monkeypatch, [
-        AssistantMessage("", [ToolCall("1", "edit_file", {"path": "a.py", "old": "x", "new": "y"})]),
+        AssistantMessage("", [ToolCall("0", "read_file", {"path": "a.py"})]),
+        AssistantMessage("", [ToolCall("1", "search_code", {"pattern": "a"})]),
+        AssistantMessage("", [ToolCall("2", "edit_file", {"path": "a.py", "old": "x", "new": "y"})]),
     ], exec_log)
     out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
                           issue_title="t", issue_body="b")
     assert out.finished is True
     assert "without converging" in out.summary
-    # Identical rewrite executes once, repeats are cache-redirected, but every
-    # attempt counts: the 4th triggers the guard before executing.
-    assert len(exec_log) == 1
-    assert out.tool_calls == 4
+    # read + search executed + 1 edit executed; identical-edit repeats are
+    # cache-reused (not re-executed) but still count toward the rewrite guard;
+    # the 4th edit attempt (6th tool call overall) triggers the guard.
+    assert exec_log == ["read_file", "search_code", "edit_file"]
+    assert out.tool_calls == 6
 
 
 def test_on_tool_called_live(monkeypatch, tmp_path):
@@ -113,7 +121,10 @@ def test_on_tool_called_live(monkeypatch, tmp_path):
 def test_no_nudge_after_real_write(monkeypatch, tmp_path):
     exec_log: list[str] = []
     _seq(monkeypatch, [
-        AssistantMessage("", [ToolCall("1", "write_file", {"path": "t.py", "content": "x"})]),
+        # Phase 4.5 depth requires two evidence pieces; then a real write suppresses nudges.
+        AssistantMessage("", [ToolCall("0", "read_file", {"path": "t.py"})]),
+        AssistantMessage("", [ToolCall("1", "search_code", {"pattern": "t"})]),
+        AssistantMessage("", [ToolCall("2", "write_file", {"path": "t.py", "content": "x"})]),
         AssistantMessage("Done.", []),
     ], exec_log)
     out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",

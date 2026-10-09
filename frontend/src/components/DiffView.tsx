@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import type { DiffInfo } from "../types";
+import { RefreshCw } from "lucide-react";
 
 interface Props {
   taskId: number | null;
@@ -41,7 +42,7 @@ export default function DiffView({ taskId, refreshKey }: Props) {
   }, [load, refreshKey]);
 
   if (!taskId) return <div className="pane-hint">Diff appears after the agent edits files.</div>;
-  if (error) return <div className="err">{error}<div><button onClick={load}>↻ retry</button></div></div>;
+  if (error) return <div className="err" role="alert">{error}<div><button onClick={load} aria-label="Retry loading diff">Retry</button></div></div>;
   if (!diff) return <div className="pane-hint">Loading diff…</div>;
 
   return (
@@ -54,7 +55,7 @@ export default function DiffView({ taskId, refreshKey }: Props) {
         <span>
           files: <strong>{diff.files.length}</strong>
         </span>
-        <button onClick={load}>↻</button>
+        <button onClick={load} title="Reload diff" aria-label="Reload diff"><RefreshCw size={14} /></button>
       </div>
       {diff.files.length > 0 && <div className="diff-files">{diff.files.join(", ")}</div>}
       <pre className="diff-stat">{diff.stat || "(no stat)"}</pre>

@@ -24,7 +24,33 @@ def _cap(text: str) -> str:
     return text[:cap] + f"\n...[truncated {len(text) - cap} bytes]..."
 
 
+def _use_firecracker() -> bool:
+    try:
+        from app.sandbox.backend import active_backend_name as _active
+
+        return _active() == "firecracker"
+    except Exception:
+        return False
+
+
+def _fc_backend():
+    from app.sandbox.backend import get_backend as _get
+
+    return _get("firecracker")
+
+
 def list_directory(workspace: str, path: str = ".") -> str:
+    if _is_sensitive(path):
+        return "ERROR: access to sensitive path is blocked"
+    try:
+        _resolve(workspace, path)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if _use_firecracker():
+        try:
+            return _fc_backend().list_directory(workspace, path)
+        except Exception as exc:
+            return f"ERROR: blocked: {exc}"
     full = _resolve(workspace, path)
     if not os.path.isdir(full):
         return f"ERROR: not a directory: {path}"
@@ -43,6 +69,24 @@ def list_directory(workspace: str, path: str = ".") -> str:
 def read_file(workspace: str, path: str, offset: int = 1, limit: int = 200) -> str:
     if _is_sensitive(path):
         return "ERROR: access to sensitive file is blocked"
+    try:
+        _resolve(workspace, path)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if _use_firecracker():
+        try:
+            full_text = _fc_backend().read_file(workspace, path)
+        except Exception as exc:
+            return f"ERROR: blocked: {exc}"
+        if full_text.startswith("ERROR"):
+            return full_text
+        lines = full_text.splitlines(keepends=True)
+        total = len(lines)
+        start = max(1, offset)
+        chunk = lines[start - 1 : start - 1 + limit]
+        body = "".join(chunk)
+        header = f"--- {path} lines {start}-{start + len(chunk) - 1} of {total} ---\n"
+        return _cap(header + body)
     full = _resolve(workspace, path)
     if not os.path.isfile(full):
         return f"ERROR: file not found: {path}"
@@ -61,6 +105,20 @@ def read_file(workspace: str, path: str, offset: int = 1, limit: int = 200) -> s
 
 def search_code(workspace: str, pattern: str, include: str = "") -> str:
     """Regex search via `rg` (fallback: grep). Returns path:line snippets, bounded."""
+    if _use_firecracker():
+        # Guest-side search (host never touches guest FS directly).
+        if _is_sensitive(pattern):
+            return "ERROR: access to sensitive file is blocked"
+        try:
+            out = _fc_backend().search_code(workspace, pattern)
+        except Exception as exc:
+            return f"ERROR: blocked: {exc}"
+        lines = []
+        for ln in out.splitlines()[:120]:
+            if _is_sensitive(ln.split(":")[0]):
+                continue
+            lines.append(ln)
+        return _cap("\n".join(lines) or "(no matches)")
     root = os.path.abspath(workspace)
     rg = shutil_which("rg")
     try:
@@ -97,6 +155,15 @@ def shutil_which(name: str) -> str | None:
 def write_file(workspace: str, path: str, content: str) -> str:
     if _is_sensitive(path):
         return "ERROR: writing to sensitive file is blocked"
+    try:
+        _resolve(workspace, path)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if _use_firecracker():
+        try:
+            return _fc_backend().write_file(workspace, path, content)
+        except Exception as exc:
+            return f"ERROR: blocked: {exc}"
     full = _resolve(workspace, path)
     try:
         os.makedirs(os.path.dirname(full) or full, exist_ok=True)
@@ -110,6 +177,27 @@ def write_file(workspace: str, path: str, content: str) -> str:
 def edit_file(workspace: str, path: str, old: str, new: str) -> str:
     if _is_sensitive(path):
         return "ERROR: editing sensitive file is blocked"
+    try:
+        _resolve(workspace, path)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    if _use_firecracker():
+        # Exact-string edit via guest read + guest write (single round trip each).
+        try:
+            fc = _fc_backend()
+            body = fc.read_file(workspace, path)
+        except Exception as exc:
+            return f"ERROR: blocked: {exc}"
+        if body.startswith("ERROR"):
+            return body
+        if old not in body:
+            return "ERROR: oldString not found"
+        if body.count(old) > 1:
+            return "ERROR: oldString matches multiple locations; provide more context"
+        try:
+            return fc.write_file(workspace, path, body.replace(old, new, 1))
+        except Exception as exc:
+            return f"ERROR: blocked: {exc}"
     full = _resolve(workspace, path)
     if not os.path.isfile(full):
         return f"ERROR: file not found: {path}"
@@ -154,10 +242,16 @@ def run_command(workspace: str, command: str, cwd: str = ".") -> str:
 
     No `cd` needed and never `pwd`: pass e.g. cwd="apps/api". Absolute and
     escaping cwds are rejected; the command runs nowhere else.
+    Dispatches to the active sandbox backend (host | firecracker); any backend
+    failure is reported as blocked (never host fallback).
     """
     try:
-        res = _sandbox.run_command(workspace, command, cwd=cwd)
+        from app.sandbox.backend import run_command as _dispatch
+
+        res = _dispatch(workspace, command, cwd=cwd)
     except _sandbox.SandboxBlockedError as exc:
+        return f"ERROR: blocked: {exc}"
+    except Exception as exc:
         return f"ERROR: blocked: {exc}"
     return _format_command_result(res)
 
@@ -180,10 +274,17 @@ def _git_direct(workspace: str, *args: str, cap: int = 8000) -> str:
 
 
 def git_status(workspace: str) -> str:
+    if _use_firecracker():
+        # Git runs INSIDE the guest on the tokenless checkout (read-only).
+        return run_command(workspace, "git status --porcelain=v1 -uall")
     return _git_direct(workspace, "status", "--porcelain=v1", "-uall")
 
 
 def git_diff(workspace: str) -> str:
+    if _use_firecracker():
+        stat = run_command(workspace, "git diff --stat")
+        diff = run_command(workspace, "git diff")
+        return f"{stat}\n{diff}"
     # bounded diff: stat + capped unified diff
     stat = _git_direct(workspace, "diff", "--stat", cap=4000)
     diff = _git_direct(workspace, "diff", cap=16000)

@@ -7,6 +7,12 @@ from fastapi.testclient import TestClient
 from app.db.models import Task
 from app.github import publisher as _pub
 from app.main import app
+from tests.conftest import make_user, session_cookies
+
+
+def _authed(db, email="git@example.com"):
+    u = make_user(db, email=email)
+    return u, session_cookies(db, u)
 
 
 def _git(path, *args):
@@ -160,7 +166,8 @@ def test_installed_repos_merges_connected(db, monkeypatch):
     from app.github import app_auth as _auth
     from app.github import client as _gh
 
-    db.add(Repository(github_full_name="u/connected", installation_id="99"))
+    u, cookies = _authed(db)
+    db.add(Repository(github_full_name="u/connected", installation_id="99", owner_id=u.id))
     db.commit()
     monkeypatch.setattr(_auth, "app_jwt", lambda: "jwt")
     monkeypatch.setattr(_auth, "installation_token", lambda iid: "tok")
@@ -171,7 +178,7 @@ def test_installed_repos_merges_connected(db, monkeypatch):
         {"full_name": "u/newrepo", "private": True, "default_branch": "main"},
     ])
     c = TestClient(app)
-    r = c.get("/api/github/repos")
+    r = c.get("/api/github/repos", cookies=cookies)
     assert r.status_code == 200, r.text
     groups = r.json()
     assert groups[0]["installation_id"] == "99"
@@ -185,23 +192,26 @@ def test_installed_repos_degrades_per_installation(db, monkeypatch):
     from app.github import app_auth as _auth
     from app.github import client as _gh
 
+    _, cookies = _authed(db, email="git2@example.com")
     monkeypatch.setattr(_auth, "app_jwt", lambda: "jwt")
     monkeypatch.setattr(_gh, "list_installations", lambda **k: [
         {"id": "1", "account": "a", "type": "User"}])
     monkeypatch.setattr(_auth, "installation_token",
                         lambda iid: (_ for _ in ()).throw(RuntimeError("nope")))
     c = TestClient(app)
-    r = c.get("/api/github/repos")
+    r = c.get("/api/github/repos", cookies=cookies)
     assert r.status_code == 200 and r.json()[0]["repos"] == []
 
 
 def test_task_detail_api(db):
+    u, cookies = _authed(db, email="git3@example.com")
     db.add(Task(repository="acme/demo", trigger_type="issue", issue_number=3, issue_title="t", status="COMPLETED",
-                branch="fixhub-fixes/issue-3-x", commit_sha="abc", pr_number=9, pr_url="http://pr/9"))
+                branch="fixhub-fixes/issue-3-x", commit_sha="abc", pr_number=9, pr_url="http://pr/9",
+                owner_id=u.id))
     db.commit()
     c = TestClient(app)
-    r = c.get("/api/tasks")
+    r = c.get("/api/tasks", cookies=cookies)
     assert r.status_code == 200 and r.json()[0]["pr_url"] == "http://pr/9"
     tid = r.json()[0]["id"]
-    d = c.get(f"/api/tasks/{tid}")
+    d = c.get(f"/api/tasks/{tid}", cookies=cookies)
     assert d.status_code == 200 and "memory" in d.json() and "events" in d.json()

@@ -35,7 +35,25 @@ _DENY = [
     r">\s*/dev/sd",
 ]
 
-_SCRUB_KEYS = ("LLM_API_KEY", "GITHUB_APP_PRIVATE_KEY", "GITHUB_TOKEN", "GH_TOKEN")
+# Phase 5: scrub the full secret surface from child env (host backend).
+# The Firecracker guest never inherits ANY host env (see firecracker.py);
+# this list is defense-in-depth for the legacy host path only.
+_SCRUB_KEYS = (
+    "LLM_API_KEY",
+    "LLM_BASE_URL",
+    "BYNARA_API_KEY",
+    "XKIRO_API_KEY",
+    "GITHUB_APP_PRIVATE_KEY",
+    "GITHUB_APP_PRIVATE_KEY_PATH",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITHUB_WEBHOOK_SECRET",
+    "FIXHUB_CREDENTIAL_ENCRYPTION_KEY",
+    "FIXHUB_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "AUTH_COOKIE_NAME",
+)
 
 
 @dataclass
@@ -183,3 +201,27 @@ def _cap(text: str) -> str:
     if len(text) <= cap:
         return text
     return text[:cap] + f"\n...[truncated {len(text) - cap} bytes]..."
+
+
+class HostBackend:
+    """Phase 5 M0: `host` backend — the pre-Phase-5 subprocess implementation.
+
+    Preserved byte-for-byte for dev/test. Production must NOT select this
+    backend (enforced by main._enforce_production_guards).
+    """
+
+    name = "host"
+
+    def run_command(
+        self,
+        workspace: str,
+        command: str,
+        timeout_s: int | None = None,
+        cwd: str = ".",
+    ):
+        return run_command(
+            workspace, command, timeout_s=timeout_s, cwd=cwd
+        )
+
+    def destroy(self, workspace: str) -> None:
+        return None

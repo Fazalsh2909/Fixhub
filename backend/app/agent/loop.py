@@ -6,6 +6,7 @@ execution, every result updates state before the next call, and stop
 conditions (solved / caps / repetition threshold / security block / cancel)
 are checked per call, not just per turn.
 """
+
 from __future__ import annotations
 
 import json
@@ -25,8 +26,19 @@ class LoopResult:
     summary: str
     iterations: int
     tool_calls: int = 0
-    events: list[dict] = field(default_factory=list)  # TOOL_CALL metadata for persistence
+    events: list[dict] = field(
+        default_factory=list
+    )  # TOOL_CALL metadata for persistence
     cancelled: bool = False
+    # Final hardening: set when the loop stopped because the task lost its
+    # execution lease. Service maps this to FAILED/lease_lost (never a silent
+    # retry) so a fenced worker never performs further side effects.
+    lease_lost: bool = False
+    # Final hardening: set when a per-user usage limit fired. Service maps
+    # this to FAILED/usage_limit with a USAGE_LIMIT_HIT event; no further
+    # provider calls are made after the limit.
+    usage_limited: bool = False
+    usage_limit_reason: str = ""
 
 
 @dataclass
@@ -71,6 +83,9 @@ def run_agent(
     on_tool=None,
     is_cancelled=None,
     ctx=None,
+    deadline_mono: float | None = None,
+    lease_guard=None,
+    request_guard=None,
 ) -> LoopResult:
     """Run the deterministic observe -> reason -> act -> verify loop.
 
@@ -79,27 +94,65 @@ def run_agent(
     is checked every iteration and before every tool call; on cancel the loop
     stops with ``LoopResult.cancelled=True``. `ctx` (optional TaskContext)
     becomes the authoritative run context; loose kwargs are kept for callers
-    that build it inline.
+    that build it inline. `deadline_mono` (optional monotonic timestamp, Phase
+    4.5) caps this invocation against a task-wide agent budget shared with
+    gate-fix rounds; the tighter of it and LLM_MAX_RUNTIME_S wins.
+    `lease_guard` (optional callable -> bool, final hardening) is verified
+    before every LLM request and after every tool execution; on loss the loop
+    stops with ``LoopResult.lease_lost=True`` so the worker performs no
+    further provider calls or side effects.
+    `request_guard` (optional callable -> str, final hardening) is verified
+    before every LLM request; it returns "" when another provider call is
+    allowed or a non-empty limit reason when the per-user budget is spent.
+    On a limit the loop stops with ``LoopResult.usage_limited=True`` without
+    making the call.
     """
     from app.agent import context as _ctxmod
 
     if ctx is None:
         ctx = _ctxmod.TaskContext(
-            workspace_root=workspace, repository=repository,
-            default_branch=default_branch, trigger_type=trigger_type,
+            workspace_root=workspace,
+            repository=repository,
+            default_branch=default_branch,
+            trigger_type=trigger_type,
             issue=_ctxmod.IssueContext(title=issue_title, body=issue_body),
             memory_overview=memory_overview,
         )
         if trigger_type == "ci":
             ctx.ci = _ctxmod.CIContext(failure_logs=ci_info)
+    # Phase 1: deterministic skill routing layered on the baseline prompt.
+    # Unknown/unsupported triggers fail safely here (loop-level) as well as
+    # service-level; never default to the wrong skill.
+    from app.agent import phase as _phase
+    from app.agent.skills import registry as _skills
+
+    try:
+        _skill = _skills.resolve_skill(ctx.trigger_type or trigger_type)
+    except _skills.UnknownSkill as exc:
+        return LoopResult(
+            False, f"blocked: unknown trigger ({exc})", 0, 0, [], cancelled=False
+        )
+    if not ctx.skill:
+        ctx.skill = _skill.name
+    if not ctx.skill_instructions:
+        try:
+            ctx.skill_instructions = _skills.skill_prompt(_skill)
+        except Exception:
+            ctx.skill_instructions = ""
+    tracker = _phase.InvestigationTracker(skill=ctx.skill or _skill.name)
     workspace = ctx.workspace_root or workspace
     repository = ctx.repository or repository
     state = AgentState(
-        workspace_root=workspace, branch=ctx.branch, base_commit=ctx.base_commit,
+        workspace_root=workspace,
+        branch=ctx.branch,
+        base_commit=ctx.base_commit,
         memory_context=ctx.memory_overview,
     )
     messages = [
-        {"role": "system", "content": _prompt.SYSTEM_PROMPT.format(repository=repository)},
+        {
+            "role": "system",
+            "content": _prompt.SYSTEM_PROMPT.format(repository=repository),
+        },
         {"role": "user", "content": _ctxmod.build_task_message(ctx)},
     ]
     events: list[dict] = []
@@ -126,12 +179,90 @@ def run_agent(
         except Exception:
             return False
 
+    def _lease_ok() -> bool:
+        if lease_guard is None:
+            return True
+        try:
+            return bool(lease_guard())
+        except Exception:
+            return False
+
+    def _lease_lost_result() -> LoopResult:
+        _emit(
+            {
+                "tool": "lease_fence",
+                "args": {"at": "pre_llm_request"},
+                "ok": False,
+                "blocked": True,
+                "fenced": True,
+                "step": tool_calls,
+            }
+        )
+        return LoopResult(
+            False,
+            "lease lost before LLM request; stopping without side effects",
+            iterations,
+            tool_calls,
+            events,
+            lease_lost=True,
+        )
+
     for i in range(settings.LLM_MAX_ITERATIONS):
         iterations = i + 1
         if _cancelled():
-            return LoopResult(False, "cancelled by user", iterations, tool_calls, events, cancelled=True)
-        if time.monotonic() - started > settings.LLM_MAX_RUNTIME_S:
-            return LoopResult(False, "agent stopped: max runtime exceeded", iterations, tool_calls, events)
+            return LoopResult(
+                False,
+                "cancelled by user",
+                iterations,
+                tool_calls,
+                events,
+                cancelled=True,
+            )
+        # Final hardening: verify lease ownership before every LLM request.
+        if not _lease_ok():
+            return _lease_lost_result()
+        # Final hardening: verify per-user usage budget before every LLM
+        # request. The guard returns "" (allowed) or a limit reason.
+        if request_guard is not None:
+            try:
+                _limit_reason = request_guard()
+            except Exception:
+                _limit_reason = ""
+            if _limit_reason:
+                _emit(
+                    {
+                        "tool": "usage_limit",
+                        "args": {"reason": _limit_reason},
+                        "ok": False,
+                        "blocked": True,
+                        "limited": True,
+                        "step": tool_calls,
+                    }
+                )
+                return LoopResult(
+                    False,
+                    f"usage limit reached ({_limit_reason}); stopping without "
+                    "further provider calls",
+                    iterations,
+                    tool_calls,
+                    events,
+                    usage_limited=True,
+                    usage_limit_reason=_limit_reason,
+                )
+        elapsed = time.monotonic() - started
+        cap = settings.LLM_MAX_RUNTIME_S
+        if deadline_mono is not None:
+            cap = min(cap, max(0.0, deadline_mono - time.monotonic()))
+        # NOTE: >= (not >): coarse clocks can return identical readings, and
+        # a zero/negative remaining budget must stop immediately, every time.
+        if elapsed >= cap:
+            return LoopResult(
+                False,
+                "agent stopped: max runtime exceeded",
+                iterations,
+                tool_calls,
+                events,
+            )
         outbound = _window(messages, events)
         assistant = _llm.chat_completion(outbound, tools=_tools.TOOL_SCHEMAS)
         if not assistant.tool_calls:
@@ -140,17 +271,21 @@ def run_agent(
             # instead of doing it. Nudge (bounded) rather than accept.
             if file_changing_calls == 0 and nudges < 2:
                 nudges += 1
-                messages.append({"role": "assistant", "content": assistant.content or ""})
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You have not modified any file yet. The task requires changing "
-                        "the repository (add/fix code or tests) and verifying with a "
-                        "command. Continue working with tool calls now — do not "
-                        "summarize until changes exist, or explain with evidence why "
-                        "no change is needed."
-                    ),
-                })
+                messages.append(
+                    {"role": "assistant", "content": assistant.content or ""}
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "You have not modified any file yet. The task requires changing "
+                            "the repository (add/fix code or tests) and verifying with a "
+                            "command. Continue working with tool calls now — do not "
+                            "summarize until changes exist, or explain with evidence why "
+                            "no change is needed."
+                        ),
+                    }
+                )
                 _emit({"tool": "nudge_no_changes", "args": {"n": nudges}, "ok": True})
                 continue
             summary = (assistant.content or "").strip()[: settings.LLM_MAX_OUTPUT_BYTES]
@@ -176,9 +311,70 @@ def run_agent(
         )
         for tc in assistant.tool_calls:
             if _cancelled():
-                return LoopResult(False, "cancelled by user", iterations, tool_calls, events, cancelled=True)
+                return LoopResult(
+                    False,
+                    "cancelled by user",
+                    iterations,
+                    tool_calls,
+                    events,
+                    cancelled=True,
+                )
             tool_calls += 1
             args = tc.arguments or {}
+            # Phase 1 runtime gating: prohibited camouflage always blocked;
+            # write/edit before sufficient investigation blocked with evidence hint.
+            if tc.name in ("write_file", "edit_file"):
+                _prohibited = _phase.prohibited_reason(tc.name, args)
+                if _prohibited:
+                    _msg = _phase.prohibited_error(_prohibited)
+                    _emit(
+                        {
+                            "tool": tc.name,
+                            "args": _summarise_args(args),
+                            "ok": False,
+                            "blocked": True,
+                            "prohibited": True,
+                            "step": tool_calls,
+                        }
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": _msg}
+                    )
+                    state.last_failure = _msg[:500]
+                    seen[_signature(tc.name, args)] = {
+                        "fails": 1,
+                        "version": state.state_version,
+                        "step": tool_calls,
+                        "result": _msg,
+                        "ok": False,
+                    }
+                    continue
+                _allowed, _missing = tracker.can_write()
+                if not _allowed:
+                    _msg = _phase.gated_write_error(tracker.skill, _missing)
+                    _emit(
+                        {
+                            "tool": tc.name,
+                            "args": _summarise_args(args),
+                            "ok": False,
+                            "blocked": True,
+                            "gated": True,
+                            "phase": tracker.phase,
+                            "step": tool_calls,
+                        }
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": _msg}
+                    )
+                    state.last_failure = _msg[:500]
+                    seen[_signature(tc.name, args)] = {
+                        "fails": 1,
+                        "version": state.state_version,
+                        "step": tool_calls,
+                        "result": _msg,
+                        "ok": False,
+                    }
+                    continue
             # Rewrite cap first: identical rewrites must still converge-stop.
             if tc.name in ("write_file", "edit_file"):
                 file_changing_calls += 1
@@ -189,7 +385,9 @@ def run_agent(
                         f"stopped: {path} rewritten {rewrites[path]} times without converging; "
                         f"finishing with current state for review"
                     )
-                    messages.append({"role": "assistant", "content": assistant.content or ""})
+                    messages.append(
+                        {"role": "assistant", "content": assistant.content or ""}
+                    )
                     return LoopResult(True, note, iterations, tool_calls, events)
             sig = _signature(tc.name, args)
             rec = seen.get(sig)
@@ -203,9 +401,18 @@ def run_agent(
                         f"cached result reused. If you need fresh information, change a "
                         f"file or vary the action.)\n{rec['result']}"
                     )
-                    _emit({"tool": tc.name, "args": _summarise_args(args),
-                           "ok": True, "cached": True, "step": tool_calls})
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": note})
+                    _emit(
+                        {
+                            "tool": tc.name,
+                            "args": _summarise_args(args),
+                            "ok": True,
+                            "cached": True,
+                            "step": tool_calls,
+                        }
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": note}
+                    )
                     continue
                 if rec["fails"] >= MAX_IDENTICAL_FAILURES:
                     # Third identical failure: block and force a strategy change.
@@ -215,14 +422,25 @@ def run_agent(
                         "inspect the directory structure, try another path, or run a "
                         "different command. Do not issue this exact call again."
                     )
-                    _emit({"tool": tc.name, "args": _summarise_args(args),
-                           "ok": False, "blocked": True, "step": tool_calls})
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": msg})
+                    _emit(
+                        {
+                            "tool": tc.name,
+                            "args": _summarise_args(args),
+                            "ok": False,
+                            "blocked": True,
+                            "step": tool_calls,
+                        }
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": msg}
+                    )
                     state.last_failure = msg
                     continue
             result = _execute(workspace, tc.name, args)
             ok = not result.startswith("ERROR")
-            meta = _parse_command_result(result) if tc.name == "run_command" and ok else {}
+            meta = (
+                _parse_command_result(result) if tc.name == "run_command" and ok else {}
+            )
             if ok:
                 state.state_version += 1
                 state.last_successful_action = tc.name
@@ -232,20 +450,63 @@ def run_agent(
                         state.changed_files.append(p)
                 if tc.name == "run_command":
                     state.commands_run += 1
+                # Phase 1 state machine bookkeeping (runtime, not prompt-only).
+                # Phase 4.5: pass args so depth (distinct paths, workflow reads)
+                # is tracked, not just call counts.
+                tracker.record(tc.name, True, args)
+                if tc.name in ("write_file", "edit_file"):
+                    tracker.mark_implementing()
+                if tc.name in ("run_command", "git_diff") and state.changed_files:
+                    tracker.mark_validating()
             else:
                 state.last_failure = result[:500]
-            seen[sig] = {"fails": (rec["fails"] + 1) if rec and not ok else (0 if ok else 1),
-                         "version": state.state_version if ok else state.state_version,
-                         "step": tool_calls, "result": result, "ok": ok}
+            seen[sig] = {
+                "fails": (rec["fails"] + 1) if rec and not ok else (0 if ok else 1),
+                "version": state.state_version if ok else state.state_version,
+                "step": tool_calls,
+                "result": result,
+                "ok": ok,
+            }
             if len(seen) > MAX_TRACKED_SIGNATURES:
                 seen.pop(next(iter(seen)))
-            ev = {"tool": tc.name, "args": _summarise_args(args), "ok": ok, "step": tool_calls}
+            ev = {
+                "tool": tc.name,
+                "args": _summarise_args(args),
+                "ok": ok,
+                "step": tool_calls,
+                "phase": tracker.phase,
+                "skill": tracker.skill,
+            }
             ev.update(meta)
             _emit(ev)
             state.recent_signatures.append(sig)
             del state.recent_signatures[:-50]
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-    return LoopResult(False, "agent stopped: max iterations exceeded", iterations, tool_calls, events)
+            # Final hardening: revalidate after every tool execution. A slow
+            # tool (or a reap during execution) must not continue the batch
+            # or reach the next LLM request on a dead lease.
+            if not _lease_ok():
+                _emit(
+                    {
+                        "tool": "lease_fence",
+                        "args": {"at": "post_tool", "after": tc.name},
+                        "ok": False,
+                        "blocked": True,
+                        "fenced": True,
+                        "step": tool_calls,
+                    }
+                )
+                return LoopResult(
+                    False,
+                    "lease lost after tool execution; stopping without " "side effects",
+                    iterations,
+                    tool_calls,
+                    events,
+                    lease_lost=True,
+                )
+    return LoopResult(
+        False, "agent stopped: max iterations exceeded", iterations, tool_calls, events
+    )
 
 
 def _window(messages: list[dict], events: list[dict]) -> list[dict]:
@@ -269,7 +530,11 @@ def _window(messages: list[dict], events: list[dict]) -> list[dict]:
         if m.get("role") == "assistant" and m.get("tool_calls"):
             ids = {tc.get("id") for tc in m["tool_calls"]}
             k = j + 1
-            while k < len(rest) and rest[k].get("role") == "tool" and rest[k].get("tool_call_id") in ids:
+            while (
+                k < len(rest)
+                and rest[k].get("role") == "tool"
+                and rest[k].get("tool_call_id") in ids
+            ):
                 k += 1
             spans.append(rest[j:k])
             j = k
@@ -282,7 +547,9 @@ def _window(messages: list[dict], events: list[dict]) -> list[dict]:
     tool_names: dict[str, int] = {}
     for ev in events:
         tool_names[ev.get("tool", "?")] = tool_names.get(ev.get("tool", "?"), 0) + 1
-    recap = ", ".join(f"{n} {t}" for t, n in sorted(tool_names.items(), key=lambda x: -x[1])[:6])
+    recap = ", ".join(
+        f"{n} {t}" for t, n in sorted(tool_names.items(), key=lambda x: -x[1])[:6]
+    )
     summary = {
         "role": "user",
         "content": (
@@ -305,8 +572,12 @@ def _require(args: dict, *fields: str) -> str | None:
     if not isinstance(args, dict) or "_raw" in args:
         return "ERROR: arguments were not valid JSON — retry the call with proper JSON arguments"
     for f in fields:
-        if f not in args or args[f] is None or (isinstance(args[f], str) and not args[f].strip()):
-            return f"ERROR: {f} is required and must be non-empty — retry the call with \"{f}\" included"
+        if (
+            f not in args
+            or args[f] is None
+            or (isinstance(args[f], str) and not args[f].strip())
+        ):
+            return f'ERROR: {f} is required and must be non-empty — retry the call with "{f}" included'
     return None
 
 
@@ -320,23 +591,28 @@ def _execute(workspace: str, name: str, args: dict) -> str:
         if name == "list_directory":
             return fn(workspace, args.get("path", "."))
         if name == "read_file":
-            if (err := _require(args, "path")):
+            if err := _require(args, "path"):
                 return err
-            return fn(workspace, args["path"], int(args.get("offset", 1)), int(args.get("limit", 200)))
+            return fn(
+                workspace,
+                args["path"],
+                int(args.get("offset", 1)),
+                int(args.get("limit", 200)),
+            )
         if name == "search_code":
-            if (err := _require(args, "pattern")):
+            if err := _require(args, "pattern"):
                 return err
             return fn(workspace, args["pattern"], args.get("include", ""))
         if name == "write_file":
-            if (err := _require(args, "path", "content")):
+            if err := _require(args, "path", "content"):
                 return err
             return fn(workspace, args["path"], args["content"])
         if name == "edit_file":
-            if (err := _require(args, "path", "old", "new")):
+            if err := _require(args, "path", "old", "new"):
                 return err
             return fn(workspace, args["path"], args["old"], args["new"])
         if name == "run_command":
-            if (err := _require(args, "command")):
+            if err := _require(args, "command"):
                 return err
             return fn(workspace, args["command"], args.get("cwd", ".") or ".")
         return f"ERROR: unhandled tool: {name}"
@@ -408,9 +684,13 @@ def summarize_event(ev: dict) -> str:
     if name == "search_code":
         return f"Searched for `{str(args.get('pattern', ''))[:80]}`"
     if name == "write_file":
-        return f"Wrote {args.get('path', '?')}" + ("" if ev.get("ok", True) else " (failed)")
+        return f"Wrote {args.get('path', '?')}" + (
+            "" if ev.get("ok", True) else " (failed)"
+        )
     if name == "edit_file":
-        return f"Edited {args.get('path', '?')}" + ("" if ev.get("ok", True) else " (failed)")
+        return f"Edited {args.get('path', '?')}" + (
+            "" if ev.get("ok", True) else " (failed)"
+        )
     if name == "run_command":
         code = ev.get("exit_code", "?")
         cmd = str(args.get("command", ""))[:100]
