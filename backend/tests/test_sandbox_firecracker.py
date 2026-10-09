@@ -195,9 +195,20 @@ def test_08_limits_enforced(workspace):
         assert out["exit_code"] == 0, out
         disk_mib = int(_re.sub(r"[^0-9]", "", out["stdout"].strip()))
         assert disk_mib <= int(_settings.FC_OVERLAY_MB), (disk_mib, out)
-        # 4. Runtime: a 60s sleep under a 30s exec budget must time out.
-        out = _exec(91009, "sleep 60")
-        assert out["timed_out"] or out["exit_code"] is not None
+        # 4. Runtime: a 60s sleep under a short exec budget must actually
+        # be terminated near the deadline (wall-clock evidence, not a
+        # tautology: a runaway sleep returning success after 60s fails).
+        import time as _time
+
+        budget = 10
+        started = _time.monotonic()
+        out = _fc.exec_in_guest(91009, command="sleep 60", cwd=".",
+                                timeout_s=budget)
+        elapsed = _time.monotonic() - started
+        assert out["timed_out"] is True, out
+        assert out["exit_code"] is None, out
+        assert elapsed < 60, elapsed
+        assert elapsed < budget + 30, elapsed
     finally:
         _fc.destroy(91009)
 
@@ -218,21 +229,79 @@ def test_09_cancel_cleans_up_vm(workspace):
         assert not alive
 
 
+def _backdate_owner_dead(task_id, age_s=99999):
+    """Rewrite this VM's owner as a dead worker (crashed-worker simulation)."""
+    import json as _json
+    import time as _time
+
+    import app.sandbox.firecracker as _fcm
+
+    # A valid-range, never-allocated PID (see _dead_pid in
+    # test_sandbox_backend.py): instant liveness check, no child spawned.
+    dead_pid = 2**21 - 1
+    path = _fcm._owner_file_for(task_id)
+    with open(path, "r", encoding="utf-8") as fh:
+        owner = _json.load(fh)
+    owner["pid"] = dead_pid
+    owner["pid_start"] = ""
+    owner["heartbeat"] = _time.time() - age_s
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        _json.dump(owner, fh)
+    os.replace(tmp, path)
+
+
 def test_10_crash_recovery_leaves_no_vm(workspace):
     _require_host()
     vm = _fc.provision(91011, workspace)
     chroot = vm.chroot_dir
-    # Simulate worker loss: drop registry entry without destroy, then the
-    # orphan reaper (not the per-task path) must reclaim it.
+    # Simulate worker loss: drop the in-memory entry (a foreign process
+    # never sees it) AND expire the durable owner as a dead worker. The
+    # per-host reaper must then reclaim the jail + network.
     import app.sandbox.firecracker as _fcm
 
     with _fcm._REG_LOCK:
         _fcm._REG.pop(91011, None)
+    _backdate_owner_dead(91011)
     cleaned = _fcm.destroy_orphans()
     assert cleaned >= 1
     assert not os.path.exists(chroot)
     # Reap is idempotent: a second sweep finds nothing for this task.
     assert _fcm.destroy_orphans() >= 0
+
+
+def test_10b_foreign_sweep_spares_live_vm(workspace):
+    """A live VM is never reaped merely because the sweeping process does
+    not hold its registry entry (multiprocess safety on a real jail)."""
+    _require_host()
+    vm = _fc.provision(91019, workspace)
+    try:
+        import app.sandbox.firecracker as _fcm
+
+        # Foreign-process view: empty registry, but the durable owner is
+        # alive (fresh heartbeat, current pid) — sweep must skip it.
+        with _fcm._REG_LOCK:
+            _fcm._REG.pop(91019, None)
+        assert _fcm.destroy_orphans() == 0
+        assert os.path.exists(vm.chroot_dir)
+        # ... and a foreign-HOST owner record is equally untouchable.
+        import json as _json
+
+        path = _fcm._owner_file_for(91019)
+        with open(path, "r", encoding="utf-8") as fh:
+            owner = _json.load(fh)
+        owner["host"] = "some-other-host"
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            _json.dump(owner, fh)
+        os.replace(tmp, path)
+        assert _fcm.destroy_orphans() == 0
+        assert os.path.exists(vm.chroot_dir)
+    finally:
+        # Re-claim ownership for this process so destroy() cleans up via
+        # the orphan path (no second jailer spawn).
+        _fcm._write_owner(91019)
+        _fc.destroy(91019)
 
 
 def test_11_creation_failure_never_runs_on_host(tmp_path):
@@ -315,6 +384,102 @@ def test_13_worker_executes_command_in_vm(workspace):
     finally:
         _settings.SANDBOX_BACKEND = orig
         _fc.destroy(91016)
+
+
+def test_16_symlink_sentinel_never_crosses(tmp_path):
+    """A host-only sentinel behind a repo symlink is neither readable in
+    the guest nor overwriteable during guest->host result sync."""
+    _require_host()
+    sentinel = tmp_path / "HOST_ONLY_SENTINEL_16"
+    sentinel.write_text("host-secret-16\n", encoding="utf-8")
+    ws = tmp_path / "task-91020"
+    ws.mkdir()
+    try:
+        os.symlink(str(sentinel), str(ws / "innocent.txt"))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable on this host")
+    (ws / "app.py").write_text("print(1)\n", encoding="utf-8")
+    _fc.provision(91020, str(ws))
+    try:
+        # 1. The link target's bytes must not be readable inside the guest.
+        out = _exec(91020, "cat innocent.txt 2>&1")
+        assert "host-secret-16" not in out["stdout"]
+        # 2. A guest file planted where a host symlink lives must not
+        # overwrite the sentinel during result sync.
+        out = _exec(91020, "echo pwned > innocent.txt 2>&1; cat innocent.txt 2>&1")
+        synced = _fc.sync_guest_to_host(task_id=91020, workspace=str(ws))
+        assert sentinel.read_text(encoding="utf-8") == "host-secret-16\n"
+        assert synced["files"] >= 0
+    finally:
+        _fc.destroy(91020)
+
+
+def test_17_sibling_vm_network_unreachable(tmp_path):
+    """One task VM cannot reach a sibling task VM over the network."""
+    _require_host()
+    wa = tmp_path / "task-91021"
+    wb = tmp_path / "task-91022"
+    wa.mkdir()
+    wb.mkdir()
+    (wa / "app.py").write_text("print(1)\n", encoding="utf-8")
+    (wb / "app.py").write_text("print(2)\n", encoding="utf-8")
+    _fc.provision(91021, str(wa))
+    _fc.provision(91022, str(wb))
+    try:
+        import app.sandbox.firecracker as _fcm
+
+        with _fcm._REG_LOCK:
+            cid_b = _fcm._REG[91022].cid
+        # Sibling guest link-net address + sibling service-net address.
+        for target in (
+            "curl -m 5 http://172.16.0.2/ 2>&1",
+            "curl -m 5 http://10.200.0.2:8443/ 2>&1",
+            f"python3 -c \"import socket;s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM);s.settimeout(4);s.connect(({cid_b},5000))\" 2>&1",
+        ):
+            out = _exec(91021, target)
+            assert out["exit_code"] != 0 or "timed_out" in str(out), target
+    finally:
+        _fc.destroy(91021)
+        _fc.destroy(91022)
+
+
+def test_18_host_git_status_diff_after_guest_edit(tmp_path):
+    """Agent-visible status/diff reflect guest edits via trusted host git,
+    while the guest holds no push-capable credential."""
+    _require_host()
+    import subprocess as _sp
+
+    from app.agent import tools as _tools
+    from app.config import settings as _settings
+
+    ws = tmp_path / "task-91023"
+    ws.mkdir()
+    _sp.run(["git", "init", "-b", "main"], cwd=str(ws), capture_output=True,
+            timeout=30)
+    _sp.run(["git", "config", "user.email", "t@t.t"], cwd=str(ws),
+            capture_output=True, timeout=30)
+    _sp.run(["git", "config", "user.name", "t"], cwd=str(ws),
+            capture_output=True, timeout=30)
+    (ws / "app.py").write_text("print(1)\n", encoding="utf-8")
+    _sp.run(["git", "add", "-A"], cwd=str(ws), capture_output=True, timeout=30)
+    _sp.run(["git", "commit", "-m", "init"], cwd=str(ws), capture_output=True,
+            timeout=30)
+    orig = _settings.SANDBOX_BACKEND
+    _settings.SANDBOX_BACKEND = "firecracker"
+    try:
+        _fc.provision(91023, str(ws))
+        out = _tools.run_command(str(ws), "echo 'print(2)' >> app.py")
+        assert "exit_code:" in out
+        status = _tools.git_status(str(ws))
+        assert "app.py" in status, status
+        diff = _tools.git_diff(str(ws))
+        assert "print(2)" in diff, diff
+        # Guest holds no push-capable credential for GitHub.
+        pub = _exec(91023, "git remote -v 2>&1; git push --dry-run origin main 2>&1")
+        assert "x-access-token" not in pub["stdout"]
+    finally:
+        _settings.SANDBOX_BACKEND = orig
+        _fc.destroy(91023)
 
 
 def test_14_publish_boundary_stays_tokenless(tmp_path):

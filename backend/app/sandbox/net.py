@@ -7,11 +7,19 @@ the host must):
 - the TAP lives in the task netns with the guest-peer address
   (GUEST_NET 172.16.0.0/30: host .1, guest .2 via kernel cmdline);
 - a veth pair links the netns to the root ns for host services only:
-  root 10.200.0.1 <-> netns 10.200.0.2. The host egress proxy
-  (TCP 8443) and DNS stub (UDP 53) listen on 10.200.0.1 (see egress.py);
-- nftables default-deny on the TAP uplink + a NAT redirect that forces
-  ALL guest TCP 443 through the proxy (hostname policy lives in the
-  proxy via SNI sniffing — nft alone cannot do SNI policy);
+  root 10.200.0.1 (on the veth-host end) <-> netns 10.200.0.2. The host
+  egress proxy (TCP 8443) and DNS stub (UDP 53) listen on 10.200.0.1
+  (see egress.py);
+- packet path (verified end to end on the KVM host): guest -> TAP
+  (inside the task netns) -> veth-guest -> veth-host (root ns) ->
+  egress proxy / DNS stub. nftables rules therefore match the
+  VETH-HOST interface in the DEFAULT namespace — the TAP name exists
+  only inside the task netns, so host-namespace rules matching the TAP
+  would never see a packet. NAT redirects ALL guest TCP 443 into the
+  proxy (hostname policy lives in the proxy via SNI sniffing — nft
+  alone cannot do SNI policy); the forward chain is default-deny;
+- IPv4 forwarding is enabled in BOTH the default namespace and the
+  task netns (tap->veth-guest forwarding happens inside the netns);
 - hard drops: cloud metadata 169.254.169.254/32, RFC1918, loopback,
   direct DNS bypass (any port-53 not to the stub), all IPv6;
 - the netns has NO default route to the internet: the only L3
@@ -91,12 +99,34 @@ def veth_names(task_id: int | str) -> tuple[str, str]:
     return f"vh{tid}", f"vg{tid}"
 
 
-def _ensure_forwarding() -> None:
-    proc = _run("sysctl", "-w", "net.ipv4.ip_forward=1")
+def _ensure_forwarding(netns: str | None = None) -> None:
+    """Enable IPv4 forwarding in the default ns and (when given) a task netns.
+
+    Guest packets are forwarded tap -> veth-guest INSIDE the task netns, so
+    the netns needs forwarding just like the root namespace does. Raises
+    NetworkIsolationError when either one cannot be enabled (fail closed).
+    """
+    try:
+        proc = _run("sysctl", "-w", "net.ipv4.ip_forward=1")
+    except OSError as exc:
+        raise NetworkIsolationError(f"sysctl unavailable for forwarding: {exc}")
     if proc.returncode != 0:
         raise NetworkIsolationError(
             f"could not enable IPv4 forwarding: {(proc.stderr or '')[-200:]}"
         )
+    if netns:
+        try:
+            proc = _run("ip", "netns", "exec", netns,
+                        "sysctl", "-w", "net.ipv4.ip_forward=1")
+        except OSError as exc:
+            raise NetworkIsolationError(
+                f"sysctl unavailable inside netns {netns}: {exc}"
+            )
+        if proc.returncode != 0:
+            raise NetworkIsolationError(
+                f"could not enable IPv4 forwarding in {netns}: "
+                f"{(proc.stderr or '')[-200:]}"
+            )
 
 
 def ensure_isolation(task_id: int | str) -> dict:
@@ -128,13 +158,17 @@ def ensure_isolation(task_id: int | str) -> dict:
                 "host services must live on "
                 f"{HOST_SVC_IP} (proxy={svc_ip} dns={dns_ip}); refusing"
             )
-        _ensure_forwarding()
         _ensure_netns(netns)
+        _ensure_forwarding(netns)
         _ensure_tap(netns, tap)
         _ensure_veth(netns, vh, vg)
-        _apply_nft(tap=tap, proxy_port=proxy_port)
+        # nft runs in the default namespace and MUST match the veth-host
+        # interface (vh), which is the interface guest traffic actually
+        # arrives on there. Matching the TAP name here would silently
+        # match nothing (the TAP lives in the task netns).
+        _apply_nft(tap=tap, proxy_port=proxy_port, iface=vh)
         proxy = _egress.ensure_available()
-        _verify_topology(netns, tap)
+        _verify_topology(netns, tap, vh)
         return {"netns": netns, "tap": tap, "nft_applied": True, "proxy": proxy}
     except NetworkIsolationError:
         raise
@@ -208,42 +242,51 @@ def _chain_names(tap: str) -> tuple[str, str]:
     return f"pre_{safe}", f"out_{safe}"
 
 
-def _nft_rules(*, tap: str, proxy_port: int) -> list[str]:
+def _nft_rules(*, tap: str, proxy_port: int, iface: str = "") -> list[str]:
     """Per-task nft `add rule` lines (pure, unit-testable).
 
-    Hostname allowlisting happens in the egress proxy (SNI sniffing);
-    nft is the backstop that (a) redirects ALL guest TCP 443 into the
-    proxy and (b) drops every bypass: direct 443 elsewhere, direct DNS,
-    metadata, private nets, IPv6.
+    `iface` is the interface these rules match in the namespace where nft
+    runs (the default namespace): the VETH-HOST device. Chain names stay
+    derived from `tap` (stable per-task id; creating task B never flushes
+    task A's chains). Hostname allowlisting happens in the egress proxy
+    (SNI sniffing); nft is the backstop that (a) redirects ALL guest TCP
+    443 into the proxy and (b) drops every bypass: direct 443 elsewhere,
+    direct DNS, metadata, private nets, IPv6.
     """
+    if not iface:
+        raise NetworkIsolationError(
+            "nft match interface is required (veth-host device in the "
+            "default namespace); refusing to emit rules that match nothing"
+        )
     pre, out = _chain_names(tap)
     rules = [
-        # NAT: every guest TCP/443 is redirected to the host proxy.
-        f'add rule inet fixhub_vm {pre} iifname "{tap}" tcp dport 443 '
+        # NAT: every guest TCP/443 arriving on the veth-host device is
+        # redirected to the host proxy.
+        f'add rule inet fixhub_vm {pre} iifname "{iface}" tcp dport 443 '
         f"dnat to {HOST_SVC_IP}:{proxy_port}",
-        f'add rule inet fixhub_vm {out} iifname "{tap}" '
+        f'add rule inet fixhub_vm {out} iifname "{iface}" '
         "ct state established,related accept",
     ]
     # Hard drops first (metadata, private nets, loopback via forward path).
     for cidr in FORBIDDEN_CIDRS:
-        rules.append(f'add rule inet fixhub_vm {out} iifname "{tap}" ip daddr {cidr} drop')
+        rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" ip daddr {cidr} drop')
     # DNS only to the host stub; every other port-53 is a bypass attempt.
     rules.append(
-        f'add rule inet fixhub_vm {out} iifname "{tap}" udp dport 53 '
+        f'add rule inet fixhub_vm {out} iifname "{iface}" udp dport 53 '
         f"ip daddr {HOST_SVC_IP} accept"
     )
-    rules.append(f'add rule inet fixhub_vm {out} iifname "{tap}" udp dport 53 drop')
-    rules.append(f'add rule inet fixhub_vm {out} iifname "{tap}" tcp dport 53 drop')
+    rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" udp dport 53 drop')
+    rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" tcp dport 53 drop')
     # IPv6 closed in v1.
-    rules.append(f'add rule inet fixhub_vm {out} iifname "{tap}" meta l4proto ipv6-icmp drop')
-    rules.append(f'add rule inet fixhub_vm {out} iifname "{tap}" ip6 daddr ::/0 drop')
+    rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" meta l4proto ipv6-icmp drop')
+    rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" ip6 daddr ::/0 drop')
     # Only the proxy may receive guest TCP 443 (explicit drop for anything
     # that evades the redirect; there is NO bare `tcp dport 443 accept`).
     rules.append(
-        f'add rule inet fixhub_vm {out} iifname "{tap}" ip daddr {HOST_SVC_IP} '
+        f'add rule inet fixhub_vm {out} iifname "{iface}" ip daddr {HOST_SVC_IP} '
         f"tcp dport {proxy_port} accept"
     )
-    rules.append(f'add rule inet fixhub_vm {out} iifname "{tap}" tcp dport 443 drop')
+    rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" tcp dport 443 drop')
     return rules
 
 
@@ -262,9 +305,12 @@ def _chain_specs() -> tuple[tuple[str, str], tuple[str, str]]:
     )
 
 
-def _apply_nft(*, tap: str, proxy_port: int) -> None:
-    # Idempotent: create table/chains (exists is fine), flush our chains,
-    # then add exactly the rules from _nft_rules().
+def _apply_nft(*, tap: str, proxy_port: int, iface: str) -> None:
+    # Idempotent: create table/chains (exists is fine), flush ONLY our
+    # per-task chains (never another task's), then add exactly the rules
+    # from _nft_rules(). `iface` is the veth-host device visible here.
+    if not iface:
+        raise NetworkIsolationError("nft match interface is required; refusing")
     pre, out = _chain_names(tap)
     proc = _nft("add", "table", "inet", "fixhub_vm")
     if proc.returncode != 0 and "exists" not in (proc.stderr or "").lower():
@@ -282,14 +328,19 @@ def _apply_nft(*, tap: str, proxy_port: int) -> None:
             raise NetworkIsolationError(
                 f"nft chain flush failed ({chain}): {(proc.stderr or '')[-300:]}"
             )
-    for rule in _nft_rules(tap=tap, proxy_port=proxy_port):
+    for rule in _nft_rules(tap=tap, proxy_port=proxy_port, iface=iface):
         proc = _nft(*rule.split(" "))
         if proc.returncode != 0:
             raise NetworkIsolationError(f"nft rule add failed: {(proc.stderr or '')[-300:]}")
-    # Verify: our chains exist and are non-empty.
+    # Verify: our chains exist, default-deny, and match the veth-host iface.
     proc = _nft("list", "chain", "inet", "fixhub_vm", out)
-    if proc.returncode != 0 or "policy drop" not in (proc.stdout or ""):
+    body = proc.stdout or ""
+    if proc.returncode != 0 or "policy drop" not in body:
         raise NetworkIsolationError("nft verification failed: out chain missing default-deny")
+    if f'iifname "{iface}"' not in body:
+        raise NetworkIsolationError(
+            f"nft verification failed: out chain does not match {iface}"
+        )
 
 
 def destroy_nft_chains(tap: str) -> None:
@@ -305,13 +356,39 @@ def destroy_nft_chains(tap: str) -> None:
         pass
 
 
-def _verify_topology(netns: str, tap: str) -> None:
-    """Post-setup assertions: TAP up with the host IP, no default route."""
+def _verify_topology(netns: str, tap: str, vh: str) -> None:
+    """Post-setup assertions for the full packet path.
+
+    - TAP up with the guest-peer IP inside the task netns;
+    - veth-host up with the service IP in the default namespace (the
+      interface nft matches and the proxy/DNS bind to);
+    - forwarding on in BOTH namespaces;
+    - no default route in the task netns.
+    """
     proc = _run_ns(netns, "addr", "show", "dev", tap)
     if proc.returncode != 0 or GUEST_HOST_IP not in (proc.stdout or ""):
         raise NetworkIsolationError(
             f"TAP {tap} missing {GUEST_HOST_IP} after setup: {(proc.stderr or '')[-200:]}"
         )
+    proc = _run("ip", "addr", "show", "dev", vh)
+    if proc.returncode != 0 or HOST_SVC_IP not in (proc.stdout or ""):
+        raise NetworkIsolationError(
+            f"veth-host {vh} missing {HOST_SVC_IP} after setup: "
+            f"{(proc.stderr or '')[-200:]}"
+        )
+    for where, cmd in (
+        ("default namespace", ("sysctl", "-n", "net.ipv4.ip_forward")),
+        (f"netns {netns}", ("ip", "netns", "exec", netns,
+                             "sysctl", "-n", "net.ipv4.ip_forward")),
+    ):
+        try:
+            proc = _run(*cmd)
+        except OSError as exc:
+            raise NetworkIsolationError(f"forwarding unreadable ({where}): {exc}")
+        if proc.returncode != 0 or (proc.stdout or "").strip() != "1":
+            raise NetworkIsolationError(
+                f"IPv4 forwarding off ({where}); refusing boot"
+            )
     proc = _run_ns(netns, "route", "show")
     if proc.returncode != 0:
         raise NetworkIsolationError("could not read netns routes for verification")

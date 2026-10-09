@@ -14,7 +14,9 @@ host (installation token never enters guest) → `destroy(task_id)` (halt + kill
 + rm jail/overlay/netns).
 
 LLM calls stay on the host (BYOK thread-local). GitHub push/PR stays on the
-host. Guest holds a tokenless checkout only.
+host. Guest holds a tokenless checkout only — `.git` objects/refs never
+enter the guest; `git status`/`git diff` reconcile guest edits into the
+trusted host workspace first, then run host git there.
 
 ## Security boundary (guest never receives)
 
@@ -45,8 +47,12 @@ kernel API paths are jail-relative (`./…`). There is no host fallback.
 - `backend/app/sandbox/backend.py` — ABC + dispatch (the cut point).
 - `backend/app/sandbox/sandbox.py` — host backend + shared redaction/policy.
 - `backend/app/sandbox/firecracker.py` — jailer lifecycle, vsock exec, repo
-  sync both directions, destroy/orphan reaper. Guest CID = `_cid_for(task)`
-  in BOTH the `/vsock` config and every host `VsockClient` dial.
+  sync both directions (symlink-safe, atomic host writes), destroy/orphan
+  reaper. Guest CID = `_cid_for(task)` in BOTH the `/vsock` config and
+  every host `VsockClient` dial. VM ownership is durable (host + worker +
+  pid + heartbeat in `owner.json`, reconciled with the DB task lease); only
+  the same host's worker/manager reaps, and only provably dead owners —
+  never the API tier, never a foreign host.
 - `backend/app/sandbox/guest_agent.py` — host-side protocol + token stripping.
 - `backend/app/sandbox/guest/agent.py` — guest-side exec server (baked into rootfs).
 - `backend/app/sandbox/net.py` — netns/TAP/veth/nft default-deny + forced

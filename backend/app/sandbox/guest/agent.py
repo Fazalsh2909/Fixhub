@@ -134,6 +134,24 @@ def _handle(req: dict, root: str) -> dict:
         e, t2 = _cap(err or "", cap // 2)
         return {"req_id": req_id, "exit_code": code, "stdout": s, "stderr": e,
                 "truncated": t1 or t2, "timed_out": timed_out, "cwd": cwd}
+    def _has_symlink_prefix(path: str) -> bool:
+        # Any existing path component (or the target itself) that is a
+        # symlink escapes lexical containment: refuse instead of following.
+        node = path
+        seen: set[str] = set()
+        while node and node not in seen:
+            seen.add(node)
+            try:
+                if os.path.islink(node):
+                    return True
+            except OSError:
+                return False
+            parent = os.path.dirname(node)
+            if parent == node:
+                break
+            node = parent
+        return False
+
     if op == "read":
         path = req.get("path", "")
         if _is_sensitive(path):
@@ -142,9 +160,20 @@ def _handle(req: dict, root: str) -> dict:
             full = _resolve(root, path)
         except ValueError as exc:
             return {"req_id": req_id, "error": str(exc)}
+        if _has_symlink_prefix(full):
+            return {"req_id": req_id, "error": "symlink access is blocked"}
         try:
-            with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                content = fh.read()
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(full, flags)
+            try:
+                with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except Exception as exc:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                return {"req_id": req_id, "error": str(exc)}
         except OSError as exc:
             return {"req_id": req_id, "error": str(exc)}
         content, _ = _cap(content, cap)
@@ -158,10 +187,16 @@ def _handle(req: dict, root: str) -> dict:
             full = _resolve(root, path)
         except ValueError as exc:
             return {"req_id": req_id, "error": str(exc)}
+        if _has_symlink_prefix(full):
+            return {"req_id": req_id, "error": "symlink access is blocked"}
         try:
             os.makedirs(os.path.dirname(full) or full, exist_ok=True)
-            with open(full, "w", encoding="utf-8") as fh:
+            if _has_symlink_prefix(full):
+                return {"req_id": req_id, "error": "symlink access is blocked"}
+            tmp = full + ".fixhub-tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
                 fh.write(content)
+            os.replace(tmp, full)
         except OSError as exc:
             return {"req_id": req_id, "error": str(exc)}
         return {"req_id": req_id, "ok": True}
@@ -177,10 +212,16 @@ def _handle(req: dict, root: str) -> dict:
         entries: list[str] = []
         try:
             if recursive:
-                for r, dirs, files in os.walk(full):
-                    dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git")]
+                for r, dirs, files in os.walk(full, followlinks=False):
+                    dirs[:] = [
+                        d for d in dirs
+                        if d not in ("__pycache__", ".git")
+                        and not os.path.islink(os.path.join(r, d))
+                    ]
                     for name in dirs + files:
                         fp = os.path.join(r, name)
+                        if os.path.islink(fp):
+                            continue
                         rel = os.path.relpath(fp, root).replace(os.sep, "/")
                         if "__pycache__" in rel or rel.startswith(".git"):
                             continue

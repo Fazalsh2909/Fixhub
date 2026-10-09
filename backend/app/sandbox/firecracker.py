@@ -39,7 +39,9 @@ import json
 import os
 import shutil
 import socket
+import stat as _stat
 import subprocess
+import tempfile as _tempfile
 import threading
 import time
 
@@ -59,6 +61,152 @@ _GUEST_AGENT_PORT = 5000
 _CID_BASE = 100
 _CID_MOD = 50000
 _CID_MAX = (1 << 32) - 1
+
+
+def _local_host() -> str:
+    try:
+        import socket as _socket
+
+        return _socket.gethostname()
+    except Exception:
+        return "unknown-host"
+
+
+def _owner_stale_s() -> int:
+    """Heartbeat age past which an owner is considered stale (seconds).
+
+    Must exceed a healthy worker's longest quiet stretch between guest
+    execs; the DB lease check below remains the safety net, so a stale
+    heartbeat alone never reaps a live-leased task.
+    """
+    try:
+        return int(_cfg("FC_OWNER_STALE_S", 900) or 900)
+    except (TypeError, ValueError):
+        return 900
+
+
+def _pid_start(pid: int) -> str:
+    """Owner-process start identity (Linux /proc starttime) against pid reuse."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8") as fh:
+            parts = fh.read().rsplit(")", 1)[1].split()
+            return parts[19]  # starttime (22nd field)
+    except (OSError, IndexError, ValueError):
+        return ""
+
+
+def _pid_alive(pid: int | None, pid_start: str = "") -> bool:
+    try:
+        pid = int(pid)  # type: ignore[assignment]
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if pid <= 0 or pid >= 2**22:
+        # Outside any real PID range (Linux pid_max default 2**22, Windows
+        # PIDs are small): treat as dead WITHOUT probing the OS. Probing
+        # absurd PIDs is both meaningless and, on some hosts, observable.
+        return False
+    try:
+        os.kill(pid, 0)
+    except (OSError, ValueError, OverflowError):
+        return False
+    if pid_start and os.path.exists(f"/proc/{pid}"):
+        try:
+            return _pid_start(pid) == pid_start
+        except Exception:
+            return False
+    return True
+
+
+def _owner_file_for(task_id: int) -> str:
+    base = str(_cfg("FC_CHROOT_BASE", "/srv/firecracker/jails"))
+    return os.path.join(base, "firecracker", jail_id_for(task_id), "owner.json")
+
+
+def _write_owner(task_id: int, *, worker: str = "") -> dict:
+    """Claim a VM for this process (durable, cross-process visible)."""
+    try:
+        import getpass as _getpass
+
+        user = _getpass.getuser()
+    except Exception:
+        user = ""
+    owner = {
+        "task_id": int(task_id),
+        "host": _local_host(),
+        "worker": (worker or f"pid-{os.getpid()}")[:64],
+        "pid": os.getpid(),
+        "pid_start": _pid_start(os.getpid()),
+        "user": user,
+        "heartbeat": time.time(),
+    }
+    try:
+        path = _owner_file_for(task_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(owner, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return owner
+
+
+def _read_owner(task_id: int) -> dict | None:
+    try:
+        with open(_owner_file_for(task_id), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and int(data.get("task_id", -1)) == int(task_id):
+            return data
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _touch_owner(task_id: int) -> None:
+    """Refresh this VM's heartbeat (owner process only, best-effort)."""
+    try:
+        owner = _read_owner(task_id)
+        if owner is None:
+            return
+        if owner.get("host") != _local_host() or int(owner.get("pid", -1)) != os.getpid():
+            return  # not ours: never rewrite a foreign owner's heartbeat
+        owner["heartbeat"] = time.time()
+        path = _owner_file_for(task_id)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(owner, fh)
+        os.replace(tmp, path)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _db_lease_live(task_id: int) -> bool | None:
+    """True when the task row is RUNNING with an unexpired lease.
+
+    None when the database cannot answer (unknown — callers must then
+    require stronger local staleness before reaping). Never raises.
+    """
+    try:
+        from app.db.database import SessionLocal, utcnow
+        from app.db.models import Task as _Task
+
+        db = SessionLocal()
+        try:
+            row = db.query(_Task).filter(_Task.id == int(task_id)).first()
+            if row is None or row.status != "RUNNING":
+                return False
+            lease = getattr(row, "lease_expires_at", None)
+            if lease is None:
+                return False
+            now = utcnow()
+            try:
+                return bool(lease > now)
+            except TypeError:
+                return False
+        finally:
+            db.close()
+    except Exception:
+        return None
 
 
 class _VM:
@@ -243,8 +391,10 @@ def jailer_cgroup_args(*, vcpu: int, mem_mib: int, pids_max: int) -> tuple[str, 
     """Build jailer --cgroup-version/--cgroup args. Raises when undetectable.
 
     v2 (Ubuntu 24.04 default): cpu.max ("<quota> <period>"), memory.max
-    (bytes), pids.max. v1: cpu.shares, memory.limit_in_bytes, pids.max.
-    Unknown layout fails closed (never boot unbounded).
+    (bytes), pids.max. v1: cpu.cfs_quota_us/cpu.cfs_period_us (REAL quota —
+    cpu.shares is only a scheduling weight and must never be claimed as a
+    hard limit), memory.limit_in_bytes, pids.max. Unknown layout fails
+    closed (never boot unbounded).
     """
     version = cgroup_version()
     mem_bytes = int(mem_mib) * 1024 * 1024
@@ -256,8 +406,10 @@ def jailer_cgroup_args(*, vcpu: int, mem_mib: int, pids_max: int) -> tuple[str, 
             "--cgroup", f"pids.max={int(pids_max)}",
         ]
     if version == "1":
+        quota = int(vcpu) * 100000
         return version, [
-            "--cgroup", f"cpu.shares={int(vcpu) * 1024}",
+            "--cgroup", f"cpu.cfs_quota_us={quota}",
+            "--cgroup", "cpu.cfs_period_us=100000",
             "--cgroup", f"memory.limit_in_bytes={mem_bytes}",
             "--cgroup", f"pids.max={int(pids_max)}",
         ]
@@ -271,16 +423,22 @@ def vm_max_runtime_s() -> int:
         return 1500
 
 
-def provision(task_id: int, workspace: str) -> _VM:
+def provision(task_id: int, workspace: str, *, owner_worker: str = "") -> _VM:
     """Boot (or reuse) the task's microVM and sync the tokenless repo tree.
 
     Raises SandboxBlockedError on ANY failure (missing host support, isolation
     failure, boot failure, transfer failure). Never falls back to host exec.
+
+    Ownership: the calling (worker) process durably claims the VM via an
+    owner file (host + worker + pid + heartbeat) BEFORE spawning the jailer,
+    so a foreign process's reaper can distinguish "mine and live" from
+    "crashed and reclaimable" without trusting its own memory.
     """
     task_id = int(task_id)
     with _REG_LOCK:
         existing = _REG.get(task_id)
         if existing is not None and existing.ready:
+            _touch_owner(task_id)
             return existing
         # CID collision guard: two live VMs must never share a CID.
         cid = _cid_for(task_id)
@@ -316,6 +474,7 @@ def provision(task_id: int, workspace: str) -> _VM:
     try:
         os.makedirs(chroot, exist_ok=True)
         os.chmod(chroot, 0o700)
+        _write_owner(task_id, worker=owner_worker)
         _prepare_overlay(overlay)
         _stage_boot_files(chroot, overlay, uid=uid, gid=gid)
         jailer_proc = _spawn_jailer(
@@ -590,11 +749,81 @@ def _wait_guest_agent(vm: _VM) -> None:
     raise RuntimeError(f"guest agent never answered: {last_err}")
 
 
+def _is_symlink(path: str) -> bool:
+    """lstat-based symlink test. Missing/unreadable paths report False."""
+    try:
+        return os.path.islink(path)
+    except OSError:
+        return False
+
+
+def _collect_transfer_files(workspace: str) -> list[tuple[str, str]]:
+    """Enumerate regular files for host->guest transfer (pure enumeration).
+
+    Symlinks are NEVER followed: symlinked dirs are pruned from the walk and
+    symlinked/non-regular files are skipped, so external file contents can
+    never enter the guest under an innocent-looking repo filename.
+    Sensitive names (.env, keys, *secret*/*token*) are excluded here too
+    (defense in depth; the guest re-validates on write).
+    Returns [(repo_relative_posix_path, host_path)].
+    """
+    from app.agent.paths import is_sensitive as _is_sensitive
+
+    collected: list[tuple[str, str]] = []
+    for root, dirs, files in os.walk(workspace, followlinks=False):
+        kept: list[str] = []
+        for d in dirs:
+            if d in ("__pycache__", ".git"):
+                continue
+            if _is_symlink(os.path.join(root, d)):
+                continue
+            kept.append(d)
+        dirs[:] = kept
+        for name in files:
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, workspace).replace(os.sep, "/")
+            if "__pycache__" in rel:
+                continue
+            try:
+                if _is_symlink(full):
+                    continue
+                if not _stat.S_ISREG(os.lstat(full).st_mode):
+                    continue
+            except OSError:
+                continue
+            if _is_sensitive(rel):
+                continue
+            collected.append((rel, full))
+    return collected
+
+
+def _read_host_file_nofollow(full: str) -> str:
+    """Read a regular file without following symlinks (TOCTOU-resistant).
+
+    O_NOFOLLOW makes the open itself fail if `full` is a symlink, so a link
+    swapped in between enumeration and read cannot leak target bytes.
+    Raises OSError/UnicodeDecodeError on failure (caller skips the file).
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(full, flags)
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8", errors="strict") as fh:
+            return fh.read()
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
 def sync_repo_to_guest(*, task_id: int, workspace: str) -> None:
     """Stream the host workspace into the guest with credentials stripped.
 
     Per-file `write` ops (bounded, skips __pycache__ + tokenless .git/config).
-    Raises on first transport failure (caller destroys the VM).
+    Symlinks are never followed (see _collect_transfer_files); sensitive
+    names never cross. Raises on first transport failure (caller destroys
+    the VM).
     """
     with _REG_LOCK:
         vm = _REG.get(int(task_id))
@@ -603,37 +832,35 @@ def sync_repo_to_guest(*, task_id: int, workspace: str) -> None:
     if not workspace or not os.path.isdir(workspace):
         raise RuntimeError("host workspace missing for repo sync")
     client = _guest.VsockClient(cid=vm.cid, port=_GUEST_AGENT_PORT)
-    for root, dirs, files in os.walk(workspace):
-        dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git")]
-        for name in files:
-            full = os.path.join(root, name)
-            rel = os.path.relpath(full, workspace).replace(os.sep, "/")
-            if "__pycache__" in rel:
-                continue
-            try:
-                with open(full, "r", encoding="utf-8", errors="strict") as fh:
-                    content = fh.read()
-            except (OSError, UnicodeDecodeError):
-                continue  # binary/large files transfer via exec path in v1 scope
-            if len(content) > 200_000:
-                continue
-            req = _guest.build_request(op="write", cwd=".", timeout_s=30)
-            req["path"] = rel
-            req["content"] = content
-            resp = client.call(req, timeout_s=35)
-            if not resp.get("ok", True) and resp.get("exit_code", 1) != 0:
-                raise RuntimeError(f"guest write failed for {rel}")
-    # Tokenless .git/config last (guest git stays read-only; host owns push).
-    git_config = os.path.join(workspace, ".git", "config")
-    if os.path.isfile(git_config):
+    _touch_owner(task_id)
+    for rel, full in _collect_transfer_files(workspace):
         try:
-            with open(git_config, "r", encoding="utf-8", errors="replace") as fh:
-                cleaned = _guest.strip_token_from_git_config(fh.read())
+            content = _read_host_file_nofollow(full)
+        except (OSError, UnicodeDecodeError):
+            continue  # vanished, relinked, binary: never ship target bytes
+        if len(content) > 200_000:
+            continue
+        req = _guest.build_request(op="write", cwd=".", timeout_s=30)
+        req["path"] = rel
+        req["content"] = content
+        resp = client.call(req, timeout_s=35)
+        if not resp.get("ok", True) and resp.get("exit_code", 1) != 0:
+            raise RuntimeError(f"guest write failed for {rel}")
+    # NOTE: .git objects/refs are intentionally NOT shipped (host-side git
+    # architecture: status/diff run on the trusted host after reconciling
+    # guest changes). Only a tokenless .git/config is provided when present
+    # and only when it is a real file (never a symlink).
+    git_config = os.path.join(workspace, ".git", "config")
+    if not _is_symlink(git_config) and os.path.isfile(git_config):
+        try:
+            cleaned = _guest.strip_token_from_git_config(
+                _read_host_file_nofollow(git_config)
+            )
             req = _guest.build_request(op="write", cwd=".", timeout_s=15)
             req["path"] = ".git/config"
             req["content"] = cleaned
             client.call(req, timeout_s=20)
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             pass
 
 
@@ -666,6 +893,7 @@ def exec_in_guest(
         raise _host.SandboxBlockedError(str(exc))
     timeout = timeout_s or _settings.COMMAND_TIMEOUT_S
     client = _guest.VsockClient(cid=vm.cid, port=_GUEST_AGENT_PORT)
+    _touch_owner(vm.task_id)
     started = time.monotonic()
     try:
         resp = client.call(
@@ -696,13 +924,114 @@ def exec_in_guest(
     }
 
 
+def _safe_host_dest(workspace: str, rel: str) -> str:
+    """Resolve a guest-supplied path to a host destination, symlink-aware.
+
+    Rejects (ValueError): empty/absolute/drive/NUL paths, `.`/`..` components,
+    and any destination whose existing parents form a symlink chain escaping
+    the workspace — including a symlinked final component. Missing parents
+    are fine (created by the atomic writer, then re-validated). Lexical
+    `resolve()` alone cannot see symlinks, so every existing component is
+    lstat-checked here.
+    """
+    if not isinstance(rel, str) or not rel.strip() or "\x00" in rel:
+        raise ValueError("path is required and must be non-empty")
+    rel = rel.replace("\\", "/")
+    if rel.startswith("/") or rel.startswith("~") or len(rel) > 2 and rel[1] == ":":
+        raise ValueError(f"path escapes workspace: {rel[:200]}")
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        raise ValueError(f"path escapes workspace: {rel[:200]}")
+    base = os.path.abspath(workspace)
+    cur = base
+    for p in parts[:-1]:
+        cur = os.path.join(cur, p)
+        try:
+            st = os.lstat(cur)
+        except OSError:
+            continue  # missing: will be created, then re-validated
+        if _stat.S_ISLNK(st.st_mode):
+            raise ValueError(f"symlinked parent in workspace path: {rel[:200]}")
+        if not _stat.S_ISDIR(st.st_mode):
+            raise ValueError(f"non-directory parent in workspace path: {rel[:200]}")
+    dest = os.path.join(cur, parts[-1])
+    try:
+        if _stat.S_ISLNK(os.lstat(dest).st_mode):
+            raise ValueError(f"destination is a symlink: {rel[:200]}")
+    except OSError:
+        pass  # missing destination: fine
+    if os.path.abspath(dest) != base and not os.path.abspath(dest).startswith(
+        base + os.sep
+    ):
+        raise ValueError(f"path escapes workspace: {rel[:200]}")
+    return dest
+
+
+def _atomic_write_text(dest: str, content: str) -> None:
+    """Write text to `dest` atomically via temp-file + rename.
+
+    Parents are re-validated symlink-free AFTER creation (a concurrent
+    symlink plant between check and write is rejected instead of followed).
+    Raises OSError/ValueError on failure.
+    """
+    import os as _os
+
+    parent = _os.path.dirname(dest)
+    if parent:
+        _os.makedirs(parent, exist_ok=True)
+        # Re-walk the created parents: any symlink invalidates the write.
+        # Walk up until the filesystem root.
+        node = parent
+        seen: set[str] = set()
+        while node and node not in seen:
+            seen.add(node)
+            try:
+                if _stat.S_ISLNK(_os.lstat(node).st_mode):
+                    raise ValueError(f"symlinked parent appeared: {node[:200]}")
+            except OSError:
+                pass
+            parent_of = _os.path.dirname(node)
+            if parent_of == node:
+                break
+            node = parent_of
+    fd, tmp = _tempfile.mkstemp(
+        dir=parent or ".", prefix=".fixhub-", suffix=".tmp"
+    )
+    try:
+        with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        _os.replace(tmp, dest)
+    except Exception:
+        try:
+            _os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_host_result(workspace: str, rel: str, content: str) -> str:
+    """Store one guest file into the host workspace (symlink-safe).
+
+    Returns the host destination path. Raises ValueError (unsafe path) or
+    OSError (I/O failure); callers treat refusal as skip, never as fallback.
+    """
+    from app.agent.paths import is_sensitive as _is_sensitive
+
+    if _is_sensitive(str(rel).split(":")[0]):
+        raise ValueError("sensitive file is blocked")
+    dest = _safe_host_dest(workspace, rel)
+    _atomic_write_text(dest, content)
+    return dest
+
+
 def sync_guest_to_host(*, task_id: int, workspace: str) -> dict:
     """Copy guest working-tree changes back to the host workspace for publish.
 
     Runs on the TRUSTED host after the agent loop and gates complete. Reads
     guest files over vsock and writes them to the host workspace through the
-    shared path jail (sensitive names blocked). `.git` internals are NOT
-    copied (host git state stays authoritative; publish uses host git).
+    symlink-aware jail (symlinked parents/destinations rejected, sensitive
+    names blocked, atomic writes). `.git` internals are NOT copied (host git
+    state stays authoritative; publish uses host git).
     Returns {files, bytes}. Raises SandboxBlockedError on transport failure
     (caller fails the task; never publishes stale state silently).
     """
@@ -714,8 +1043,6 @@ def sync_guest_to_host(*, task_id: int, workspace: str) -> dict:
         raise _host.SandboxBlockedError("no live microVM for result sync")
     if not workspace or not _os.path.isdir(workspace):
         raise _host.SandboxBlockedError("host workspace missing for result sync")
-    from app.agent.paths import is_sensitive as _is_sensitive
-    from app.agent.paths import resolve as _resolve
 
     client = _guest.VsockClient(cid=vm.cid, port=_GUEST_AGENT_PORT)
     # 1. List guest tree (guest agent returns repo-relative paths).
@@ -735,13 +1062,7 @@ def sync_guest_to_host(*, task_id: int, workspace: str) -> dict:
             continue
         if "__pycache__" in rel:
             continue
-        if _is_sensitive(rel.split(":")[0]):
-            continue
-        try:
-            dest = _resolve(workspace, rel)
-        except ValueError:
-            continue
-        # 2. Read from guest, write to host.
+        # 2. Read from guest, write to host (refusals skip the file).
         try:
             rreq = _guest.build_request(op="read", cwd=".", timeout_s=15)
             rreq["path"] = rel
@@ -750,15 +1071,12 @@ def sync_guest_to_host(*, task_id: int, workspace: str) -> dict:
             continue
         if rresp.get("error"):
             continue
-        content = str(rresp.get("content", ""))
         try:
-            _os.makedirs(_os.path.dirname(dest) or dest, exist_ok=True)
-            with open(dest, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            files += 1
-            total_bytes += len(content)
-        except OSError:
+            write_host_result(workspace, rel, str(rresp.get("content", "")))
+        except (ValueError, OSError):
             continue
+        files += 1
+        total_bytes += len(str(rresp.get("content", "")))
         if total_bytes > 10 * 1024 * 1024 or files > 2000:
             break
     return {"files": files, "bytes": total_bytes}
@@ -818,23 +1136,75 @@ def destroy(task_id: int) -> None:
             pass
 
 
-def destroy_orphans(*, max_runtime_s: int | None = None) -> int:
-    """Reclaim VMs with no live owner. Returns the number cleaned.
+def _owner_reclaimable(owner: dict | None, *, stale_s: int) -> bool:
+    """Decide whether an on-disk VM may be reclaimed by THIS process.
 
-    Covers BOTH failure modes, actually (not a stub):
-    1. Crash orphans: jail dirs on disk with no live registry entry
-       (worker SIGKILLed between provision and destroy).
-    2. Overstays: live VMs older than FC_VM_MAX_RUNTIME_S (runaway
-       workers that never called destroy).
-    Never raises. Safe to call periodically from the worker/recovery sweep.
+    Never trusts the local `_REG` (another worker's live VM is absent from
+    it by design). Reclaim requires ALL of:
+    - an owner record exists and names THIS host (foreign hosts are never
+      touched; only the per-host manager reaps its own VMs);
+    - the owner process is dead (pid liveness + start-identity against
+      pid reuse; unknown platform counts as dead only with a very stale
+      heartbeat, see below);
+    - the heartbeat is older than `stale_s`;
+    - the task row is NOT RUNNING with a live lease (a live lease always
+      wins; an unreachable database counts as unknown and then requires
+      both a dead pid AND a heartbeat older than the VM runtime cap).
+    """
+    if not owner:
+        return False
+    try:
+        if str(owner.get("host", "")) != _local_host():
+            return False
+        pid = int(owner.get("pid", 0) or 0)
+        heartbeat = float(owner.get("heartbeat", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    now = time.time()
+    heartbeat_age = now - heartbeat if heartbeat > 0 else float("inf")
+    if heartbeat_age < 0:
+        return False  # clock skew: never reap
+    alive = _pid_alive(pid, str(owner.get("pid_start", "") or ""))
+    lease = _db_lease_live(int(owner.get("task_id", -1)))
+    if lease is True:
+        return False  # live lease always protects the VM
+    if lease is False:
+        return (not alive) and heartbeat_age >= stale_s
+    # Database unknown: conservatively require dead pid AND a heartbeat
+    # older than the VM runtime cap (not just the stale threshold).
+    try:
+        cap = vm_max_runtime_s()
+    except Exception:
+        cap = 1500
+    return (not alive) and heartbeat_age >= max(stale_s, cap)
+
+
+def destroy_orphans(*, max_runtime_s: int | None = None) -> int:
+    """Reclaim crashed/overstayed VMs. Returns the number cleaned.
+
+    Multiprocess-safe (unlike a pure in-memory sweep):
+    1. Overstays: live `_REG` VMs older than FC_VM_MAX_RUNTIME_S — these
+       entries are owned by THIS process by construction, so destroy()
+       is safe for them.
+    2. Crash orphans: jail dirs on disk whose durable owner record proves
+       the owner is dead AND stale (see _owner_reclaimable). A live VM
+       owned by another worker/host is never touched merely because it
+       is absent from this process's registry.
+    Never raises. Call ONLY from the sandbox host's manager/worker process
+    (same host as the VMs), never from a foreign host or the generic API
+    tier — foreign-host records are skipped by construction.
     """
     cleaned = 0
     try:
         limit = int(max_runtime_s) if max_runtime_s is not None else vm_max_runtime_s()
     except (TypeError, ValueError):
         limit = 1500
+    try:
+        stale_s = int(max_runtime_s) if max_runtime_s is not None else _owner_stale_s()
+    except (TypeError, ValueError):
+        stale_s = 900
     now = time.monotonic()
-    # Mode 2: reap overstayed live VMs first (registry is authoritative).
+    # Mode 1: reap overstayed live VMs owned by THIS process first.
     overstayed: list[int] = []
     with _REG_LOCK:
         for tid, vm in list(_REG.items()):
@@ -849,9 +1219,9 @@ def destroy_orphans(*, max_runtime_s: int | None = None) -> int:
             cleaned += 1
         except Exception:
             continue
-    # Mode 1: jail dirs with no live registry entry.
+    # Mode 2: on-disk jail dirs with a provably dead owner (this host only).
     base = str(_cfg("FC_CHROOT_BASE", "/srv/firecracker/jails") or "")
-    candidates: list[tuple[int, str]] = []
+    seen: set[int] = set()
     for parent in (os.path.join(base, "firecracker"), base):
         try:
             names = os.listdir(parent)
@@ -864,26 +1234,29 @@ def destroy_orphans(*, max_runtime_s: int | None = None) -> int:
             if not suffix.isdigit():
                 continue
             tid = int(suffix)
+            if tid in seen:
+                continue
+            seen.add(tid)
             with _REG_LOCK:
-                live = tid in _REG
-            if not live:
-                candidates.append((tid, name))
-    for tid, _name in candidates:
-        try:
-            # Kill anything still running for this jail, then remove the tree.
+                if tid in _REG:
+                    continue  # live in THIS process: not an orphan
             try:
-                _kill_pid(_read_fc_pid(chroot_dir_for(tid)))
+                if not _owner_reclaimable(_read_owner(tid), stale_s=stale_s):
+                    continue
+                # Kill anything still running for this jail, then remove it.
+                try:
+                    _kill_pid(_read_fc_pid(chroot_dir_for(tid)))
+                except Exception:
+                    pass
+                _kill_task_procs(jail_id_for(tid))
+                _remove_jail_tree(tid, jail_id_for(tid))
+                try:
+                    _net.destroy_isolation(tid)
+                except Exception:
+                    pass
+                cleaned += 1
             except Exception:
-                pass
-            _kill_task_procs(jail_id_for(tid))
-            _remove_jail_tree(tid, jail_id_for(tid))
-            try:
-                _net.destroy_isolation(tid)
-            except Exception:
-                pass
-            cleaned += 1
-        except Exception:
-            continue
+                continue
     return cleaned
 
 
@@ -903,19 +1276,66 @@ def _cleanup_partial(task_id: int) -> None:
         pass
 
 
+def _task_id_from_workspace(workspace: str) -> int | None:
+    try:
+        base = os.path.basename(os.path.abspath(workspace))
+        if base.startswith("task-"):
+            return int(base.split("task-", 1)[1])
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _run_host_git(workspace: str, *args: str, cap: int = 8000) -> str:
+    """Run host git without a shell (Windows-safe) and truncate in Python."""
+    import subprocess as _sp
+
+    try:
+        proc = _sp.run(
+            ["git", *args], cwd=workspace, capture_output=True, text=True,
+            timeout=30,
+        )
+    except (OSError, _sp.TimeoutExpired) as exc:
+        return f"ERROR: {exc}"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if len(out) > cap:
+        out = out[:cap] + f"\n...[truncated {len(out) - cap} bytes]..."
+    return f"exit_code: {proc.returncode}\n{out}"
+
+
+def guest_status_and_diff(workspace: str, *, what: str) -> str:
+    """Host-side git status/diff reflecting the guest's current edits.
+
+    Architecture (P1-4): `.git` objects/refs NEVER enter the guest, so git
+    cannot run there. Instead the guest working tree is reconciled into
+    the trusted host workspace (symlink-safe, sensitive names blocked;
+    `.git` untouched) and host git answers from the authoritative repo.
+    Push-capable credentials live only on the host and are never sent to
+    the guest. Raises SandboxBlockedError when there is no live VM or the
+    listing transport fails (fail closed, never stale output).
+    """
+    task_id = _task_id_from_workspace(workspace)
+    if task_id is None:
+        raise _host.SandboxBlockedError(
+            "firecracker backend requires a task workspace (task-<id>)"
+        )
+    sync_guest_to_host(task_id=task_id, workspace=workspace)
+    if what == "status":
+        return _run_host_git(workspace, "status", "--porcelain=v1", "-uall")
+    if what == "diff":
+        stat = _run_host_git(workspace, "diff", "--stat", cap=4000)
+        diff = _run_host_git(workspace, "diff", cap=16000)
+        return f"{stat}\n{diff}"
+    raise ValueError(f"unknown git view: {what}")
+
+
 class FirecrackerBackend:
     """`firecracker` backend: real microVMs, fail-closed, no host fallback."""
 
     name = "firecracker"
 
     def _task_id_from_workspace(self, workspace: str) -> int | None:
-        try:
-            base = os.path.basename(os.path.abspath(workspace))
-            if base.startswith("task-"):
-                return int(base.split("task-", 1)[1])
-        except (ValueError, IndexError):
-            pass
-        return None
+        return _task_id_from_workspace(workspace)
 
     def _ensure_vm(self, workspace: str):
         task_id = self._task_id_from_workspace(workspace)

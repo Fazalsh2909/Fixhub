@@ -275,16 +275,26 @@ def _git_direct(workspace: str, *args: str, cap: int = 8000) -> str:
 
 def git_status(workspace: str) -> str:
     if _use_firecracker():
-        # Git runs INSIDE the guest on the tokenless checkout (read-only).
-        return run_command(workspace, "git status --porcelain=v1 -uall")
+        # P1-4 host-side architecture: .git objects/refs never enter the
+        # guest, so git cannot run there. Reconcile guest edits into the
+        # trusted host workspace, then answer with host git.
+        try:
+            from app.sandbox import firecracker as _fc
+
+            return _fc.guest_status_and_diff(workspace, what="status")
+        except Exception as exc:
+            return f"ERROR: blocked: {exc}"
     return _git_direct(workspace, "status", "--porcelain=v1", "-uall")
 
 
 def git_diff(workspace: str) -> str:
     if _use_firecracker():
-        stat = run_command(workspace, "git diff --stat")
-        diff = run_command(workspace, "git diff")
-        return f"{stat}\n{diff}"
+        try:
+            from app.sandbox import firecracker as _fc
+
+            return _fc.guest_status_and_diff(workspace, what="diff")
+        except Exception as exc:
+            return f"ERROR: blocked: {exc}"
     # bounded diff: stat + capped unified diff
     stat = _git_direct(workspace, "diff", "--stat", cap=4000)
     diff = _git_direct(workspace, "diff", cap=16000)

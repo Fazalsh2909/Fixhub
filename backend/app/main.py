@@ -287,15 +287,12 @@ def _sweep_stale_running_tasks() -> None:
             db.close()
     except Exception:
         pass
-    # Gate 0: reclaim crashed-worker microVMs (jail dirs with no live owner
-    # + overstayed VMs past FC_VM_MAX_RUNTIME_S). Best-effort, never raises;
-    # the DB lease sweep above stays the source of truth for task state.
-    try:
-        from app.sandbox import firecracker as _fc
-
-        _fc.destroy_orphans()
-    except Exception:
-        pass
+    # Gate 0 (P0-2): the API tier MUST NOT reap microVMs. destroy_orphans()
+    # used to run here, but this process cannot see worker-owned registry
+    # entries, so a live VM looked orphaned. Reaping runs only in the
+    # sandbox host's worker/manager process (see tasks/worker.py), keyed
+    # on durable owner records + DB leases. The DB lease sweep above stays
+    # the source of truth for task state.
 
 
 def _start_recovery_sweep() -> None:

@@ -95,6 +95,9 @@ class Settings(BaseSettings):
     # overstay reaper). Must stay below JOB_TIMEOUT_S so the RQ kill (not a
     # leaked VM) is what bounds runaway work.
     FC_VM_MAX_RUNTIME_S: int = 1500
+    # Owner heartbeat age (seconds) past which a dead owner is considered
+    # stale. A stale heartbeat alone never reaps a live-leased task.
+    FC_OWNER_STALE_S: int = 900
     FC_BOOT_TIMEOUT_S: int = 30
     FC_VSOCK_TIMEOUT_S: int = 10
     # Host egress services (root-ns veth address; see net.py/egress.py).

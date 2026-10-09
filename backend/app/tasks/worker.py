@@ -36,6 +36,18 @@ def main() -> None:
     if settings.ENV.strip().lower() != "prod":
         Base.metadata.create_all(bind=engine)
         ensure_columns()
+    # Gate 0 (P0-2): reap crashed-worker microVMs from the sandbox host's
+    # worker process (same host as the jail dirs). The API tier never reaps:
+    # only this host's manager may destroy this host's VMs, and only with a
+    # provably dead owner (host + pid + stale heartbeat + no live DB lease).
+    try:
+        from app.sandbox import firecracker as _fc
+
+        cleaned = _fc.destroy_orphans()
+        if cleaned:
+            log.info("reclaimed %d orphan microVM(s) at worker startup", cleaned)
+    except Exception as exc:
+        log.warning("orphan microVM sweep failed (non-fatal): %s", exc)
     with Connection(conn):
         q = Queue(settings.QUEUE_NAME)
         log.info(

@@ -106,7 +106,7 @@ def test_forbidden_cidrs_parse():
 
 
 def test_nft_ruleset_default_deny():
-    rules = "\n".join(_net._nft_rules(tap="ftap1", proxy_port=8443))
+    rules = "\n".join(_net._nft_rules(tap="ftap1", proxy_port=8443, iface="vh1"))
     assert "169.254.169.254" in rules
     assert "dport 53 drop" in rules
 
@@ -207,6 +207,21 @@ def test_cgroup_args_v2_shape(monkeypatch):
     assert "cpus=" not in blob
 
 
+def test_cgroup_args_v1_real_quota_not_shares(monkeypatch):
+    """cgroup v1 must enforce a real CPU quota (cfs), never cpu.shares."""
+    from app.sandbox import firecracker as _fc
+
+    monkeypatch.setattr(_fc, "cgroup_version", lambda: "1")
+    version, args = _fc.jailer_cgroup_args(vcpu=2, mem_mib=1024, pids_max=256)
+    assert version == "1"
+    blob = " ".join(args)
+    assert "cpu.cfs_quota_us=200000" in blob
+    assert "cpu.cfs_period_us=100000" in blob
+    assert "cpu.shares" not in blob
+    assert f"memory.limit_in_bytes={1024 * 1024 * 1024}" in blob
+    assert "pids.max=256" in blob
+
+
 def test_overlay_cap_rejects_oversize_base(monkeypatch, tmp_path):
     from app.sandbox import firecracker as _fc
 
@@ -225,11 +240,30 @@ def test_overlay_cap_rejects_oversize_base(monkeypatch, tmp_path):
     raise AssertionError("oversize base rootfs must refuse boot")
 
 
+def test_nft_rules_match_veth_host_not_tap():
+    """Host-namespace rules must match the veth-host device (visible here).
+
+    Matching the TAP name would silently match nothing: the TAP lives in
+    the task netns. Chain names stay per-task (tap-derived) so task B
+    never flushes task A's chains.
+    """
+    import pytest as _pytest
+
+    from app.sandbox import net as _net
+
+    rules = "\n".join(_net._nft_rules(tap="ftap7", proxy_port=8443, iface="vh7"))
+    assert 'iifname "vh7"' in rules
+    assert '"ftap7"' not in rules
+    assert "pre_ftap7" in rules and "out_ftap7" in rules
+    with _pytest.raises(_net.NetworkIsolationError):
+        _net._nft_rules(tap="ftap7", proxy_port=8443)
+
+
 def test_nft_rules_proxy_only_no_open_443():
     """No bare `tcp dport 443 accept`: everything funnels to the proxy."""
     from app.sandbox import net as _net
 
-    rules = "\n".join(_net._nft_rules(tap="ftap9", proxy_port=8443))
+    rules = "\n".join(_net._nft_rules(tap="ftap9", proxy_port=8443, iface="vh9"))
     assert "dnat to 10.200.0.1:8443" in rules
     assert "tcp dport 443 drop" in rules
     # The forward chain itself is default-deny.
@@ -295,8 +329,43 @@ def test_dns_stub_answers_allowlisted(monkeypatch):
     assert _socket.inet_aton("1.2.3.4") in resp
 
 
+def _dead_pid() -> int:
+    """A valid-range PID that is (practically) never allocated.
+
+    Stays inside the plausible PID range so liveness probing is a single
+    instant `os.kill` check — no child processes spawned, no absurd
+    out-of-range PIDs. Tests always pair it with a very stale heartbeat
+    (and, where relevant, lease state), mirroring production's layered
+    check: even a recycled PID could not cause a wrongful reap without a
+    live lease AND a fresh heartbeat.
+    """
+    return 2**21 - 1  # 2097151: valid range, never allocated on test hosts
+
+
+def _write_test_owner(base, tid, *, host=None, pid=None, age_s=2000):
+    """Plant a durable owner record for a jail dir (crashed-worker sim)."""
+    import json as _json
+    import time as _time
+
+    from app.sandbox import firecracker as _fc
+
+    owner = {
+        "task_id": tid,
+        "host": host if host is not None else _fc._local_host(),
+        "worker": "w-test",
+        "pid": pid if pid is not None else _dead_pid(),
+        "pid_start": "",
+        "user": "",
+        "heartbeat": _time.time() - age_s,
+    }
+    path = base / "firecracker" / f"task-{tid}" / "owner.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(owner), encoding="utf-8")
+    return owner
+
+
 def test_destroy_orphans_reaps_stale_jail_dir(monkeypatch, tmp_path):
-    """destroy_orphans() actually removes jail dirs with no live owner."""
+    """destroy_orphans() reaps jail dirs with provably dead owners only."""
     from app.sandbox import firecracker as _fc
 
     base = tmp_path / "jails"
@@ -307,11 +376,86 @@ def test_destroy_orphans_reaps_stale_jail_dir(monkeypatch, tmp_path):
         "app.sandbox.firecracker._cfg",
         lambda name, default="": str(base) if name == "FC_CHROOT_BASE" else default,
     )
-    # Registry is empty for 424242 (worker crashed before destroy).
+    # Crashed worker: dead pid + very stale heartbeat + no live DB lease.
+    _write_test_owner(base, 424242, age_s=2000)
+    monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: False)
     assert 424242 not in _fc._REG
     cleaned = _fc.destroy_orphans()
     assert cleaned >= 1
     assert not (base / "firecracker" / "task-424242").exists()
+
+
+def test_destroy_orphans_needs_owner_file(monkeypatch, tmp_path):
+    """A jail dir with NO owner record is never reaped (mid-provision safe)."""
+    from app.sandbox import firecracker as _fc
+
+    base = tmp_path / "jails"
+    pending = base / "firecracker" / "task-424249" / "root"
+    pending.mkdir(parents=True)
+    monkeypatch.setattr(
+        "app.sandbox.firecracker._cfg",
+        lambda name, default="": str(base) if name == "FC_CHROOT_BASE" else default,
+    )
+    monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: False)
+    assert 424249 not in _fc._REG
+    assert _fc.destroy_orphans() == 0
+    assert (base / "firecracker" / "task-424249").exists()
+
+
+def test_destroy_orphans_spares_live_foreign_owner(monkeypatch, tmp_path):
+    """A live VM owned by another worker process survives a foreign sweep."""
+    import os as _os
+
+    from app.sandbox import firecracker as _fc
+
+    base = tmp_path / "jails"
+    live = base / "firecracker" / "task-424250" / "root"
+    live.mkdir(parents=True)
+    monkeypatch.setattr(
+        "app.sandbox.firecracker._cfg",
+        lambda name, default="": str(base) if name == "FC_CHROOT_BASE" else default,
+    )
+    # Owner is THIS test process with a fresh heartbeat: alive by definition.
+    _write_test_owner(base, 424250, pid=_os.getpid(), age_s=0)
+    monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: False)
+    assert 424250 not in _fc._REG  # absent locally, yet owned elsewhere
+    assert _fc.destroy_orphans() == 0
+    assert (base / "firecracker" / "task-424250").exists()
+
+
+def test_destroy_orphans_spares_foreign_host(monkeypatch, tmp_path):
+    """Owner records from another host are never reaped here."""
+    from app.sandbox import firecracker as _fc
+
+    base = tmp_path / "jails"
+    other = base / "firecracker" / "task-424251" / "root"
+    other.mkdir(parents=True)
+    monkeypatch.setattr(
+        "app.sandbox.firecracker._cfg",
+        lambda name, default="": str(base) if name == "FC_CHROOT_BASE" else default,
+    )
+    _write_test_owner(base, 424251, host="some-other-host", age_s=99999)
+    monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: False)
+    assert _fc.destroy_orphans() == 0
+    assert (base / "firecracker" / "task-424251").exists()
+
+
+def test_destroy_orphans_live_lease_protects_vm(monkeypatch, tmp_path):
+    """A RUNNING task with a live lease is never reaped, even when the
+    owner pid is dead and the heartbeat is stale (lease always wins)."""
+    from app.sandbox import firecracker as _fc
+
+    base = tmp_path / "jails"
+    leased = base / "firecracker" / "task-424252" / "root"
+    leased.mkdir(parents=True)
+    monkeypatch.setattr(
+        "app.sandbox.firecracker._cfg",
+        lambda name, default="": str(base) if name == "FC_CHROOT_BASE" else default,
+    )
+    _write_test_owner(base, 424252, age_s=99999)
+    monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: True)
+    assert _fc.destroy_orphans() == 0
+    assert (base / "firecracker" / "task-424252").exists()
 
 
 def test_destroy_orphans_reaps_overstayed_live_vm(monkeypatch, tmp_path):
@@ -349,6 +493,108 @@ def test_destroy_orphans_reaps_overstayed_live_vm(monkeypatch, tmp_path):
     finally:
         with _fc._REG_LOCK:
             _fc._REG.pop(424243, None)
+
+
+def _try_symlink(target, link):
+    """Create a symlink; pytest.skip when the platform refuses (Windows)."""
+    import pytest as _pytest
+
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as exc:
+        _pytest.skip(f"symlinks unavailable on this host: {exc}")
+
+
+def test_collect_transfer_never_follows_symlinks(tmp_path):
+    """Host->guest enumeration must not expose outside files via repo links."""
+    from app.sandbox import firecracker as _fc
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "good.py").write_text("print('ok')\n", encoding="utf-8")
+    (ws / ".env").write_text("LLM_API_KEY=topsecret\n", encoding="utf-8")
+    sentinel = tmp_path / "HOST_ONLY_SENTINEL"
+    sentinel.write_text("host-secret-xyz\n", encoding="utf-8")
+    _try_symlink(str(sentinel), str(ws / "innocent.txt"))
+    sub = ws / "sub"
+    sub.mkdir()
+    _try_symlink(str(tmp_path), str(sub / "dirlink"))
+
+    collected = dict(_fc._collect_transfer_files(str(ws)))
+    assert "good.py" in collected
+    assert ".env" not in collected
+    assert "innocent.txt" not in collected
+    assert not any("dirlink" in rel for rel in collected)
+    for rel, full in collected.items():
+        assert "host-secret-xyz" not in _fc._read_host_file_nofollow(full)
+
+
+def test_read_nofollow_refuses_symlink(tmp_path):
+    from app.sandbox import firecracker as _fc
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    real = ws / "real.txt"
+    real.write_text("data\n", encoding="utf-8")
+    assert _fc._read_host_file_nofollow(str(real)) == "data\n"
+    sentinel = tmp_path / "SENTINEL"
+    sentinel.write_text("s3cr3t\n", encoding="utf-8")
+    link = ws / "link.txt"
+    _try_symlink(str(sentinel), str(link))
+    try:
+        _fc._read_host_file_nofollow(str(link))
+    except OSError:
+        return
+    raise AssertionError("O_NOFOLLOW read must refuse symlinks")
+
+
+def test_safe_host_dest_rejects_escapes(tmp_path):
+    import pytest as _pytest
+
+    from app.sandbox import firecracker as _fc
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for bad in ("", "../evil", "/abs", "a/../../b", "C:\\win", "a\x00b"):
+        with _pytest.raises(ValueError):
+            _fc._safe_host_dest(str(ws), bad)
+    # Symlinked parent inside the workspace.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _try_symlink(str(outside), str(ws / "sub"))
+    with _pytest.raises(ValueError):
+        _fc._safe_host_dest(str(ws), "sub/evil.txt")
+    # Symlink at the destination itself.
+    sentinel = outside / "SENTINEL"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    _try_symlink(str(sentinel), str(ws / "dest.txt"))
+    with _pytest.raises(ValueError):
+        _fc._safe_host_dest(str(ws), "dest.txt")
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+
+
+def test_write_host_result_atomic_and_safe(tmp_path):
+    import pytest as _pytest
+
+    from app.sandbox import firecracker as _fc
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    dest = _fc.write_host_result(str(ws), "pkg/app.py", "print(1)\n")
+    assert open(dest, encoding="utf-8").read() == "print(1)\n"
+    assert not os.path.exists(dest + ".fixhub-tmp")
+    # Sensitive names blocked even when the path is otherwise safe.
+    with _pytest.raises(ValueError):
+        _fc.write_host_result(str(ws), ".env", "x=1\n")
+    # Guest path escaping through a host symlink is refused; sentinel intact.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "SENTINEL"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    _try_symlink(str(sentinel), str(ws / "evil.txt"))
+    with _pytest.raises(ValueError):
+        _fc.write_host_result(str(ws), "evil.txt", "pwned\n")
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
 
 
 def test_migrate_strictness(monkeypatch):
