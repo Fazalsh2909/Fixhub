@@ -33,9 +33,12 @@ fast unit tests; `FIXHUB_FIRECRACKER_TEST=1` runs only on the KVM host/CI.
 
 ## 3. Network (host-enforced, see docs/FIRECRACKER_NETWORK.md)
 
-- Per-task netns `fixhub-t<id>` + TAP `ftap<id>`; nft default-deny forward chain
-  `inet fixhub_vm out` (established-only + TCP 443 to proxy; hard drops for
-  metadata 169.254.169.254/32, RFC1918, loopback, direct DNS, all IPv6).
+- Per-task netns `fixhub-t<id>` + TAP `ft<id>` + addressed `/31` veth link;
+  per-task nft chains in `inet fixhub_vm` with interface-scoped rules and
+  explicit catch-all drops (no base-chain drop policies — those would hit
+  unrelated host traffic): prerouting DNATs TCP 443 to the proxy, the
+  INPUT chain admits marked proxy + stub DNS only, the FORWARD chain
+  drops metadata 169.254.169.254/32, RFC1918, loopback, direct DNS, IPv6.
 - Host stub resolver + egress proxy own hostname policy
   (`FC_EGRESS_ALLOWLIST`). Guests have no direct route.
 

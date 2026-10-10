@@ -23,11 +23,15 @@ on the host; environment variables and prompt instructions are not controls.
    guest `/30`s) — host-side end takes the even address, netns-side end
    the odd one. ARP resolves naturally inside each point-to-point `/31`
    (exactly two hosts; no proxy ARP, no floods cross tasks). The netns
-   holds `10.200.0.1/32 via <link-host> dev vg` plus a permanent neigh
-   entry for the service IP; the root ns holds a host route
-   `<guest-net>/30 dev vh` plus a permanent neigh entry for the guest
-   IP. `addr replace` heals stale addresses from older layouts, and
-   verification requires each end to hold exactly its own `/31`.
+   holds link-scoped `10.200.0.1/32 dev vg` — so the permanent neigh
+   entry for the service IP is its actual resolution (a `via` form would
+   resolve the next hop instead and leave that entry decorative) — plus
+   a second permanent neigh entry for the `/31` host peer (the default
+   route's real next hop). No dynamic neighbor resolution happens in
+   the netns. The root ns holds a host route `<guest-net>/30 dev vh`
+   plus a permanent neigh entry for the guest IP. `addr replace` heals
+   stale addresses from older layouts, and verification requires each
+   end to hold exactly its own `/31` plus both permanent entries.
 4. **Netns default route (transport, not permission)**: the task netns
    holds exactly one default route, `default via <link-host> dev vg`,
    so guest traffic for public destinations (guest default via the TAP
@@ -54,13 +58,21 @@ on the host; environment variables and prompt instructions are not controls.
      still fall through to the drops), plus DNS to the host stub —
      then the same hard drops, ending in an explicit catch-all drop so
      guest traffic reaches NO other host-local service;
-   - FORWARD chain (`out_*`, policy drop): accept established/related
-     only, then hard drops — `169.254.169.254/32` (metadata), `10/8`
-     (covers sibling `10.201/16` subnets and the `10.202/16` link
-     pool), `172.16/12`, `192.168/16`, `127/8`; drop direct DNS
-     (`udp/tcp dport 53`) — guests use the host stub only; drop all
-     IPv6 in v1; drop residual TCP 443 (no bare accept anywhere, on
-     either hook).
+   - FORWARD chain (`out_*`, no drop policy — a base-chain policy applies
+     to the whole hook and would drop unrelated host-forwarded traffic;
+     per-task default-deny comes from the explicit interface-scoped
+     catch-all instead): accept established/related, then hard drops —
+     `169.254.169.254/32` (metadata), `10/8` (covers sibling `10.201/16`
+     subnets and the `10.202/16` link pool), `172.16/12`, `192.168/16`,
+     `127/8`; drop direct DNS (`udp/tcp dport 53`) — guests use the host
+     stub only; drop all IPv6 in v1; drop residual TCP 443 (no bare
+     accept anywhere, on either hook).
+   - Established-first is deliberate on both hooks: replies to the guest
+     carry dst `10.201/16` (inside the `10/8` drop), so drops-first would
+     kill all legitimate return traffic. Entries can only establish after
+     passing the drops as NEW; same-IP recreation flushes stale
+     conntrack entries on setup and teardown (`conntrack -D`, best-effort)
+     so they cannot bypass the drops of the next VM.
 3. **Egress proxy + stub resolver** (operator-provided, allowlist =
    `FC_EGRESS_ALLOWLIST`): all guest TCP 443 is routed via the host proxy,
    which allowlists SNI/hostnames (GitHub + package registries) and logs every

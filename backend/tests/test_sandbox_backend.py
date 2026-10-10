@@ -266,8 +266,12 @@ def test_nft_rules_proxy_only_no_open_443():
     rules = "\n".join(_net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9"))
     assert "dnat to 10.200.0.1:8443" in rules
     assert "tcp dport 443 drop" in rules
-    # The forward chain itself is default-deny.
-    assert "policy drop" in dict(_net._chain_specs())["out"]
+    # The forward chain is default-deny FOR THIS TASK ONLY via an explicit
+    # interface-scoped catch-all — never a base-chain drop policy (which
+    # would drop unrelated host-forwarded traffic on the shared hook).
+    assert "policy drop" not in dict(_net._chain_specs())["out"]
+    assert "policy drop" not in dict(_net._chain_specs())["in"]
+    assert rules.splitlines()[-1].endswith('iifname "vh9" drop')
     for line in rules.splitlines():
         if "tcp dport 443 accept" in line:
             raise AssertionError(f"open-443 bypass in nft rules: {line}")
@@ -906,13 +910,14 @@ def _fake_topology_world(tid):
                 stdout=f"3: {vg} inet {link['ns']}/{link['prefix']} scope global\n"
             )
         if args[:2] == ["neigh", "show"]:
+            queried = args[2] if len(args) > 2 else ""
             return _fake_completed(
-                stdout=f"{_net.HOST_SVC_IP} lladdr aa:bb:cc:dd:ee:ff PERMANENT\n"
+                stdout=f"{queried} lladdr aa:bb:cc:dd:ee:ff PERMANENT\n"
             )
         if args[:2] == ["route", "show"] and len(args) == 2:
             return _fake_completed(
                 stdout=(
-                    f"{_net.HOST_SVC_IP}/32 via {link['host']} dev {vg}\n"
+                    f"{_net.HOST_SVC_IP}/32 dev {vg} scope link\n"
                     f"default via {link['host']} dev {vg}\n"
                 )
             )
@@ -973,7 +978,7 @@ def test_verify_rejects_wrong_default_route(monkeypatch):
         args = list(ip_args)
         if args[:2] == ["route", "show"] and len(args) == 2:
             return _fake_completed(
-                stdout=f"{_net.HOST_SVC_IP}/32 via {link['host']} dev {vg}\n"
+                stdout=f"{_net.HOST_SVC_IP}/32 dev {vg} scope link\n"
             )
         return _fake_run_ns(netns_arg, *ip_args, **kwargs)
 
@@ -1017,10 +1022,27 @@ def test_ensure_veth_emits_addressed_routes(monkeypatch):
     monkeypatch.setattr(_net, "_run_ns", _fake_run_ns)
     _net._ensure_veth(netns, vh, vg, addrs, link)
     flat = [" ".join(c) for c in calls]
-    # Addressed ends (replace heals stale layouts), via-routes, default.
+    # Addressed ends (replace heals stale layouts), static routes, default.
     assert any(f"addr replace {link['host']}/{link['prefix']} dev {vh}" in s for s in flat)
     assert any(f"addr replace {link['ns']}/{link['prefix']} dev {vg}" in s for s in flat)
-    assert any(f"route replace {_net.HOST_SVC_IP}/32 via {link['host']}" in s for s in flat)
+    # Service route is link-scoped (dev-form): the static HOST_SVC_IP neigh
+    # entry is its actual resolution. A `via` form would resolve the next
+    # hop instead and leave that entry decorative — refuse that shape.
+    assert any(
+        f"route replace {_net.HOST_SVC_IP}/32 dev {vg}" in s for s in flat
+    )
+    assert not any(
+        f"route replace {_net.HOST_SVC_IP}/32 via" in s for s in flat
+    ), "service route must not use a via next hop"
+    # Static neigh for the service IP AND for the default's real next hop.
+    assert any(
+        f"neigh replace {_net.HOST_SVC_IP} lladdr" in s and "permanent" in s
+        for s in flat
+    )
+    assert any(
+        f"neigh replace {link['host']} lladdr" in s and "permanent" in s
+        for s in flat
+    )
     assert any(f"route replace default via {link['host']} dev {vg}" in s for s in flat)
     # No unqualified service address may ever land on a veth device.
     for s in flat:
@@ -1183,3 +1205,130 @@ def test_atomic_write_detects_post_write_escape(tmp_path, monkeypatch):
     with _pytest.raises(ValueError, match="escaped workspace"):
         _fc.write_host_result(str(ws), "evil.txt", "pwned\n")
     assert not (ws / "evil.txt").exists()
+
+
+# --- Gate 0: scoped enforcement without a global forward drop ---
+
+
+def test_forward_chain_scoped_no_global_policy():
+    """Per-task forward enforcement must not break unrelated host traffic.
+
+    A base-chain `policy drop` applies to the HOOK, so one task would drop
+    every forwarded packet on the host. Instead: no policy on either filter
+    chain, every rule interface-qualified, explicit catch-all last.
+    """
+    from app.sandbox import net as _net
+
+    specs = dict(_net._chain_specs())
+    assert "policy drop" not in specs["out"]
+    assert "policy drop" not in specs["in"]
+    assert "hook forward" in specs["out"] and "hook input" in specs["in"]
+    fwd = _net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9")
+    inp = _net._nft_input_rules(tap="ft9", proxy_port=8443, iface="vh9")
+    for line in fwd + inp:
+        assert 'iifname "vh9"' in line, line  # unmatched traffic unaffected
+    assert fwd[-1].endswith('iifname "vh9" drop')  # per-task default-deny
+    assert inp[-1].endswith('iifname "vh9" drop')
+    # Sibling isolation: neither task's rules match the other's device.
+    sib = _net._nft_rules(tap="ft91022", proxy_port=8443, iface="vh91022")
+    assert 'iifname "vh9"' not in "\n".join(sib)
+    sib_in = _net._nft_input_rules(tap="ft91022", proxy_port=8443, iface="vh91022")
+    assert 'iifname "vh9"' not in "\n".join(sib_in)
+
+
+def test_established_first_is_load_bearing():
+    """Established accepts precede the 10/8 drop on both hooks — replies to
+    the guest (dst 10.201/16, inside 10/8) would otherwise die. Drops still
+    gate every NEW flow; cross-lifetime stale entries are flushed (see
+    _flush_task_conntrack), not papered over by reordering."""
+    from app.sandbox import net as _net
+
+    fwd = _net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9")
+    est = next(i for i, r in enumerate(fwd) if "established,related accept" in r)
+    drop10 = next(i for i, r in enumerate(fwd) if "ip daddr 10.0.0.0/8 drop" in r)
+    assert est < drop10
+    inp = _net._nft_input_rules(tap="ft9", proxy_port=8443, iface="vh9")
+    est_in = next(i for i, r in enumerate(inp) if "established,related accept" in r)
+    drop10_in = next(i for i, r in enumerate(inp) if "ip daddr 10.0.0.0/8 drop" in r)
+    assert est_in < drop10_in
+    # The guest's own subnet is inside the dropped range — proving the
+    # ordering matters (replies must clear before the drop).
+    import ipaddress as _ip
+
+    assert _ip.ip_address(_net.guest_addrs(9)["vm"]) in _ip.ip_network("10.0.0.0/8")
+
+
+def test_conntrack_flush_best_effort(monkeypatch):
+    """Stale-entry hygiene: both orig directions flushed; tool absence never
+    blocks boot (drops still gate NEW flows)."""
+    from app.sandbox import net as _net
+
+    calls: list[tuple[str, ...]] = []
+
+    def _fake_run(*args, **kwargs):
+        calls.append(tuple(args))
+        return _fake_completed(stdout="")
+
+    monkeypatch.setattr(_net, "_run", _fake_run)
+    _net._flush_task_conntrack("10.201.0.2")
+    flat = [" ".join(c) for c in calls]
+    assert "conntrack -D --orig-src 10.201.0.2" in flat
+    assert "conntrack -D --orig-dst 10.201.0.2" in flat
+
+    def _boom(*args, **kwargs):
+        raise OSError("conntrack missing")
+
+    monkeypatch.setattr(_net, "_run", _boom)
+    _net._flush_task_conntrack("10.201.0.2")  # must not raise
+
+
+def test_destroy_flushes_conntrack_and_all_chains(monkeypatch):
+    """Teardown flushes the guest IP first, then removes all three chains."""
+    from app.sandbox import net as _net
+
+    tid = 92001
+    vm_ip = _net.guest_addrs(tid)["vm"]
+    runs: list[tuple[str, ...]] = []
+    nft_cmds: list[tuple[str, ...]] = []
+
+    def _fake_run(*args, **kwargs):
+        runs.append(tuple(args))
+        return _fake_completed(stdout="")
+
+    def _fake_nft(*args):
+        nft_cmds.append(tuple(args))
+        return _fake_completed(stdout="")
+
+    monkeypatch.setattr(_net, "_run", _fake_run)
+    monkeypatch.setattr(_net, "_run_ns", lambda *a, **k: _fake_completed(stdout=""))
+    monkeypatch.setattr(_net, "_nft", _fake_nft)
+    _net.destroy_isolation(tid)  # never raises by contract
+    flat = [" ".join(c) for c in runs]
+    assert f"conntrack -D --orig-src {vm_ip}" in flat
+    deleted = {" ".join(c) for c in nft_cmds if c[:2] == ("delete", "chain")}
+    tap = _net.tap_name(tid)
+    pre, out, in_chain = _net._chain_names(tap)
+    for chain in (pre, out, in_chain):
+        assert any(chain in d for d in deleted), chain
+
+
+def test_verify_requires_link_peer_neigh(monkeypatch):
+    """A missing permanent entry for the default's next hop refuses boot
+    (no silent fallback to dynamic resolution)."""
+    import pytest as _pytest
+
+    from app.sandbox import net as _net
+
+    tid = 92001
+    addrs, link, vh, vg, tap, netns, _fake_run, _fake_run_ns = _fake_topology_world(tid)
+
+    def _no_peer_ns(netns_arg, *ip_args, **kwargs):
+        args = list(ip_args)
+        if args[:2] == ["neigh", "show"] and len(args) > 2 and args[2] == link["host"]:
+            return _fake_completed(stdout="")  # no PERMANENT entry
+        return _fake_run_ns(netns_arg, *ip_args, **kwargs)
+
+    monkeypatch.setattr(_net, "_run", _fake_run)
+    monkeypatch.setattr(_net, "_run_ns", _no_peer_ns)
+    with _pytest.raises(_net.NetworkIsolationError, match="link peer"):
+        _net._verify_topology(netns, tap, vh, vg, addrs, link)

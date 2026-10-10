@@ -548,6 +548,17 @@ def test_19_concurrent_vms_topology_and_lifecycle(tmp_path):
             capture_output=True, text=True, timeout=15,
         )
         assert "meta mark" in (inchains.stdout or ""), inchains
+        # No chain may carry a global drop policy (that would drop
+        # unrelated host-forwarded traffic on the shared hooks); per-task
+        # default-deny comes from the interface-scoped catch-alls instead.
+        outchains = _sp.run(
+            ["nft", "list", "chain", "inet", "fixhub_vm", "out_ft92002"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert "policy drop" not in (outchains.stdout or ""), outchains
+        assert "meta mark" in (outchains.stdout or "") or "drop" in (
+            outchains.stdout or ""
+        ), outchains
         # Recreating A works on the same topology (idempotent rebuild).
         _fc.provision(92001, str(wa))
         out = _exec(92001, "git ls-remote https://github.com/git/git.git HEAD 2>&1 | head -2")
