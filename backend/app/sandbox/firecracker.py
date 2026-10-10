@@ -45,7 +45,6 @@ import tempfile as _tempfile
 import threading
 import time
 
-from app.sandbox import egress as _egress
 from app.sandbox import guest_agent as _guest
 from app.sandbox import images as _images
 from app.sandbox import net as _net
@@ -423,6 +422,91 @@ def vm_max_runtime_s() -> int:
         return 1500
 
 
+# Explicit jailer parent cgroup (upstream default would be the exec-file
+# basename, which varies with operator installs). Deterministic placement
+# <cgroup-base>/fixhub/<jail-id>/ is what verification asserts.
+_CGROUP_PARENT = "fixhub"
+
+
+def _cgroup_mounts() -> list[tuple[str, str, str]]:
+    """Parse /proc/mounts into [(fstype, mountpoint, options)]."""
+    mounts: list[tuple[str, str, str]] = []
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] in ("cgroup", "cgroup2"):
+                    mounts.append((parts[2], parts[1], parts[3]))
+    except OSError:
+        pass
+    return mounts
+
+
+def _expected_cgroup_files(*, version: str, vcpu: int, mem_mib: int,
+                           pids_max: int) -> dict[str, str]:
+    """Controller file -> exact expected content (pure, unit-testable)."""
+    mem_bytes = str(int(mem_mib) * 1024 * 1024)
+    if version == "2":
+        return {
+            "cpu.max": f"{int(vcpu) * 100000} 100000",
+            "memory.max": mem_bytes,
+            "pids.max": str(int(pids_max)),
+        }
+    return {
+        "cpu.cfs_quota_us": str(int(vcpu) * 100000),
+        "cpu.cfs_period_us": "100000",
+        "memory.limit_in_bytes": mem_bytes,
+        "pids.max": str(int(pids_max)),
+    }
+
+
+def _cgroup_base_dir(*, version: str, controller_file: str,
+                     mounts: list[tuple[str, str, str]] | None = None) -> str:
+    """Locate the cgroup mount holding a controller file (v1 per-controller
+    roots, v2 unified hierarchy). Raises RuntimeError when undiscoverable."""
+    if mounts is None:
+        mounts = _cgroup_mounts()
+    for fstype, mount, opts in mounts:
+        if version == "2" and fstype == "cgroup2":
+            return mount
+        if version == "1" and fstype == "cgroup":
+            controller = controller_file.split(".")[0]
+            opt_list = opts.split(",")
+            if controller in opt_list or "all" in opt_list:
+                return mount
+    raise RuntimeError(
+        f"cgroup mount for {controller_file} (v{version}) not discoverable"
+    )
+
+
+def _verify_cgroup_applied(*, jail_id: str, version: str, vcpu: int,
+                           mem_mib: int, pids_max: int) -> None:
+    """Assert the jailer actually applied the VM's limits (fail closed).
+
+    Reads back the controller files at <base>/fixhub/<jail-id>/ (the
+    deterministic placement from --parent-cgroup). A missing file or a
+    value mismatch means the limits are NOT enforced -> refuse boot.
+    """
+    expected = _expected_cgroup_files(
+        version=version, vcpu=vcpu, mem_mib=mem_mib, pids_max=pids_max
+    )
+    for name, want in expected.items():
+        try:
+            base = _cgroup_base_dir(version=version, controller_file=name)
+        except RuntimeError as exc:
+            raise RuntimeError(f"cgroup verification failed: {exc}")
+        path = os.path.join(base, _CGROUP_PARENT, jail_id, name)
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                got = fh.read().strip()
+        except OSError as exc:
+            raise RuntimeError(f"cgroup file unreadable {path}: {exc}")
+        if got != want:
+            raise RuntimeError(
+                f"cgroup limit not enforced: {path} is {got!r}, want {want!r}"
+            )
+
+
 def provision(task_id: int, workspace: str, *, owner_worker: str = "") -> _VM:
     """Boot (or reuse) the task's microVM and sync the tokenless repo tree.
 
@@ -477,16 +561,33 @@ def provision(task_id: int, workspace: str, *, owner_worker: str = "") -> _VM:
         _write_owner(task_id, worker=owner_worker)
         _prepare_overlay(overlay)
         _stage_boot_files(chroot, overlay, uid=uid, gid=gid)
+        # Single resource read for spawn AND verification (never diverge,
+        # even if operator config changes mid-provision).
+        vcpu, mem_mib, pids_max = _fc_resources()
         jailer_proc = _spawn_jailer(
             task_id=task_id, jail_id=jail_id, chroot_dir=chroot,
             api_socket=api_socket, netns=netinfo["netns"],
             uid=uid, gid=gid,
+            vcpu=vcpu, mem_mib=mem_mib, pids_max=pids_max,
         )
+        # Limits must be OBSERVED applied, not merely requested: read back
+        # the cgroup files the jailer wrote. Any miss/mismatch refuses boot.
+        try:
+            version, _ = jailer_cgroup_args(
+                vcpu=vcpu, mem_mib=mem_mib, pids_max=pids_max
+            )
+            _verify_cgroup_applied(
+                jail_id=jail_id, version=version, vcpu=vcpu,
+                mem_mib=mem_mib, pids_max=pids_max,
+            )
+        except Exception as exc:
+            raise _host.SandboxBlockedError(f"cgroup limits unverified: {exc}")
         _configure_and_boot(
             api_socket=api_socket,
             overlay_name=os.path.basename(overlay),
             cid=cid,
             tap=netinfo["tap"],
+            task_id=task_id,
         )
         vm = _VM(
             task_id=task_id,
@@ -579,9 +680,23 @@ def _stage_boot_files(chroot: str, overlay: str, *, uid: int, gid: int) -> None:
         raise RuntimeError(f"could not chown staged boot files to {uid}:{gid}: {exc}")
 
 
+def _fc_resources() -> tuple[int, int, int]:
+    """Guest resource envelope (vcpu, mem_mib, pids_max) — single source for
+    jailer args AND post-spawn verification (never diverge)."""
+    vcpu = int(_cfg("FC_GUEST_VCPU", 2) or 2)
+    mem_mib = int(_cfg("FC_GUEST_MEM_MIB", 1024) or 1024)
+    try:
+        pids_max = int(_cfg("FC_PIDS_MAX", 256) or 256)
+    except (TypeError, ValueError):
+        pids_max = 256
+    return vcpu, mem_mib, pids_max
+
+
 def _spawn_jailer(
     *, task_id: int, jail_id: str, chroot_dir: str, api_socket: str,
     netns: str, uid: int, gid: int,
+    vcpu: int | None = None, mem_mib: int | None = None,
+    pids_max: int | None = None,
 ) -> "subprocess.Popen":
     """Launch the jailer (foreground, PID-tracked) and wait for its socket.
 
@@ -594,12 +709,11 @@ def _spawn_jailer(
     jailer = _images.jailer_binary()
     fc = _images.firecracker_binary()
     chroot_base = _images.chroot_base()
-    vcpu = int(_cfg("FC_GUEST_VCPU", 2) or 2)
-    mem_mib = int(_cfg("FC_GUEST_MEM_MIB", 1024) or 1024)
-    try:
-        pids_max = int(_cfg("FC_PIDS_MAX", 256) or 256)
-    except (TypeError, ValueError):
-        pids_max = 256
+    if vcpu is None or mem_mib is None or pids_max is None:
+        _vcpu, _mem, _pids = _fc_resources()
+        vcpu = _vcpu if vcpu is None else vcpu
+        mem_mib = _mem if mem_mib is None else mem_mib
+        pids_max = _pids if pids_max is None else pids_max
     cgroup_version, cgroup_args = jailer_cgroup_args(vcpu=vcpu, mem_mib=mem_mib, pids_max=pids_max)
     overlay_bytes = 0
     try:
@@ -618,6 +732,10 @@ def _spawn_jailer(
         "--gid", str(gid),
         "--chroot-base-dir", chroot_base,
         "--cgroup-version", cgroup_version,
+        # Explicit parent cgroup (never the exec-file default): the VM's
+        # limits land at <cgroup-base>/fixhub/<jail-id>/ deterministically,
+        # which is what _verify_cgroup_applied() asserts after spawn.
+        "--parent-cgroup", _CGROUP_PARENT,
         *cgroup_args,
         "--resource-limit", "no-file=1024",
         "--resource-limit", f"fsize={fsize_cap}",
@@ -671,14 +789,19 @@ def _spawn_jailer(
 
 
 def _configure_and_boot(
-    *, api_socket: str, overlay_name: str, cid: int, tap: str
+    *, api_socket: str, overlay_name: str, cid: int, tap: str,
+    task_id: int,
 ) -> None:
     vcpu = int(_cfg("FC_GUEST_VCPU", 2) or 2)
     mem = int(_cfg("FC_GUEST_MEM_MIB", 1024) or 1024)
     kernel_name = os.path.basename(_images.kernel_image()) or "vmlinux"
+    # Per-task guest addresses (concurrent VMs must never share a guest IP:
+    # identical IPs would make host return routes ambiguous and conntrack
+    # tuples collide across tenants).
+    addrs = _net.guest_addrs(task_id)
     boot_args = (
         "console=ttyS0 reboot=k panic=1 pci=off ipv6.disable=1 "
-        f"ip={_net.GUEST_VM_IP}::{_net.GUEST_HOST_IP}:"
+        f"ip={addrs['vm']}::{addrs['gw']}:"
         f"255.255.255.252::eth0:off"
     )
     _api_put(api_socket, "/boot-source", {
@@ -967,24 +1090,29 @@ def _safe_host_dest(workspace: str, rel: str) -> str:
     return dest
 
 
-def _atomic_write_text(dest: str, content: str) -> None:
+def _atomic_write_text(dest: str, content: str, *, stop_at: str = "") -> None:
     """Write text to `dest` atomically via temp-file + rename.
 
     Parents are re-validated symlink-free AFTER creation (a concurrent
     symlink plant between check and write is rejected instead of followed).
+    The upward walk STOPS at `stop_at` (the workspace root): symlinked
+    ancestors ABOVE the workspace (e.g. /tmp -> /private/tmp on macOS) are
+    the operator's environment, not an attack, and must not refuse writes.
     Raises OSError/ValueError on failure.
     """
     import os as _os
 
+    stop = _os.path.abspath(stop_at) if stop_at else ""
     parent = _os.path.dirname(dest)
     if parent:
         _os.makedirs(parent, exist_ok=True)
-        # Re-walk the created parents: any symlink invalidates the write.
-        # Walk up until the filesystem root.
+        # Re-walk the created parents up to (not above) the workspace root.
         node = parent
         seen: set[str] = set()
         while node and node not in seen:
             seen.add(node)
+            if stop and (node == stop or not node.startswith(stop + _os.sep)):
+                break
             try:
                 if _stat.S_ISLNK(_os.lstat(node).st_mode):
                     raise ValueError(f"symlinked parent appeared: {node[:200]}")
@@ -1001,6 +1129,28 @@ def _atomic_write_text(dest: str, content: str) -> None:
         with _os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
         _os.replace(tmp, dest)
+        # Post-write containment: a symlink planted in a parent between the
+        # pre-write walk and the rename would have redirected `dest` outside
+        # the workspace. Detect via realpath and remove + refuse instead of
+        # leaving an escaped write in place.
+        if stop:
+            try:
+                real_dest = _os.path.realpath(dest)
+                real_stop = _os.path.realpath(stop)
+                if real_dest != real_stop and not real_dest.startswith(
+                    real_stop + _os.sep
+                ):
+                    try:
+                        _os.unlink(dest)
+                    except OSError:
+                        pass
+                    raise ValueError(
+                        f"write escaped workspace (realpath {real_dest[:200]})"
+                    )
+            except ValueError:
+                raise
+            except OSError:
+                pass
     except Exception:
         try:
             _os.unlink(tmp)
@@ -1017,10 +1167,18 @@ def write_host_result(workspace: str, rel: str, content: str) -> str:
     """
     from app.agent.paths import is_sensitive as _is_sensitive
 
-    if _is_sensitive(str(rel).split(":")[0]):
+    rel_s = str(rel)
+    # Block when EITHER the full name or the pre-colon prefix is sensitive:
+    # checking only the prefix would miss "good.txt:.env"-style names only
+    # if the full name itself were sensitive, and checking only the full
+    # name would miss ADS-style "secret:stream" smuggling of a sensitive
+    # prefix. Either signal refuses the write.
+    if _is_sensitive(rel_s) or _is_sensitive(rel_s.split(":")[0]):
         raise ValueError("sensitive file is blocked")
     dest = _safe_host_dest(workspace, rel)
-    _atomic_write_text(dest, content)
+    import os as _os
+
+    _atomic_write_text(dest, content, stop_at=_os.path.abspath(workspace))
     return dest
 
 
@@ -1032,7 +1190,10 @@ def sync_guest_to_host(*, task_id: int, workspace: str) -> dict:
     symlink-aware jail (symlinked parents/destinations rejected, sensitive
     names blocked, atomic writes). `.git` internals are NOT copied (host git
     state stays authoritative; publish uses host git).
-    Returns {files, bytes}. Raises SandboxBlockedError on transport failure
+    Returns {files, bytes, truncated}: truncated is True when the transfer
+    caps (10 MB / 2000 files) cut the listing short — callers must surface
+    that instead of presenting a partial tree as complete.
+    Raises SandboxBlockedError on transport failure
     (caller fails the task; never publishes stale state silently).
     """
     import os as _os
@@ -1078,8 +1239,8 @@ def sync_guest_to_host(*, task_id: int, workspace: str) -> dict:
         files += 1
         total_bytes += len(str(rresp.get("content", "")))
         if total_bytes > 10 * 1024 * 1024 or files > 2000:
-            break
-    return {"files": files, "bytes": total_bytes}
+            return {"files": files, "bytes": total_bytes, "truncated": True}
+    return {"files": files, "bytes": total_bytes, "truncated": False}
 
 
 def _remove_jail_tree(task_id: int, jail_id: str) -> None:
@@ -1097,7 +1258,13 @@ def _remove_jail_tree(task_id: int, jail_id: str) -> None:
 
 
 def destroy(task_id: int) -> None:
-    """Halt the VM, kill its processes, remove jail/netns. Never raises."""
+    """Halt the VM, kill its processes, remove jail/netns. Never raises.
+
+    Ownership invariant: call only from the owning worker (normal path) or
+    from destroy_orphans() AFTER _owner_reclaimable() proves the owner is
+    dead/stale on THIS host. destroy() itself performs no ownership check —
+    it is the reaper's gate, not this function's, that protects live VMs.
+    """
     task_id = int(task_id)
     with _REG_LOCK:
         vm = _REG.pop(task_id, None)
@@ -1319,13 +1486,22 @@ def guest_status_and_diff(workspace: str, *, what: str) -> str:
         raise _host.SandboxBlockedError(
             "firecracker backend requires a task workspace (task-<id>)"
         )
-    sync_guest_to_host(task_id=task_id, workspace=workspace)
+    synced = sync_guest_to_host(task_id=task_id, workspace=workspace)
+    notice = ""
+    if synced.get("truncated"):
+        # Fail-visible: a capped reconcile must never present a partial
+        # tree as the complete guest state.
+        notice = (
+            "[warning: guest result sync hit transfer caps "
+            f"({synced['files']} files, {synced['bytes']} bytes); "
+            "status/diff below may be partial]\n"
+        )
     if what == "status":
-        return _run_host_git(workspace, "status", "--porcelain=v1", "-uall")
+        return notice + _run_host_git(workspace, "status", "--porcelain=v1", "-uall")
     if what == "diff":
         stat = _run_host_git(workspace, "diff", "--stat", cap=4000)
         diff = _run_host_git(workspace, "diff", cap=16000)
-        return f"{stat}\n{diff}"
+        return f"{notice}{stat}\n{diff}"
     raise ValueError(f"unknown git view: {what}")
 
 

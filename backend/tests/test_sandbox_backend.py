@@ -251,19 +251,19 @@ def test_nft_rules_match_veth_host_not_tap():
 
     from app.sandbox import net as _net
 
-    rules = "\n".join(_net._nft_rules(tap="ftap7", proxy_port=8443, iface="vh7"))
+    rules = "\n".join(_net._nft_rules(tap="ft7", proxy_port=8443, iface="vh7"))
     assert 'iifname "vh7"' in rules
-    assert '"ftap7"' not in rules
-    assert "pre_ftap7" in rules and "out_ftap7" in rules
+    assert '"ft7"' not in rules
+    assert "pre_ft7" in rules and "out_ft7" in rules
     with _pytest.raises(_net.NetworkIsolationError):
-        _net._nft_rules(tap="ftap7", proxy_port=8443)
+        _net._nft_rules(tap="ft7", proxy_port=8443)
 
 
 def test_nft_rules_proxy_only_no_open_443():
     """No bare `tcp dport 443 accept`: everything funnels to the proxy."""
     from app.sandbox import net as _net
 
-    rules = "\n".join(_net._nft_rules(tap="ftap9", proxy_port=8443, iface="vh9"))
+    rules = "\n".join(_net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9"))
     assert "dnat to 10.200.0.1:8443" in rules
     assert "tcp dport 443 drop" in rules
     # The forward chain itself is default-deny.
@@ -272,7 +272,7 @@ def test_nft_rules_proxy_only_no_open_443():
         if "tcp dport 443 accept" in line:
             raise AssertionError(f"open-443 bypass in nft rules: {line}")
     # Per-task chains (multi-tenant safe).
-    assert "pre_ftap9" in rules and "out_ftap9" in rules
+    assert "pre_ft9" in rules and "out_ft9" in rules
 
 
 def test_egress_allowlist_matching():
@@ -597,6 +597,148 @@ def test_write_host_result_atomic_and_safe(tmp_path):
     assert sentinel.read_text(encoding="utf-8") == "keep\n"
 
 
+def test_guest_addrs_per_task_unique_and_aligned():
+    from app.sandbox import net as _net
+
+    a = _net.guest_addrs(91021)
+    b = _net.guest_addrs(91022)
+    assert a["prefix"] == 30
+    assert a["vm"] != b["vm"] and a["gw"] != b["gw"] and a["net"] != b["net"]
+    for tid in (1, 7, 91001, 100001, 16383, 16384):
+        addrs = _net.guest_addrs(tid)
+        assert addrs["net"].startswith("10.201.")
+        assert addrs["gw"].rsplit(".", 1)[0] == addrs["net"].rsplit(".", 1)[0]
+        last = int(addrs["net"].rsplit(".", 1)[1])
+        assert last % 4 == 0  # /30 alignment
+        assert addrs["gw"].endswith(f".{last + 1}")
+        assert addrs["vm"].endswith(f".{last + 2}")
+    nets = {_net.guest_addrs(i)["net"] for i in range(16384)}
+    assert len(nets) == 16384  # full subnet space, no collisions
+
+
+def test_ifname_full_id_no_truncation():
+    import pytest as _pytest
+
+    from app.sandbox import net as _net
+
+    assert _net.tap_name(1) == "ft1"
+    assert _net.tap_name(100001) == "ft100001"  # must differ, never collide
+    assert _net.veth_names(1) == ("vh1", "vg1")
+    assert _net.veth_names(100001) != _net.veth_names(1)
+    with _pytest.raises(_net.NetworkIsolationError):
+        _net.tap_name(10**15)  # >15 chars: refuse, never truncate
+
+
+def test_nft_redirect_mark_before_drops():
+    """Marked redirect accept must precede the 10/8 drop (post-DNAT dst is
+    10.200.0.1), and unmarked direct-to-proxy traffic must still drop."""
+    from app.sandbox import net as _net
+
+    rules = _net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9")
+    blob = "\n".join(rules)
+    assert "meta mark set 0x1" in blob and "dnat to 10.200.0.1:8443" in blob
+    marked = next(i for i, r in enumerate(rules) if "meta mark 0x1" in r and "accept" in r)
+    drop10 = next(i for i, r in enumerate(rules) if "ip daddr 10.0.0.0/8 drop" in r)
+    assert marked < drop10
+    # No unmarked proxy-port accept anywhere (direct-connect bypass closed).
+    for line in rules:
+        if "tcp dport 8443 accept" in line:
+            assert "meta mark" in line, line
+
+
+def test_teardown_targets_scoped_to_task():
+    from app.sandbox import net as _net
+
+    t = _net._teardown_targets(91021)
+    assert t["netns"] == "fixhub-t91021"
+    assert t["vh"] == "vh91021"
+    assert t["net"].startswith("10.201.")
+    assert "lo" not in (t["vh"], t["tap"])
+    t2 = _net._teardown_targets(91022)
+    assert t["chains"] != t2["chains"]
+    assert t["net"] != t2["net"]
+
+
+def test_atomic_write_stops_at_workspace_root(tmp_path):
+    """Symlinked ancestors ABOVE the workspace must not refuse writes, but
+    symlinked parents INSIDE still do."""
+    from app.sandbox import firecracker as _fc
+
+    real = tmp_path / "real"
+    real.mkdir()
+    ws = real / "ws"
+    ws.mkdir()
+    linkdir = tmp_path / "linkdir"
+    _try_symlink(str(real), str(linkdir))
+    if not os.path.islink(str(linkdir)):
+        return  # symlink platform check already skipped inside _try_symlink
+    ws_via_link = linkdir / "ws"
+    dest = _fc.write_host_result(str(ws_via_link), "pkg/app.py", "print(1)\n")
+    assert open(dest, encoding="utf-8").read() == "print(1)\n"
+
+
+def test_guest_status_warns_on_truncated_sync(tmp_path, monkeypatch):
+    """A capped reconcile must present a visible warning, never silent."""
+    from app.sandbox import firecracker as _fc
+
+    ws = tmp_path / "task-424260"
+    ws.mkdir()
+    monkeypatch.setattr(
+        _fc, "sync_guest_to_host",
+        lambda task_id, workspace: {"files": 2000, "bytes": 1, "truncated": True},
+    )
+    monkeypatch.setattr(
+        _fc, "_run_host_git", lambda workspace, *args, cap=8000: "exit_code: 0\n"
+    )
+    out = _fc.guest_status_and_diff(str(ws), what="status")
+    assert "warning" in out.lower() and "partial" in out.lower()
+    monkeypatch.setattr(
+        _fc, "sync_guest_to_host",
+        lambda task_id, workspace: {"files": 1, "bytes": 9, "truncated": False},
+    )
+    assert "warning" not in _fc.guest_status_and_diff(str(ws), what="status").lower()
+
+
+def test_cgroup_expected_files_shapes():
+    from app.sandbox import firecracker as _fc
+
+    v2 = _fc._expected_cgroup_files(version="2", vcpu=2, mem_mib=1024, pids_max=256)
+    assert v2 == {
+        "cpu.max": "200000 100000",
+        "memory.max": str(1024 * 1024 * 1024),
+        "pids.max": "256",
+    }
+    v1 = _fc._expected_cgroup_files(version="1", vcpu=2, mem_mib=1024, pids_max=256)
+    assert v1["cpu.cfs_quota_us"] == "200000"
+    assert v1["cpu.cfs_period_us"] == "100000"
+    assert "cpu.shares" not in v1
+    assert v1["memory.limit_in_bytes"] == str(1024 * 1024 * 1024)
+
+
+def test_cgroup_base_discovery():
+    from app.sandbox import firecracker as _fc
+
+    mounts = [
+        ("cgroup", "/sys/fs/cgroup/cpu", "rw,cpu"),
+        ("cgroup", "/sys/fs/cgroup/memory", "rw,memory"),
+        ("cgroup2", "/sys/fs/cgroup", "rw,nsdelegate"),
+    ]
+    assert _fc._cgroup_base_dir(
+        version="2", controller_file="cpu.max", mounts=mounts
+    ) == "/sys/fs/cgroup"
+    assert _fc._cgroup_base_dir(
+        version="1", controller_file="cpu.cfs_quota_us", mounts=mounts
+    ) == "/sys/fs/cgroup/cpu"
+    assert _fc._cgroup_base_dir(
+        version="1", controller_file="memory.limit_in_bytes", mounts=mounts
+    ) == "/sys/fs/cgroup/memory"
+    try:
+        _fc._cgroup_base_dir(version="1", controller_file="nope.x", mounts=mounts)
+    except RuntimeError:
+        return
+    raise AssertionError("undiscoverable controller must raise")
+
+
 def test_migrate_strictness(monkeypatch):
     """Prod migration failure stops startup; dev may fall back."""
     import sys as _sys
@@ -610,3 +752,249 @@ def test_migrate_strictness(monkeypatch):
     except _migrate.MigrationFailed:
         return
     raise AssertionError("strict migration failure must raise MigrationFailed")
+
+
+# --- Gate 0: concurrent-VM topology regression (mocked ip/nft, no root) ---
+
+
+def _fake_completed(stdout="", stderr="", returncode=0):
+    import subprocess as _sp
+
+    return _sp.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_concurrent_vms_distinct_topology_and_chains():
+    """Two simultaneous VMs: distinct subnets/routes, per-task chains, shared loopback.
+
+    Regression for the duplicate-HOST_SVC_IP bug (_ensure_veth assigning
+    10.200.0.1/24 to every veth): veth ends must stay unnumbered, the
+    service address lives once on loopback, and sibling chains never overlap.
+    """
+    from app.sandbox import net as _net
+
+    a_id, b_id = 92001, 92002
+    aa, ab = _net.guest_addrs(a_id), _net.guest_addrs(b_id)
+    assert aa["net"] != ab["net"] and aa["vm"] != ab["vm"] and aa["gw"] != ab["gw"]
+    assert aa["net"].startswith("10.201.") and ab["net"].startswith("10.201.")
+
+    # Interface + chain identity is per-task (no truncation collisions).
+    assert _net.veth_names(a_id) != _net.veth_names(b_id)
+    assert _net.tap_name(a_id) != _net.tap_name(b_id)
+    ta, tb = _net._teardown_targets(a_id), _net._teardown_targets(b_id)
+    assert ta["chains"] != tb["chains"] and ta["net"] != tb["net"]
+    assert ta["vh"] != tb["vh"] and ta["tap"] != tb["tap"]
+    # Teardown never touches shared state (loopback) or a sibling's objects.
+    for key in ("netns", "tap", "vh", "net", "vm_ip"):
+        assert tb[key] not in (ta["netns"], ta["tap"], ta["vh"], ta["net"], ta["vm_ip"]) or key in (
+            "net", "vm_ip",
+        )
+    assert "lo" not in (ta["vh"], ta["tap"], tb["vh"], tb["tap"])
+
+    # nft rules for A match only A's veth-host device and carry the full
+    # forbidden set + DNS bypass drops + IPv6 drops + marked proxy accept.
+    for tid, vh in ((a_id, ta["vh"]), (b_id, tb["vh"])):
+        rules = _net._nft_rules(tap=_net.tap_name(tid), proxy_port=8443, iface=vh)
+        blob = "\n".join(rules)
+        other_vh = tb["vh"] if tid == a_id else ta["vh"]
+        assert f'iifname "{vh}"' in blob
+        assert f'iifname "{other_vh}"' not in blob
+        for cidr in _net.FORBIDDEN_CIDRS:
+            assert f"ip daddr {cidr} drop" in blob, cidr
+        assert "udp dport 53" in blob and "tcp dport 53 drop" in blob
+        assert "ip6 daddr ::/0 drop" in blob
+        # Proxy/DNS reachability shape: marked accept to the stub exists,
+        # and no unmarked direct-to-proxy accept exists (bypass closed).
+        assert f"ip daddr {_net.HOST_SVC_IP} tcp dport 8443 accept" in blob
+        assert "meta mark 0x1" in blob
+
+
+def test_verify_rejects_numbered_veth_regression(monkeypatch):
+    """_verify_topology must refuse a veth carrying an IP (old duplicate-IP shape)."""
+    import pytest as _pytest
+
+    from app.sandbox import net as _net
+
+    tid = 92001
+    addrs = _net.guest_addrs(tid)
+    vh, vg = _net.veth_names(tid)
+    tap, netns = _net.tap_name(tid), _net.netns_name(tid)
+
+    def _fake_run(*args, **kwargs):
+        cmd = list(args)
+        if cmd[:3] == ["ip", "addr", "show"] and "lo" in cmd:
+            return _fake_completed(stdout=f"inet {_net.HOST_SVC_IP}/32 scope host lo\n")
+        if cmd[:4] == ["ip", "-o", "addr", "show"]:
+            # Regression shape: veth-host carries the service address.
+            return _fake_completed(stdout=f"2: {vh} inet {_net.HOST_SVC_IP}/24 brd x scope global\n")
+        return _fake_completed(stdout="")
+
+    def _fake_run_ns(netns_arg, *ip_args, **kwargs):
+        if list(ip_args)[:2] == ["addr", "show"]:
+            return _fake_completed(stdout=f"inet {addrs['gw']}/30 scope global {tap}\n")
+        if list(ip_args)[:2] == ["neigh", "show"]:
+            return _fake_completed(stdout=f"{_net.HOST_SVC_IP} lladdr aa:bb:cc:dd:ee:ff PERMANENT\n")
+        if list(ip_args)[:2] == ["route", "show"] and len(list(ip_args)) == 2:
+            return _fake_completed(stdout=f"{addrs['net']}/30 dev {tap} scope link\n")
+        return _fake_completed(stdout="")
+
+    monkeypatch.setattr(_net, "_run", _fake_run)
+    monkeypatch.setattr(_net, "_run_ns", _fake_run_ns)
+    with _pytest.raises(_net.NetworkIsolationError, match="unnumbered"):
+        _net._verify_topology(netns, tap, vh, vg, addrs)
+
+
+def test_loopback_check_requires_exact_32(monkeypatch):
+    """Substring 10.200.0.1 must not satisfy the loopback check (10.200.0.10)."""
+    import pytest as _pytest
+
+    from app.sandbox import net as _net
+
+    calls: list[list[str]] = []
+
+    def _fake_run(*args, **kwargs):
+        calls.append(list(args))
+        if list(args) == ["ip", "addr", "show", "dev", "lo"]:
+            # Longer address sharing the prefix: must NOT count.
+            return _fake_completed(stdout="inet 10.200.0.10/32 scope global lo\n")
+        return _fake_completed(stdout="", stderr="cannot find device", returncode=1)
+
+    monkeypatch.setattr(_net, "_run", _fake_run)
+    with _pytest.raises(_net.NetworkIsolationError):
+        _net._ensure_loopback()
+    # It attempted the exact /32 add after rejecting the imposter.
+    assert any("10.200.0.1/32" in " ".join(c) for c in calls)
+
+
+def test_subnet_collision_fails_closed(monkeypatch):
+    """Two live tasks mapping to the same /30 refuse the second boot."""
+    import pytest as _pytest
+
+    from app.sandbox import net as _net
+
+    tid_a = 7
+    # Same subnet by construction (modulo the 16384-subnet space).
+    tid_b = tid_a + _net.GUEST_SUBNETS
+    assert _net.guest_addrs(tid_a)["net"] == _net.guest_addrs(tid_b)["net"]
+    monkeypatch.setattr(
+        _net, "_live_task_nets", lambda exclude=None: {tid_a: _net.guest_addrs(tid_a)["net"]}
+    )
+    with _pytest.raises(_net.NetworkIsolationError, match="already owned"):
+        _net._assert_subnet_free(tid_b, _net.guest_addrs(tid_b)["net"])
+    # The owner itself is never blocked by its own netns.
+    monkeypatch.setattr(_net, "_live_task_nets", lambda exclude=None: {})
+    _net._assert_subnet_free(tid_a, _net.guest_addrs(tid_a)["net"])
+
+
+def test_owner_reclaimable_db_unknown_requires_runtime_cap(monkeypatch):
+    """DB-unknown reaps only with dead pid AND heartbeat past the VM cap."""
+    import time as _time
+
+    from app.sandbox import firecracker as _fc
+
+    owner = {
+        "task_id": 424260,
+        "host": _fc._local_host(),
+        "worker": "w",
+        "pid": _dead_pid(),
+        "pid_start": "",
+        "user": "",
+        "heartbeat": _time.time() - 1000,  # past stale(900), below cap(1500)
+    }
+    monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: None)
+    assert _fc._owner_reclaimable(dict(owner), stale_s=900) is False
+    owner["heartbeat"] = _time.time() - 2000  # past the runtime cap
+    assert _fc._owner_reclaimable(dict(owner), stale_s=900) is True
+    # Live lease always protects, even with dead pid + ancient heartbeat.
+    monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: True)
+    assert _fc._owner_reclaimable(dict(owner), stale_s=900) is False
+    # Definite not-running lease + dead pid + stale heartbeat reaps.
+    monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: False)
+    assert _fc._owner_reclaimable(dict(owner), stale_s=900) is True
+    # Clock skew (future heartbeat) never reaps.
+    owner["heartbeat"] = _time.time() + 60
+    assert _fc._owner_reclaimable(dict(owner), stale_s=900) is False
+
+
+def test_cgroup_verify_reads_back_limits(tmp_path, monkeypatch):
+    """Post-spawn cgroup verification accepts exact limits, rejects drift."""
+    import pytest as _pytest
+
+    from app.sandbox import firecracker as _fc
+
+    base = tmp_path / "cgroup"
+    base.mkdir()
+    monkeypatch.setattr(
+        _fc, "_cgroup_base_dir", lambda version, controller_file: str(base)
+    )
+    jail = base / "fixhub" / "task-7"
+    jail.mkdir(parents=True)
+    expected = _fc._expected_cgroup_files(version="2", vcpu=2, mem_mib=1024, pids_max=256)
+    for name, want in expected.items():
+        (jail / name).write_text(want, encoding="utf-8")
+    _fc._verify_cgroup_applied(jail_id="task-7", version="2", vcpu=2, mem_mib=1024, pids_max=256)
+    (jail / "memory.max").write_text("1", encoding="utf-8")
+    with _pytest.raises(RuntimeError, match="not enforced"):
+        _fc._verify_cgroup_applied(
+            jail_id="task-7", version="2", vcpu=2, mem_mib=1024, pids_max=256
+        )
+
+
+def test_host_git_no_shell_and_truncates(tmp_path, monkeypatch):
+    """Host git runs argv-style (no shell) and truncates long output visibly."""
+    import subprocess as _sp
+
+    from app.sandbox import firecracker as _fc
+
+    seen: dict = {}
+
+    def _fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["kwargs"] = kwargs
+        assert isinstance(cmd, list) and cmd[0] == "git"
+        assert "shell" not in kwargs
+        big = "x" * 9000
+        return _sp.CompletedProcess(args=cmd, returncode=0, stdout=big, stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    out = _fc._run_host_git(str(tmp_path), "status", "--porcelain=v1", "-uall")
+    assert out.startswith("exit_code: 0")
+    assert "truncated" in out
+    assert seen["cmd"][:2] == ["git", "status"]
+    assert seen["kwargs"].get("cwd") == str(tmp_path)
+
+
+def test_write_host_result_blocks_colon_sensitive(tmp_path):
+    """ADS-style 'sensitive:stream' names are refused via the prefix check."""
+    import pytest as _pytest
+
+    from app.sandbox import firecracker as _fc
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with _pytest.raises(ValueError):
+        _fc.write_host_result(str(ws), ".env:stream", "x=1\n")
+    dest = _fc.write_host_result(str(ws), "notes.txt", "hi\n")
+    assert open(dest, encoding="utf-8").read() == "hi\n"
+
+
+def test_atomic_write_detects_post_write_escape(tmp_path, monkeypatch):
+    """A parent swapped to escape after rename is detected and removed."""
+    import os as _os
+
+    import pytest as _pytest
+
+    from app.sandbox import firecracker as _fc
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    real_realpath = _os.path.realpath
+
+    def _fake_realpath(p):
+        if str(p).endswith("evil.txt"):
+            return "/elsewhere/evil.txt"
+        return real_realpath(p)
+
+    monkeypatch.setattr(_os.path, "realpath", _fake_realpath)
+    with _pytest.raises(ValueError, match="escaped workspace"):
+        _fc.write_host_result(str(ws), "evil.txt", "pwned\n")
+    assert not (ws / "evil.txt").exists()

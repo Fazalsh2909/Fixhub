@@ -427,13 +427,18 @@ def test_17_sibling_vm_network_unreachable(tmp_path):
     _fc.provision(91022, str(wb))
     try:
         import app.sandbox.firecracker as _fcm
+        from app.sandbox import net as _net
 
         with _fcm._REG_LOCK:
             cid_b = _fcm._REG[91022].cid
-        # Sibling guest link-net address + sibling service-net address.
+        sib = _net.guest_addrs(91022)["vm"]
+        own = _net.guest_addrs(91021)["vm"]
+        assert sib != own  # per-task subnets: siblings never share an IP
+        # Sibling guest IP, direct proxy-port without redirect mark, vsock.
         for target in (
-            "curl -m 5 http://172.16.0.2/ 2>&1",
-            "curl -m 5 http://10.200.0.2:8443/ 2>&1",
+            f"curl -m 5 http://{sib}/ 2>&1",
+            f"curl -m 5 http://{sib}:8443/ 2>&1",
+            "curl -m 5 http://10.200.0.1:8443/ -k -o /dev/null -w '%{http_code}' 2>&1",
             f"python3 -c \"import socket;s=socket.socket(socket.AF_VSOCK,socket.SOCK_STREAM);s.settimeout(4);s.connect(({cid_b},5000))\" 2>&1",
         ):
             out = _exec(91021, target)
@@ -480,6 +485,55 @@ def test_18_host_git_status_diff_after_guest_edit(tmp_path):
     finally:
         _settings.SANDBOX_BACKEND = orig
         _fc.destroy(91023)
+
+
+def test_19_concurrent_vms_topology_and_lifecycle(tmp_path):
+    """Two live VMs: distinct subnets/routes, mutual egress, no cross-talk,
+    single-VM destroy preserves the survivor, recreation works."""
+    _require_host()
+    import subprocess as _sp
+
+    from app.sandbox import net as _net
+
+    wa = tmp_path / "task-92001"
+    wb = tmp_path / "task-92002"
+    wa.mkdir()
+    wb.mkdir()
+    (wa / "app.py").write_text("print(1)\n", encoding="utf-8")
+    (wb / "app.py").write_text("print(2)\n", encoding="utf-8")
+    aa, ab = _net.guest_addrs(92001), _net.guest_addrs(92002)
+    assert aa["net"] != ab["net"]
+    _fc.provision(92001, str(wa))
+    _fc.provision(92002, str(wb))
+    try:
+        # Each guest sees its own unique link-net (no shared guest IP).
+        for tid, addrs in ((92001, aa), (92002, ab)):
+            out = _exec(tid, "ip -o addr show dev eth0")
+            assert addrs["vm"] in out["stdout"], (tid, out)
+        # Both reach approved egress through the shared proxy path.
+        for tid in (92001, 92002):
+            out = _exec(tid, "git ls-remote https://github.com/git/git.git HEAD 2>&1 | head -2")
+            assert out["exit_code"] == 0, (tid, out)
+        # Neither reaches the other (no shared L2, no route, nft drops).
+        out = _exec(92001, f"curl -m 5 http://{ab['vm']}/ 2>&1")
+        assert out["exit_code"] != 0, out
+        # Destroying A keeps B's chains, routes and egress intact.
+        _fc.destroy(92001)
+        out = _exec(92002, "git ls-remote https://github.com/git/git.git HEAD 2>&1 | head -2")
+        assert out["exit_code"] == 0, out
+        chains = _sp.run(
+            ["nft", "list", "table", "inet", "fixhub_vm"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert "out_ft92002" in (chains.stdout or ""), chains
+        assert "out_ft92001" not in (chains.stdout or ""), chains
+        # Recreating A works on the same topology (idempotent rebuild).
+        _fc.provision(92001, str(wa))
+        out = _exec(92001, "git ls-remote https://github.com/git/git.git HEAD 2>&1 | head -2")
+        assert out["exit_code"] == 0, out
+    finally:
+        _fc.destroy(92001)
+        _fc.destroy(92002)
 
 
 def test_14_publish_boundary_stays_tokenless(tmp_path):
