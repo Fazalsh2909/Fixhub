@@ -369,27 +369,51 @@ def _assert_subnet_free(task_id: int, net: str) -> None:
             )
 
 
-def _flush_task_conntrack(vm_ip: str) -> None:
-    """Best-effort conntrack flush for one guest IP (stale-entry hygiene).
+def _flush_task_conntrack(vm_ip: str) -> bool:
+    """Conntrack flush for one guest IP (stale-entry hygiene, NOT the boundary).
 
-    `established,related accept` stands FIRST in both chains on purpose:
-    replies to the guest carry dst 10.201/16 (inside the 10/8 drop), so
-    drops-first would kill all legitimate return traffic. That ordering is
-    sound within one VM lifetime (entries can only establish after passing
-    the drops as NEW — flow dst never changes mid-flow on this path), but
-    same-IP recreation would inherit ESTABLISHED entries that bypass the
-    drops. Flushing on setup AND teardown closes that window. Missing tool
-    or empty table is ignored (never raises); the drops still gate every
-    NEW flow regardless.
+    The nftables policy is secure with OR without stale entries: neither
+    chain contains a generic state-keyed accept anymore (forward has zero
+    accepts; input accepts only DNAT-proven or mark-proven proxy flows and
+    the exact stub-DNS shape), so a stale ESTABLISHED entry authorizes
+    nothing. Flushing exists so a recreated same-IP VM's legitimate NEW
+    flows cannot collide with dead tuples in the table.
+
+    Returns True when both deletions exited 0, False otherwise — and boot
+    proceeds either way (callers must NOT gate on this): refusing boot for
+    a missing `conntrack` tool would strand hosts without weakening any
+    rule, while the drops gate every NEW flow regardless. A False return
+    is logged as a warning for operator visibility.
     """
+    import logging as _logging
+
+    log = _logging.getLogger(__name__)
+    if not shutil.which("conntrack"):
+        log.warning(
+            "conntrack tool unavailable; skipping stale-entry flush for %s "
+            "(rules remain state-independent, boot proceeds)",
+            vm_ip,
+        )
+        return False
+    ok = True
     for args in (
         ("conntrack", "-D", "--orig-src", vm_ip),
         ("conntrack", "-D", "--orig-dst", vm_ip),
     ):
         try:
-            _run(*args, timeout=15)
-        except Exception:
-            pass
+            proc = _run(*args, timeout=15)
+        except Exception as exc:
+            log.warning("conntrack flush failed for %s (%s); boot proceeds", vm_ip, exc)
+            ok = False
+            continue
+        if proc.returncode != 0:
+            # Empty table / no such entries also lands here: not fatal.
+            log.warning(
+                "conntrack flush exited %s for %s (%s); boot proceeds",
+                proc.returncode, vm_ip, (proc.stderr or "").strip()[-160:],
+            )
+            ok = False
+    return ok
 
 
 def _ensure_tap(netns: str, tap: str, gw_ip: str) -> None:
@@ -570,13 +594,14 @@ def _nft_rules(*, tap: str, proxy_port: int, iface: str = "") -> list[str]:
         f'add rule inet fixhub_vm {pre} iifname "{iface}" tcp dport 443 '
         f"meta mark set {REDIRECT_MARK} "
         f"dnat to {HOST_SVC_IP}:{proxy_port}",
-        # Established-first is deliberate AND load-bearing: replies to the
-        # guest carry dst 10.201/16 (inside the 10/8 drop below), so
-        # drops-first would kill all legitimate return traffic. Entries can
-        # only establish after passing these drops as NEW; cross-lifetime
-        # stale entries are flushed by _flush_task_conntrack instead.
-        f'add rule inet fixhub_vm {out} iifname "{iface}" '
-        "ct state established,related accept",
+        # NOTE: there is deliberately NO established/related accept on this
+        # chain. Every packet arriving on the veth-host device is either
+        # DNATed to local delivery (TCP 443 -> INPUT hook), stub DNS (local
+        # -> INPUT hook), or forbidden onward traffic. Replies to approved
+        # flows are locally GENERATED (proxy/stub sockets) and traverse the
+        # OUTPUT hook, never forward — so no legitimate forwarded flow needs
+        # a state exception, and a stale ESTABLISHED entry can never bypass
+        # the drops below (it matches only drops — by structure, not luck).
     ]
     # Hard drops on the onward path (metadata, private nets incl. sibling
     # 10.201/16 subnets and the 10.202/16 link pool, loopback).
@@ -614,11 +639,23 @@ def _nft_input_rules(*, tap: str, proxy_port: int, iface: str = "") -> list[str]
     """
     _require_iface(iface)
     _pre, _out, in_chain = _chain_names(tap)
+    # NOTE: no generic established/related accept here either. Every
+    # legitimate input-traversing packet is individually provable without
+    # consulting connection state: each guest->proxy packet is re-DNATed
+    # and re-marked in prerouting (the guest socket stays bound to
+    # public-IP:443), each DNS query matches dst+port directly, and proxy /
+    # stub REPLIES traverse the OUTPUT hook, never input. A stale
+    # ESTABLISHED entry therefore authorizes nothing. (Dropped as a side
+    # effect: ICMP `related` errors — benign; timeouts are already the
+    # guest-visible norm and the single-hop veth has no PMTU issue.)
     rules = [
-        # Established-first, same rationale as the forward chain: proxy/DNS
-        # replies carry dst 10.201/16 (inside the 10/8 drop below).
+        # Persistent-conntrack proof: only flows proven DNATed may reach
+        # the proxy. Paired below with the stateless per-packet mark proof
+        # (either narrow match suffices; both are bound to the exact proxy
+        # dst+port, so neither admits anything else).
         f'add rule inet fixhub_vm {in_chain} iifname "{iface}" '
-        "ct state established,related accept",
+        f"ct status dnat "
+        f"ip daddr {HOST_SVC_IP} tcp dport {proxy_port} accept",
         # Redirected packets are accepted toward the proxy BEFORE the
         # drops (their dst 10.200.0.1/32 would otherwise match the 10/8
         # drop — the mark is what distinguishes them from bypasses).
@@ -724,6 +761,11 @@ def _apply_nft(*, tap: str, proxy_port: int, iface: str) -> None:
         raise NetworkIsolationError(
             "nft verification failed: out chain must not carry a drop policy"
         )
+    if "established" in body:
+        raise NetworkIsolationError(
+            "nft verification failed: out chain must not accept on bare "
+            "connection state (stale entries would bypass the drops)"
+        )
     # Verify input chain: marked proxy accept BEFORE the drops plus the
     # catch-all drop (a missing mark rule would silently drop ALL
     # approved egress after the redirect; a missing catch-all would
@@ -743,6 +785,11 @@ def _apply_nft(*, tap: str, proxy_port: int, iface: str) -> None:
     if "policy drop" in in_body:
         raise NetworkIsolationError(
             "nft verification failed: input chain must not carry a drop policy"
+        )
+    if "established" in in_body:
+        raise NetworkIsolationError(
+            "nft verification failed: input chain must not accept on bare "
+            "connection state (only DNAT-proven or mark-proven proxy flows)"
         )
     proc = _nft("list", "chain", "inet", "fixhub_vm", pre)
     pre_body = proc.stdout or ""

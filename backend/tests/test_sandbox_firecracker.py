@@ -559,6 +559,10 @@ def test_19_concurrent_vms_topology_and_lifecycle(tmp_path):
         assert "meta mark" in (outchains.stdout or "") or "drop" in (
             outchains.stdout or ""
         ), outchains
+        # No chain may accept on bare connection state: stale entries must
+        # authorize nothing (legitimate flows are DNAT/mark-proven).
+        assert "established" not in (outchains.stdout or ""), outchains
+        assert "established" not in (inchains.stdout or ""), inchains
         # Recreating A works on the same topology (idempotent rebuild).
         _fc.provision(92001, str(wa))
         out = _exec(92001, "git ls-remote https://github.com/git/git.git HEAD 2>&1 | head -2")

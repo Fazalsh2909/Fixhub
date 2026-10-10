@@ -52,27 +52,36 @@ on the host; environment variables and prompt instructions are not controls.
      DNATed to the host proxy (`10.200.0.1:8443`);
    - INPUT chain (`in_*`, no drop policy — a base-chain policy would hit
      all host input; every rule is `iifname`-qualified instead): accept
-     established/related, plus marked packets toward the proxy (before
-     the drops — post-DNAT dst is `10.200.0.1`, which would otherwise
-     match the `10/8` drop; unmarked direct-to-proxy-port connections
-     still fall through to the drops), plus DNS to the host stub —
-     then the same hard drops, ending in an explicit catch-all drop so
-     guest traffic reaches NO other host-local service;
+     only flows proven to be the approved proxy connection — persistent
+     conntrack proof (`ct status dnat`) or stateless per-packet proof
+     (`meta mark`, re-applied in prerouting to every guest→proxy packet
+     since the guest socket stays bound to public-IP:443) — both bound
+     to the exact proxy dst+port and placed before the drops (post-DNAT
+     dst is `10.200.0.1`, which would otherwise match the `10/8` drop;
+     unmarked direct-to-proxy-port connections still fall through to the
+     drops), plus DNS to the host stub — then the same hard drops, ending
+     in an explicit catch-all drop so guest traffic reaches NO other
+     host-local service. No generic `established` accept: a stale entry
+     authorizes nothing;
    - FORWARD chain (`out_*`, no drop policy — a base-chain policy applies
      to the whole hook and would drop unrelated host-forwarded traffic;
      per-task default-deny comes from the explicit interface-scoped
-     catch-all instead): accept established/related, then hard drops —
+     catch-all instead): zero accepts, then hard drops —
      `169.254.169.254/32` (metadata), `10/8` (covers sibling `10.201/16`
      subnets and the `10.202/16` link pool), `172.16/12`, `192.168/16`,
      `127/8`; drop direct DNS (`udp/tcp dport 53`) — guests use the host
-     stub only; drop all IPv6 in v1; drop residual TCP 443 (no bare
-     accept anywhere, on either hook).
-   - Established-first is deliberate on both hooks: replies to the guest
-     carry dst `10.201/16` (inside the `10/8` drop), so drops-first would
-     kill all legitimate return traffic. Entries can only establish after
-     passing the drops as NEW; same-IP recreation flushes stale
-     conntrack entries on setup and teardown (`conntrack -D`, best-effort)
-     so they cannot bypass the drops of the next VM.
+     stub only; drop all IPv6 in v1; drop residual TCP 443. Nothing is
+     legitimately forwarded (443/DNS go local via DNAT; proxy/stub
+     replies are locally generated and traverse OUTPUT, never these
+     chains), so no state exception exists for a stale entry to exploit.
+   - No generic `established,related` accept on either hook by design.
+     Stale-conntrack hygiene (`conntrack -D` for the guest IP on setup
+     and teardown) remains, but only to avoid dead-tuple collisions for
+     legitimate NEW flows — the boundary does not depend on it. Cleanup
+     reports success/failure (missing tool or nonzero exit logs a warning)
+     and never blocks boot: the rules above are secure with or without
+     stale entries, and the firewall is never weakened to accommodate a
+     missing tool.
 3. **Egress proxy + stub resolver** (operator-provided, allowlist =
    `FC_EGRESS_ALLOWLIST`): all guest TCP 443 is routed via the host proxy,
    which allowlists SNI/hostnames (GitHub + package registries) and logs every
@@ -100,6 +109,6 @@ routes, host-side `/31` addresses, mutual approved egress, no
 cross-talk, survivor-intact destroy (forward + input chains), and
 idempotent recreation. nft counters provide host-side evidence of drops.
 Rule-inspection unit tests cover the veth-match, mark-order, catch-all,
-and no-input-policy contracts, but packet filtering itself is proven
-only by these real-guest runs on the KVM host — a mocked test never
-counts as filtering evidence.
+no-policy, and no-bare-established contracts, but packet filtering itself
+is proven only by these real-guest runs on the KVM host — a mocked test
+never counts as filtering evidence.

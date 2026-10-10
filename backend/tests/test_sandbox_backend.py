@@ -652,10 +652,11 @@ def test_nft_redirect_mark_before_drops():
     marked = next(i for i, r in enumerate(rules) if "meta mark 0x1" in r and "accept" in r)
     drop10 = next(i for i, r in enumerate(rules) if "ip daddr 10.0.0.0/8 drop" in r)
     assert marked < drop10
-    # No unmarked proxy-port accept anywhere (direct-connect bypass closed).
+    # Every proxy-port accept carries a narrow flow proof (per-packet mark
+    # or persistent DNAT status) — a bare direct-connect accept is closed.
     for line in rules:
         if "tcp dport 8443 accept" in line:
-            assert "meta mark" in line, line
+            assert ("meta mark" in line or "ct status dnat" in line), line
     # Catch-all drop is last: no other host-local service is reachable.
     assert rules[-1].endswith('iifname "vh9" drop')
     # Every input rule is interface-qualified (other hosts/tasks unaffected).
@@ -1236,31 +1237,75 @@ def test_forward_chain_scoped_no_global_policy():
     assert 'iifname "vh9"' not in "\n".join(sib_in)
 
 
-def test_established_first_is_load_bearing():
-    """Established accepts precede the 10/8 drop on both hooks — replies to
-    the guest (dst 10.201/16, inside 10/8) would otherwise die. Drops still
-    gate every NEW flow; cross-lifetime stale entries are flushed (see
-    _flush_task_conntrack), not papered over by reordering."""
+def test_no_generic_established_accept_rules_emission():
+    """RULE-GENERATION test only (not packet-filtering proof).
+
+    Neither chain may accept on bare connection state: a stale ESTABLISHED
+    entry for a forbidden destination or a non-proxy host-local service
+    must match drops only. Replies need no state exception — proxy/stub
+    replies are locally generated (OUTPUT hook, never our chains), and
+    every guest->proxy packet is individually re-DNATed/re-marked.
+    """
     from app.sandbox import net as _net
 
     fwd = _net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9")
-    est = next(i for i, r in enumerate(fwd) if "established,related accept" in r)
-    drop10 = next(i for i, r in enumerate(fwd) if "ip daddr 10.0.0.0/8 drop" in r)
-    assert est < drop10
+    assert not any("established" in r for r in fwd)
+    # The forward chain has ZERO accepts: nothing is legitimately
+    # forwarded (443/DNS go local via DNAT; replies go via OUTPUT).
+    assert not any(" accept" in r for r in fwd), [
+        r for r in fwd if " accept" in r
+    ]
     inp = _net._nft_input_rules(tap="ft9", proxy_port=8443, iface="vh9")
-    est_in = next(i for i, r in enumerate(inp) if "established,related accept" in r)
-    drop10_in = next(i for i, r in enumerate(inp) if "ip daddr 10.0.0.0/8 drop" in r)
-    assert est_in < drop10_in
-    # The guest's own subnet is inside the dropped range — proving the
-    # ordering matters (replies must clear before the drop).
-    import ipaddress as _ip
-
-    assert _ip.ip_address(_net.guest_addrs(9)["vm"]) in _ip.ip_network("10.0.0.0/8")
+    assert not any("established" in r for r in inp)
 
 
-def test_conntrack_flush_best_effort(monkeypatch):
-    """Stale-entry hygiene: both orig directions flushed; tool absence never
-    blocks boot (drops still gate NEW flows)."""
+def test_stale_flow_to_forbidden_dst_matches_drops_only_rules_emission():
+    """RULE-GENERATION test only (not packet-filtering proof).
+
+    A stale established flow to a forbidden destination (or a non-proxy
+    host-local service) can only match drop rules: every rule mentioning
+    a forbidden range or the catch-all is a drop, and no accept admits
+    those destinations.
+    """
+    from app.sandbox import net as _net
+
+    for rules in (
+        _net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9"),
+        _net._nft_input_rules(tap="ft9", proxy_port=8443, iface="vh9"),
+    ):
+        for cidr in ("169.254.169.254/32", "10.0.0.0/8", "172.16.0.0/12",
+                     "192.168.0.0/16", "127.0.0.0/8"):
+            hits = [r for r in rules if f"ip daddr {cidr}" in r]
+            assert hits, cidr
+            assert all(r.rstrip().endswith("drop") for r in hits), hits
+
+
+def test_approved_proxy_subsequent_packets_accepted_rules_emission():
+    """RULE-GENERATION test only (not packet-filtering proof).
+
+    First AND subsequent packets of an approved proxy connection are
+    accepted without consulting connection state: the persistent
+    conntrack proof (`ct status dnat`) and the stateless per-packet mark
+    proof, both bound to the exact proxy dst+port.
+    """
+    from app.sandbox import net as _net
+
+    inp = _net._nft_input_rules(tap="ft9", proxy_port=8443, iface="vh9")
+    blob = "\n".join(inp)
+    assert (
+        'ct status dnat ip daddr 10.200.0.1 tcp dport 8443 accept' in blob
+    )
+    assert "meta mark 0x1 ip daddr 10.200.0.1 tcp dport 8443 accept" in blob
+    # Stub DNS stays exactly shaped (no state involved).
+    assert any(
+        "udp dport 53" in r and "ip daddr 10.200.0.1 accept" in r for r in inp
+    )
+
+
+def test_conntrack_flush_reports_status(monkeypatch):
+    """Cleanup reports success/failure but never blocks boot: the rules are
+    secure with or without stale entries (no state-keyed accept remains),
+    so a missing tool or nonzero exit is a logged warning, not a refusal."""
     from app.sandbox import net as _net
 
     calls: list[tuple[str, ...]] = []
@@ -1270,16 +1315,31 @@ def test_conntrack_flush_best_effort(monkeypatch):
         return _fake_completed(stdout="")
 
     monkeypatch.setattr(_net, "_run", _fake_run)
-    _net._flush_task_conntrack("10.201.0.2")
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/sbin/conntrack")
+    assert _net._flush_task_conntrack("10.201.0.2") is True
     flat = [" ".join(c) for c in calls]
     assert "conntrack -D --orig-src 10.201.0.2" in flat
     assert "conntrack -D --orig-dst 10.201.0.2" in flat
+
+    # Missing tool: False + warning, boot proceeds.
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    assert _net._flush_task_conntrack("10.201.0.2") is False
+
+    # Crashed spawn: False, never raises.
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/sbin/conntrack")
 
     def _boom(*args, **kwargs):
         raise OSError("conntrack missing")
 
     monkeypatch.setattr(_net, "_run", _boom)
-    _net._flush_task_conntrack("10.201.0.2")  # must not raise
+    assert _net._flush_task_conntrack("10.201.0.2") is False
+
+    # Nonzero exit (e.g. empty table): False, never raises.
+    monkeypatch.setattr(
+        _net, "_run",
+        lambda *a, **k: _fake_completed(stdout="", stderr="0 flow entries", returncode=1),
+    )
+    assert _net._flush_task_conntrack("10.201.0.2") is False
 
 
 def test_destroy_flushes_conntrack_and_all_chains(monkeypatch):
@@ -1302,6 +1362,7 @@ def test_destroy_flushes_conntrack_and_all_chains(monkeypatch):
     monkeypatch.setattr(_net, "_run", _fake_run)
     monkeypatch.setattr(_net, "_run_ns", lambda *a, **k: _fake_completed(stdout=""))
     monkeypatch.setattr(_net, "_nft", _fake_nft)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/sbin/conntrack")
     _net.destroy_isolation(tid)  # never raises by contract
     flat = [" ".join(c) for c in runs]
     assert f"conntrack -D --orig-src {vm_ip}" in flat
