@@ -630,13 +630,21 @@ def test_ifname_full_id_no_truncation():
 
 
 def test_nft_redirect_mark_before_drops():
-    """Marked redirect accept must precede the 10/8 drop (post-DNAT dst is
-    10.200.0.1), and unmarked direct-to-proxy traffic must still drop."""
+    """Prerouting marks+DNATs; the INPUT chain (the hook DNATed-to-local
+    packets actually traverse) accepts marked proxy traffic before the
+    10/8 drop; unmarked direct-to-proxy traffic still drops."""
     from app.sandbox import net as _net
 
-    rules = _net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9")
-    blob = "\n".join(rules)
+    pre_fwd = _net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9")
+    blob = "\n".join(pre_fwd)
     assert "meta mark set 0x1" in blob and "dnat to 10.200.0.1:8443" in blob
+    # Forward chain carries NO local-destination accepts (dead rules would
+    # be mistaken for enforcement — DNATed packets never traverse forward).
+    for line in pre_fwd:
+        if "accept" in line:
+            assert "10.200.0.1" not in line, line
+    rules = _net._nft_input_rules(tap="ft9", proxy_port=8443, iface="vh9")
+    blob = "\n".join(rules)
     marked = next(i for i, r in enumerate(rules) if "meta mark 0x1" in r and "accept" in r)
     drop10 = next(i for i, r in enumerate(rules) if "ip daddr 10.0.0.0/8 drop" in r)
     assert marked < drop10
@@ -644,6 +652,13 @@ def test_nft_redirect_mark_before_drops():
     for line in rules:
         if "tcp dport 8443 accept" in line:
             assert "meta mark" in line, line
+    # Catch-all drop is last: no other host-local service is reachable.
+    assert rules[-1].endswith('iifname "vh9" drop')
+    # Every input rule is interface-qualified (other hosts/tasks unaffected).
+    for line in rules:
+        assert 'iifname "vh9"' in line, line
+    # Input chain spec carries no drop policy (that would hit all host input).
+    assert "policy drop" not in dict(_net._chain_specs())["in"]
 
 
 def test_teardown_targets_scoped_to_task():
@@ -763,12 +778,42 @@ def _fake_completed(stdout="", stderr="", returncode=0):
     return _sp.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def test_link_addrs_per_task_unique_and_separate():
+    """Link /31 pool: unique per task, /31-aligned, disjoint from guest pool."""
+    from app.sandbox import net as _net
+
+    a, b = _net.link_addrs(92001), _net.link_addrs(92002)
+    assert a["prefix"] == 31 and b["prefix"] == 31
+    assert a["net"] != b["net"] and a["host"] != b["host"] and a["ns"] != b["ns"]
+    assert a["net"].startswith("10.202.") and b["net"].startswith("10.202.")
+    for tid in (1, 7, 92001, 100001, 32767, 32768):
+        link = _net.link_addrs(tid)
+        guest = _net.guest_addrs(tid)
+        assert link["net"].startswith("10.202.")
+        assert not link["net"].startswith("10.201.")
+        assert not guest["net"].startswith("10.202.")
+        last = int(link["net"].rsplit(".", 1)[1])
+        assert last % 2 == 0  # /31 alignment (even base)
+        assert link["host"].endswith(f".{last}")
+        assert link["ns"].endswith(f".{last + 1}")
+        assert link["host"] != _net.HOST_SVC_IP and link["ns"] != _net.HOST_SVC_IP
+    nets = {_net.link_addrs(i)["net"] for i in range(32768)}
+    assert len(nets) == 32768  # full link space, no collisions
+    # Guest-space wrap implies link-space difference and vice versa: the
+    # guest collision guard therefore covers link collisions too.
+    assert _net.guest_addrs(7)["net"] == _net.guest_addrs(7 + 16384)["net"]
+    assert _net.link_addrs(7)["net"] != _net.link_addrs(7 + 16384)["net"]
+    assert _net.guest_addrs(9)["net"] == _net.guest_addrs(9 + 32768)["net"]
+    assert _net.link_addrs(9)["net"] == _net.link_addrs(9 + 32768)["net"]
+
+
 def test_concurrent_vms_distinct_topology_and_chains():
-    """Two simultaneous VMs: distinct subnets/routes, per-task chains, shared loopback.
+    """Two simultaneous VMs: distinct guest/link subnets, per-task chains/hooks.
 
     Regression for the duplicate-HOST_SVC_IP bug (_ensure_veth assigning
-    10.200.0.1/24 to every veth): veth ends must stay unnumbered, the
-    service address lives once on loopback, and sibling chains never overlap.
+    10.200.0.1/24 to every veth): each veth pair holds only its own /31
+    link addresses, the service address lives once on loopback, and
+    sibling chains never overlap.
     """
     from app.sandbox import net as _net
 
@@ -776,6 +821,8 @@ def test_concurrent_vms_distinct_topology_and_chains():
     aa, ab = _net.guest_addrs(a_id), _net.guest_addrs(b_id)
     assert aa["net"] != ab["net"] and aa["vm"] != ab["vm"] and aa["gw"] != ab["gw"]
     assert aa["net"].startswith("10.201.") and ab["net"].startswith("10.201.")
+    la, lb = _net.link_addrs(a_id), _net.link_addrs(b_id)
+    assert la["net"] != lb["net"] and la["host"] != lb["host"] and la["ns"] != lb["ns"]
 
     # Interface + chain identity is per-task (no truncation collisions).
     assert _net.veth_names(a_id) != _net.veth_names(b_id)
@@ -783,6 +830,8 @@ def test_concurrent_vms_distinct_topology_and_chains():
     ta, tb = _net._teardown_targets(a_id), _net._teardown_targets(b_id)
     assert ta["chains"] != tb["chains"] and ta["net"] != tb["net"]
     assert ta["vh"] != tb["vh"] and ta["tap"] != tb["tap"]
+    assert len(ta["chains"]) == 3  # prerouting + forward + input
+    assert any(c.startswith("in_") for c in ta["chains"])
     # Teardown never touches shared state (loopback) or a sibling's objects.
     for key in ("netns", "tap", "vh", "net", "vm_ip"):
         assert tb[key] not in (ta["netns"], ta["tap"], ta["vh"], ta["net"], ta["vm_ip"]) or key in (
@@ -790,8 +839,9 @@ def test_concurrent_vms_distinct_topology_and_chains():
         )
     assert "lo" not in (ta["vh"], ta["tap"], tb["vh"], tb["tap"])
 
-    # nft rules for A match only A's veth-host device and carry the full
-    # forbidden set + DNS bypass drops + IPv6 drops + marked proxy accept.
+    # Forward rules for A match only A's veth-host device and carry the
+    # full forbidden set + DNS bypass drops + IPv6 drops (no local-dst
+    # accepts: DNATed packets traverse input, never forward).
     for tid, vh in ((a_id, ta["vh"]), (b_id, tb["vh"])):
         rules = _net._nft_rules(tap=_net.tap_name(tid), proxy_port=8443, iface=vh)
         blob = "\n".join(rules)
@@ -800,22 +850,30 @@ def test_concurrent_vms_distinct_topology_and_chains():
         assert f'iifname "{other_vh}"' not in blob
         for cidr in _net.FORBIDDEN_CIDRS:
             assert f"ip daddr {cidr} drop" in blob, cidr
-        assert "udp dport 53" in blob and "tcp dport 53 drop" in blob
+        assert "udp dport 53 drop" in blob and "tcp dport 53 drop" in blob
         assert "ip6 daddr ::/0 drop" in blob
-        # Proxy/DNS reachability shape: marked accept to the stub exists,
-        # and no unmarked direct-to-proxy accept exists (bypass closed).
-        assert f"ip daddr {_net.HOST_SVC_IP} tcp dport 8443 accept" in blob
-        assert "meta mark 0x1" in blob
+        for line in rules:
+            if "accept" in line:
+                assert "10.200.0.1" not in line, line
+    # Input rules carry the proxy/DNS reachability shape: marked accept to
+    # the stub exists, and no unmarked direct-to-proxy accept exists.
+    for tid, vh in ((a_id, ta["vh"]), (b_id, tb["vh"])):
+        in_rules = _net._nft_input_rules(
+            tap=_net.tap_name(tid), proxy_port=8443, iface=vh
+        )
+        in_blob = "\n".join(in_rules)
+        assert f"ip daddr {_net.HOST_SVC_IP} tcp dport 8443 accept" in in_blob
+        assert "meta mark 0x1" in in_blob
+        assert f"ip daddr {_net.HOST_SVC_IP} accept" in in_blob  # stub DNS
+        assert in_rules[-1].endswith(f'iifname "{vh}" drop')  # catch-all last
 
 
-def test_verify_rejects_numbered_veth_regression(monkeypatch):
-    """_verify_topology must refuse a veth carrying an IP (old duplicate-IP shape)."""
-    import pytest as _pytest
-
+def _fake_topology_world(tid):
+    """Healthy mocked world for _verify_topology (addressed /31 design)."""
     from app.sandbox import net as _net
 
-    tid = 92001
     addrs = _net.guest_addrs(tid)
+    link = _net.link_addrs(tid)
     vh, vg = _net.veth_names(tid)
     tap, netns = _net.tap_name(tid), _net.netns_name(tid)
 
@@ -824,23 +882,150 @@ def test_verify_rejects_numbered_veth_regression(monkeypatch):
         if cmd[:3] == ["ip", "addr", "show"] and "lo" in cmd:
             return _fake_completed(stdout=f"inet {_net.HOST_SVC_IP}/32 scope host lo\n")
         if cmd[:4] == ["ip", "-o", "addr", "show"]:
-            # Regression shape: veth-host carries the service address.
-            return _fake_completed(stdout=f"2: {vh} inet {_net.HOST_SVC_IP}/24 brd x scope global\n")
+            return _fake_completed(
+                stdout=f"2: {vh} inet {link['host']}/{link['prefix']} brd x scope global\n"
+            )
+        if cmd[:3] == ["ip", "neigh", "show"]:
+            return _fake_completed(
+                stdout=f"{addrs['vm']} lladdr aa:bb:cc:dd:ee:01 PERMANENT\n"
+            )
+        if cmd[:3] == ["ip", "route", "show"]:
+            return _fake_completed(
+                stdout=f"{addrs['net']}/{addrs['prefix']} dev {vh} scope link\n"
+            )
+        if cmd[0] == "sysctl" or "sysctl" in cmd:
+            return _fake_completed(stdout="1\n")
         return _fake_completed(stdout="")
 
     def _fake_run_ns(netns_arg, *ip_args, **kwargs):
-        if list(ip_args)[:2] == ["addr", "show"]:
+        args = list(ip_args)
+        if args[:2] == ["addr", "show"] and tap in args:
             return _fake_completed(stdout=f"inet {addrs['gw']}/30 scope global {tap}\n")
-        if list(ip_args)[:2] == ["neigh", "show"]:
-            return _fake_completed(stdout=f"{_net.HOST_SVC_IP} lladdr aa:bb:cc:dd:ee:ff PERMANENT\n")
-        if list(ip_args)[:2] == ["route", "show"] and len(list(ip_args)) == 2:
-            return _fake_completed(stdout=f"{addrs['net']}/30 dev {tap} scope link\n")
+        if args[:3] == ["-o", "addr", "show"]:
+            return _fake_completed(
+                stdout=f"3: {vg} inet {link['ns']}/{link['prefix']} scope global\n"
+            )
+        if args[:2] == ["neigh", "show"]:
+            return _fake_completed(
+                stdout=f"{_net.HOST_SVC_IP} lladdr aa:bb:cc:dd:ee:ff PERMANENT\n"
+            )
+        if args[:2] == ["route", "show"] and len(args) == 2:
+            return _fake_completed(
+                stdout=(
+                    f"{_net.HOST_SVC_IP}/32 via {link['host']} dev {vg}\n"
+                    f"default via {link['host']} dev {vg}\n"
+                )
+            )
+        return _fake_completed(stdout="")
+
+    return addrs, link, vh, vg, tap, netns, _fake_run, _fake_run_ns
+
+
+def test_verify_accepts_addressed_topology(monkeypatch):
+    """Healthy /31 world (exact link addrs + intended default) verifies."""
+    from app.sandbox import net as _net
+
+    tid = 92001
+    addrs, link, vh, vg, tap, netns, _fake_run, _fake_run_ns = _fake_topology_world(tid)
+    monkeypatch.setattr(_net, "_run", _fake_run)
+    monkeypatch.setattr(_net, "_run_ns", _fake_run_ns)
+    _net._verify_topology(netns, tap, vh, vg, addrs, link)
+
+
+def test_verify_rejects_duplicate_link_address(monkeypatch):
+    """_verify_topology must refuse a veth carrying the service address
+    (old duplicate-IP shape) or any extra address."""
+    import pytest as _pytest
+
+    from app.sandbox import net as _net
+
+    tid = 92001
+    addrs, link, vh, vg, tap, netns, _fake_run, _fake_run_ns = _fake_topology_world(tid)
+
+    def _bad_run(*args, **kwargs):
+        cmd = list(args)
+        if cmd[:4] == ["ip", "-o", "addr", "show"]:
+            # Regression shape: service address duplicated on the veth.
+            return _fake_completed(
+                stdout=(
+                    f"2: {vh} inet {link['host']}/{link['prefix']} scope global\n"
+                    f"2: {vh} inet {_net.HOST_SVC_IP}/24 brd x scope global\n"
+                )
+            )
+        return _fake_run(*args, **kwargs)
+
+    monkeypatch.setattr(_net, "_run", _bad_run)
+    monkeypatch.setattr(_net, "_run_ns", _fake_run_ns)
+    with _pytest.raises(_net.NetworkIsolationError, match="extra addresses"):
+        _net._verify_topology(netns, tap, vh, vg, addrs, link)
+
+
+def test_verify_rejects_wrong_default_route(monkeypatch):
+    """A missing or foreign default route in the netns refuses boot."""
+    import pytest as _pytest
+
+    from app.sandbox import net as _net
+
+    tid = 92001
+    addrs, link, vh, vg, tap, netns, _fake_run, _fake_run_ns = _fake_topology_world(tid)
+
+    def _noroute_run_ns(netns_arg, *ip_args, **kwargs):
+        args = list(ip_args)
+        if args[:2] == ["route", "show"] and len(args) == 2:
+            return _fake_completed(
+                stdout=f"{_net.HOST_SVC_IP}/32 via {link['host']} dev {vg}\n"
+            )
+        return _fake_run_ns(netns_arg, *ip_args, **kwargs)
+
+    monkeypatch.setattr(_net, "_run", _fake_run)
+    monkeypatch.setattr(_net, "_run_ns", _noroute_run_ns)
+    with _pytest.raises(_net.NetworkIsolationError, match="default route"):
+        _net._verify_topology(netns, tap, vh, vg, addrs, link)
+
+
+def test_ensure_veth_emits_addressed_routes(monkeypatch):
+    """_ensure_veth assigns exactly the /31 pair + via-routes + default."""
+    from app.sandbox import net as _net
+
+    tid = 92001
+    addrs, link = _net.guest_addrs(tid), _net.link_addrs(tid)
+    vh, vg = _net.veth_names(tid)
+    netns = _net.netns_name(tid)
+    calls: list[tuple[str, ...]] = []
+
+    def _fake_run(*args, **kwargs):
+        calls.append(("root",) + tuple(args))
+        cmd = list(args)
+        if cmd[:4] == ["ip", "-o", "link", "show"]:
+            return _fake_completed(stdout=f"2: {vh} link/ether aa:bb:cc:dd:ee:ff\n")
+        if cmd[0] == "sysctl":
+            return _fake_completed(stdout="")
+        return _fake_completed(stdout="")
+
+    def _fake_run_ns(ns, *ip_args, **kwargs):
+        calls.append(("ns",) + tuple(ip_args))
+        args = list(ip_args)
+        if args[:3] == ["-o", "link", "show"]:
+            return _fake_completed(stdout=f"3: {vg} link/ether aa:bb:cc:dd:ee:01\n")
+        if args[:2] == ["route", "show"]:
+            return _fake_completed(
+                stdout=f"default via {link['host']} dev {vg}\n"
+            )
         return _fake_completed(stdout="")
 
     monkeypatch.setattr(_net, "_run", _fake_run)
     monkeypatch.setattr(_net, "_run_ns", _fake_run_ns)
-    with _pytest.raises(_net.NetworkIsolationError, match="unnumbered"):
-        _net._verify_topology(netns, tap, vh, vg, addrs)
+    _net._ensure_veth(netns, vh, vg, addrs, link)
+    flat = [" ".join(c) for c in calls]
+    # Addressed ends (replace heals stale layouts), via-routes, default.
+    assert any(f"addr replace {link['host']}/{link['prefix']} dev {vh}" in s for s in flat)
+    assert any(f"addr replace {link['ns']}/{link['prefix']} dev {vg}" in s for s in flat)
+    assert any(f"route replace {_net.HOST_SVC_IP}/32 via {link['host']}" in s for s in flat)
+    assert any(f"route replace default via {link['host']} dev {vg}" in s for s in flat)
+    # No unqualified service address may ever land on a veth device.
+    for s in flat:
+        if f"addr replace {_net.HOST_SVC_IP}" in s or f"addr add {_net.HOST_SVC_IP}" in s:
+            raise AssertionError(f"service address on veth: {s}")
 
 
 def test_loopback_check_requires_exact_32(monkeypatch):

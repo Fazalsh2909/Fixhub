@@ -13,29 +13,43 @@ the host must):
   host egress proxy (TCP 8443) and DNS stub (UDP 53) bind it there
   (see egress.py). No per-task interface ever carries it, so duplicate
   IP assignments are impossible by construction;
-- a veth pair links each netns to the root ns, UNNUMBERED (no addresses
-  on either end — nothing to collide). L2 adjacency uses static
-  permanent neigh entries both ways (no ARP floods cross tasks);
-  per-task host route <guest-net>/30 dev <veth-host> carries
-  conntracked return traffic;
-- packet path (verified end to end on the KVM host): guest -> TAP
-  (inside the task netns) -> veth-guest -> veth-host (root ns) ->
-  egress proxy / DNS stub on loopback. nftables rules therefore match
+- a veth pair links each netns to the root ns over a per-task /31 link
+  subnet from 10.202.0.0/16 (RFC 3021, no broadcast consumed): the
+  host-side end takes the even address, the netns-side end the odd one.
+  Link subnets are separate from the guest /30 pool and deterministic
+  per task, so concurrent VMs never share (or duplicate) link
+  addresses. ARP resolves naturally inside each /31 (exactly two
+  hosts); no proxy ARP, no floods cross tasks. Static permanent neigh
+  entries pin the service IP and the guest IP both ways;
+- the task netns holds a DEFAULT route via its own link address
+  (`default via <link-host> dev <veth-guest>`). This route is transport
+  only, NOT permission: it lets guest packets for public destinations
+  travel TAP -> veth-guest -> veth-host (root ns), where nftables
+  decides. Without it, approved egress could never leave the netns;
+  with it, every packet still faces the hooks below;
+- packet path: guest -> TAP (inside the task netns) -> veth-guest ->
+  veth-host (root ns) -> prerouting DNAT (TCP 443 -> host proxy, marked)
+  -> routing decision. DNAT to the LOCAL service address delivers to
+  the INPUT hook, never forward — so policy lives on BOTH hooks:
+  a per-task INPUT chain guards host-local delivery (marked proxy
+  packets + stub DNS only, catch-all drop for any other guest
+  access to host-local services), and the per-task FORWARD chain
+  (default-deny) guards onward-routed traffic (direct DNS bypass,
+  metadata, private nets, IPv6, residual 443). nftables rules match
   the VETH-HOST interface in the DEFAULT namespace — the TAP name
   exists only inside the task netns, so host-namespace rules matching
-  the TAP would never see a packet. NAT redirects ALL guest TCP 443
-  into the proxy AND marks redirected packets; only marked packets are
-  accepted toward the proxy (hostname policy lives in the proxy via
-  SNI sniffing — nft alone cannot do SNI policy, and the mark proves
+  the TAP would never see a packet. Hostname policy lives in the proxy
+  via SNI sniffing — nft alone cannot do SNI policy, and the mark proves
   the packet actually passed the redirect instead of connecting to the
-  proxy port directly); the forward chain is default-deny;
+  proxy port directly;
 - IPv4 forwarding is enabled in BOTH the default ns and the
   task netns (tap->veth-guest forwarding happens inside the netns);
-- hard drops: cloud metadata 169.254.169.254/32, RFC1918, loopback,
-  direct DNS bypass (any port-53 not to the stub), all IPv6;
-- the netns has NO default route to the internet and no route to any
-  sibling subnet: the only L3 destinations reachable are the task's
-  own link-net and the host service address.
+- hard drops (both hooks): cloud metadata 169.254.169.254/32, RFC1918
+  (covers sibling 10.201/16 subnets and the 10.202/16 link pool),
+  loopback, direct DNS bypass (any port-53 not to the stub), all IPv6;
+- per-task host route <guest-net>/30 dev <veth-host> carries
+  conntracked return traffic; the loopback service address and other
+  tasks' chains/routes are never touched by teardown.
 
 All functions raise NetworkIsolationError when enforcement cannot be
 established — callers must then refuse to boot the VM (fail closed).
@@ -71,6 +85,15 @@ GUEST_NET_BASE_HI = 10
 GUEST_NET_BASE_MID = 201
 GUEST_PREFIX = 30
 GUEST_SUBNETS = 16384
+# Per-task veth link-nets carved from 10.202.0.0/16 into /31s (32768
+# subnets, RFC 3021: both addresses usable, no broadcast). Separate pool
+# from the guest /30s: the host-side veth takes the even address, the
+# netns-side veth the odd one. Deterministic per task; ARP stays inside
+# each point-to-point /31 (no proxy ARP anywhere).
+LINK_NET_BASE_HI = 10
+LINK_NET_BASE_MID = 202
+LINK_PREFIX = 31
+LINK_SUBNETS = 32768
 # nft packet mark proving a packet passed the TCP-443 redirect (set in
 # prerouting, checked in forward before the drops). Direct connections to
 # the proxy port carry no mark and hit the drops instead.
@@ -92,6 +115,26 @@ def guest_addrs(task_id: int | str) -> dict:
         "gw": f"{GUEST_NET_BASE_HI}.{GUEST_NET_BASE_MID}.{hi}.{lo + 1}",
         "vm": f"{GUEST_NET_BASE_HI}.{GUEST_NET_BASE_MID}.{hi}.{lo + 2}",
         "prefix": GUEST_PREFIX,
+    }
+
+
+def link_addrs(task_id: int | str) -> dict:
+    """Per-task veth link-net addresses (pure, unit-testable).
+
+    Returns {net, host, ns, prefix}: the root-ns veth end takes `host`,
+    the netns veth end takes `ns`. The pool (10.202/16 /31s) never
+    overlaps the guest pool (10.201/16 /30s); every task's pair is
+    unique, so concurrent veths never duplicate an address.
+    """
+    idx = int(task_id) % LINK_SUBNETS
+    off = idx * 2
+    hi = off // 256
+    lo = off % 256
+    return {
+        "net": f"{LINK_NET_BASE_HI}.{LINK_NET_BASE_MID}.{hi}.{lo}",
+        "host": f"{LINK_NET_BASE_HI}.{LINK_NET_BASE_MID}.{hi}.{lo}",
+        "ns": f"{LINK_NET_BASE_HI}.{LINK_NET_BASE_MID}.{hi}.{lo + 1}",
+        "prefix": LINK_PREFIX,
     }
 
 
@@ -201,6 +244,7 @@ def ensure_isolation(task_id: int | str) -> dict:
         tap = tap_name(task_id)
         vh, vg = veth_names(task_id)
         addrs = guest_addrs(task_id)
+        link = link_addrs(task_id)
         proxy_port = _egress.proxy_port()
         svc_ip = _egress.proxy_addr()
         dns_ip = _egress.dns_addr()
@@ -214,14 +258,14 @@ def ensure_isolation(task_id: int | str) -> dict:
         _ensure_forwarding(netns)
         _ensure_tap(netns, tap, addrs["gw"])
         _assert_subnet_free(task_id, addrs["net"])
-        _ensure_veth(netns, vh, vg, addrs)
+        _ensure_veth(netns, vh, vg, addrs, link)
         # nft runs in the default namespace and MUST match the veth-host
         # interface (vh), which is the interface guest traffic actually
         # arrives on there. Matching the TAP name here would silently
         # match nothing (the TAP lives in the task netns).
         _apply_nft(tap=tap, proxy_port=proxy_port, iface=vh)
         proxy = _egress.ensure_available()
-        _verify_topology(netns, tap, vh, vg, addrs)
+        _verify_topology(netns, tap, vh, vg, addrs, link)
         return {"netns": netns, "tap": tap, "nft_applied": True, "proxy": proxy}
     except NetworkIsolationError:
         raise
@@ -340,33 +384,53 @@ def _ensure_tap(netns: str, tap: str, gw_ip: str) -> None:
         raise NetworkIsolationError(f"tap up failed: {(proc.stderr or '')[-300:]}")
 
 
-def _ensure_veth(netns: str, vh: str, vg: str, addrs: dict) -> None:
-    """Unnumbered veth pair + static L2 adjacency + per-task host route.
+def _ensure_veth(
+    netns: str, vh: str, vg: str, addrs: dict, link: dict,
+) -> None:
+    """Addressed veth pair (/31) + static adjacency + per-task routes.
 
-    Neither end carries an IP address (nothing to duplicate across tasks):
-    - in-netns link route HOST_SVC_IP/32 dev vg + permanent neigh for the
-      service IP via the veth-host MAC (no ARP floods cross tasks);
-    - root-ns host route <guest-net>/30 dev vh + permanent neigh for the
-      guest IP via the veth-guest MAC (conntracked return traffic).
+    Each end carries exactly its own /31 address (unique per task — never
+    duplicated across concurrent VMs):
+    - netns side: <ns-addr>/31 on vg; service route HOST_SVC_IP/32 via the
+      host link address + permanent neigh for the service IP (no ARP
+      floods cross tasks); DEFAULT route via the host link address so
+      guest traffic for public destinations can travel TAP -> vg -> vh.
+      The default route is transport only: root-ns nft decides on both
+      hooks (input for DNATed-to-local, forward for onward), so it
+      grants no internet permission by itself;
+    - root side: <host-addr>/31 on vh; host route <guest-net>/30 dev vh
+      + permanent neigh for the guest IP (conntracked return traffic).
+    `addr replace` (not `add`) heals stale addresses from older layouts.
     """
     net = f"{addrs['net']}/{addrs['prefix']}"
     vm_ip = addrs["vm"]
+    host_ip, ns_ip = link["host"], link["ns"]
+    prefix = link["prefix"]
     proc = _run("ip", "link", "add", vh, "type", "veth", "peer", "name", vg)
     if proc.returncode != 0 and "exists" not in (proc.stderr or "").lower():
         raise NetworkIsolationError(f"veth create failed: {(proc.stderr or '')[-300:]}")
+    proc = _run("ip", "addr", "replace", f"{host_ip}/{prefix}", "dev", vh)
+    if proc.returncode != 0:
+        raise NetworkIsolationError(f"veth host addr failed: {(proc.stderr or '')[-300:]}")
     proc = _run("ip", "link", "set", vh, "up")
     if proc.returncode != 0:
         raise NetworkIsolationError(f"veth host up failed: {(proc.stderr or '')[-300:]}")
     proc = _run("ip", "link", "set", vg, "netns", netns)
     if proc.returncode != 0 and "exists" not in (proc.stderr or "").lower():
         pass
+    proc = _run_ns(netns, "addr", "replace", f"{ns_ip}/{prefix}", "dev", vg)
+    if proc.returncode != 0:
+        raise NetworkIsolationError(f"veth ns addr failed: {(proc.stderr or '')[-300:]}")
     proc = _run_ns(netns, "link", "set", vg, "up")
     if proc.returncode != 0:
         raise NetworkIsolationError(f"veth ns up failed: {(proc.stderr or '')[-300:]}")
     vh_mac = _mac_of(vh)
     vg_mac = _mac_of_ns(netns, vg)
-    # Netns side: service address via the host end (link route + static ARP).
-    proc = _run_ns(netns, "route", "replace", f"{HOST_SVC_IP}/32", "dev", vg)
+    # Netns side: service address via the host link address + static ARP.
+    proc = _run_ns(
+        netns, "route", "replace", f"{HOST_SVC_IP}/32", "via", host_ip,
+        "dev", vg,
+    )
     if proc.returncode != 0:
         raise NetworkIsolationError(f"svc route failed: {(proc.stderr or '')[-300:]}")
     proc = _run_ns(
@@ -375,6 +439,11 @@ def _ensure_veth(netns: str, vh: str, vg: str, addrs: dict) -> None:
     )
     if proc.returncode != 0:
         raise NetworkIsolationError(f"svc neigh failed: {(proc.stderr or '')[-300:]}")
+    # Netns side: default via the host link address (transport to the root
+    # ns for public destinations; nft on both root-ns hooks still decides).
+    proc = _run_ns(netns, "route", "replace", "default", "via", host_ip, "dev", vg)
+    if proc.returncode != 0:
+        raise NetworkIsolationError(f"netns default route failed: {(proc.stderr or '')[-300:]}")
     # Root side: guest net via the host end + static ARP for the guest IP.
     proc = _run("ip", "route", "replace", net, "dev", vh)
     if proc.returncode != 0:
@@ -389,13 +458,20 @@ def _ensure_veth(netns: str, vh: str, vg: str, addrs: dict) -> None:
         raise NetworkIsolationError(
             f"guest neigh failed: {(proc.stderr or '')[-300:]}"
         )
-    # Assert there is no default route in the task netns.
+    # Assert the netns default route is exactly the intended one (one
+    # default, via our link address, on our device — never wide open).
     proc = _run_ns(netns, "route", "show")
-    for line in (proc.stdout or "").splitlines():
-        if line.strip().startswith("default"):
-            raise NetworkIsolationError(
-                f"task netns has a default route (forbidden): {line.strip()[:120]}"
-            )
+    if proc.returncode != 0:
+        raise NetworkIsolationError("could not read netns routes after setup")
+    defaults = [
+        line.strip()
+        for line in (proc.stdout or "").splitlines()
+        if line.strip().startswith("default")
+    ]
+    if len(defaults) != 1 or host_ip not in defaults[0] or vg not in defaults[0]:
+        raise NetworkIsolationError(
+            f"task netns default route is not the intended one: {defaults[:2]}"
+        )
 
 
 def _teardown_targets(task_id: int | str) -> dict:
@@ -407,75 +483,123 @@ def _teardown_targets(task_id: int | str) -> dict:
     tid = int(task_id)
     addrs = guest_addrs(tid)
     vh, _vg = veth_names(tid)
-    pre, out = _chain_names(tap_name(tid))
+    pre, out, in_chain = _chain_names(tap_name(tid))
     return {
         "netns": netns_name(tid),
         "tap": tap_name(tid),
         "vh": vh,
         "net": f"{addrs['net']}/{addrs['prefix']}",
         "vm_ip": addrs["vm"],
-        "chains": (pre, out),
+        "chains": (pre, out, in_chain),
     }
 
 
-def _chain_names(tap: str) -> tuple[str, str]:
+def _chain_names(tap: str) -> tuple[str, str, str]:
     # Per-task chains inside the shared table (multi-tenant safe: creating
-    # task B never flushes task A's rules).
+    # task B never flushes task A's rules). `in_*` guards host-local
+    # delivery (input hook); `out_*` guards onward routing (forward hook).
     safe = "".join(c if c.isalnum() else "_" for c in tap)
-    return f"pre_{safe}", f"out_{safe}"
+    return f"pre_{safe}", f"out_{safe}", f"in_{safe}"
+
+
+def _require_iface(iface: str) -> None:
+    if not iface:
+        raise NetworkIsolationError(
+            "nft match interface is required (veth-host device in the "
+            "default namespace); refusing to emit rules that match nothing"
+        )
 
 
 def _nft_rules(*, tap: str, proxy_port: int, iface: str = "") -> list[str]:
-    """Per-task nft `add rule` lines (pure, unit-testable).
+    """Per-task prerouting + forward `add rule` lines (pure, unit-testable).
 
     `iface` is the interface these rules match in the namespace where nft
     runs (the default namespace): the VETH-HOST device. Chain names stay
     derived from `tap` (stable per-task id; creating task B never flushes
     task A's chains). Hostname allowlisting happens in the egress proxy
     (SNI sniffing); nft is the backstop that (a) redirects ALL guest TCP
-    443 into the proxy and (b) drops every bypass: direct 443 elsewhere,
-    direct DNS, metadata, private nets, IPv6.
+    443 into the proxy and (b) drops every onward bypass: direct 443
+    elsewhere, direct DNS, metadata, private nets, IPv6.
+
+    NOTE: packets DNATed to the LOCAL service address traverse the INPUT
+    hook, never forward — their accepts live in _nft_input_rules(). This
+    forward chain carries no local-destination accepts by design (they
+    would be dead rules mistaken for enforcement).
     """
-    if not iface:
-        raise NetworkIsolationError(
-            "nft match interface is required (veth-host device in the "
-            "default namespace); refusing to emit rules that match nothing"
-        )
-    pre, out = _chain_names(tap)
+    _require_iface(iface)
+    pre, out, _in = _chain_names(tap)
     rules = [
         # NAT: every guest TCP/443 arriving on the veth-host device is
         # redirected to the host proxy AND marked. The mark proves the
         # packet passed the redirect: a guest connecting DIRECTLY to the
-        # proxy port carries no mark and hits the drops below.
+        # proxy port carries no mark and hits the drops (input catch-all).
         f'add rule inet fixhub_vm {pre} iifname "{iface}" tcp dport 443 '
         f"meta mark set {REDIRECT_MARK} "
         f"dnat to {HOST_SVC_IP}:{proxy_port}",
         f'add rule inet fixhub_vm {out} iifname "{iface}" '
         "ct state established,related accept",
-        # Redirected packets are accepted toward the proxy BEFORE the
-        # drops (their dst 10.200.0.1/32 would otherwise match the 10/8
-        # drop — the mark is what distinguishes them from bypasses).
-        f'add rule inet fixhub_vm {out} iifname "{iface}" '
-        f"meta mark {REDIRECT_MARK} "
-        f"ip daddr {HOST_SVC_IP} tcp dport {proxy_port} accept",
     ]
-    # Hard drops (metadata, private nets, loopback, direct proxy-port
-    # connections without a redirect mark, via forward path).
+    # Hard drops on the onward path (metadata, private nets incl. sibling
+    # 10.201/16 subnets and the 10.202/16 link pool, loopback).
     for cidr in FORBIDDEN_CIDRS:
         rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" ip daddr {cidr} drop')
-    # DNS only to the host stub; every other port-53 is a bypass attempt.
-    rules.append(
-        f'add rule inet fixhub_vm {out} iifname "{iface}" udp dport 53 '
-        f"ip daddr {HOST_SVC_IP} accept"
-    )
+    # No local-destination accepts here: stub/proxy traffic is delivered
+    # locally (input hook). Every other port-53 is a bypass attempt.
     rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" udp dport 53 drop')
     rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" tcp dport 53 drop')
     # IPv6 closed in v1.
     rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" meta l4proto ipv6-icmp drop')
     rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" ip6 daddr ::/0 drop')
     # Residual 443 that evaded the redirect is dropped; there is NO bare
-    # `tcp dport 443 accept` and NO unmarked proxy-port accept.
+    # `tcp dport 443 accept` and NO unmarked proxy-port accept anywhere.
     rules.append(f'add rule inet fixhub_vm {out} iifname "{iface}" tcp dport 443 drop')
+    return rules
+
+
+def _nft_input_rules(*, tap: str, proxy_port: int, iface: str = "") -> list[str]:
+    """Per-task INPUT-hook `add rule` lines (pure, unit-testable).
+
+    Prerouting DNAT rewrites guest TCP 443 to the LOCAL service address,
+    so redirected packets are delivered locally and traverse INPUT, never
+    FORWARD. This chain is where the intended proxy/DNS policy is
+    enforced; it ends in an explicit catch-all drop so guest-originated
+    traffic can reach NO other host-local service. Every rule is
+    qualified by `iifname` (the task's veth-host device) so other hosts'
+    and other tasks' input traffic is unaffected — the chain itself
+    carries no `policy drop` for the same reason.
+    """
+    _require_iface(iface)
+    _pre, _out, in_chain = _chain_names(tap)
+    rules = [
+        f'add rule inet fixhub_vm {in_chain} iifname "{iface}" '
+        "ct state established,related accept",
+        # Redirected packets are accepted toward the proxy BEFORE the
+        # drops (their dst 10.200.0.1/32 would otherwise match the 10/8
+        # drop — the mark is what distinguishes them from bypasses).
+        # A direct connection to the proxy port carries no mark and falls
+        # through to the drops + catch-all below.
+        f'add rule inet fixhub_vm {in_chain} iifname "{iface}" '
+        f"meta mark {REDIRECT_MARK} "
+        f"ip daddr {HOST_SVC_IP} tcp dport {proxy_port} accept",
+        # DNS only to the host stub.
+        f'add rule inet fixhub_vm {in_chain} iifname "{iface}" udp dport 53 '
+        f"ip daddr {HOST_SVC_IP} accept",
+    ]
+    # Same hard drops as the forward path (a local destination inside a
+    # forbidden range is still forbidden).
+    for cidr in FORBIDDEN_CIDRS:
+        rules.append(
+            f'add rule inet fixhub_vm {in_chain} iifname "{iface}" ip daddr {cidr} drop'
+        )
+    rules.append(f'add rule inet fixhub_vm {in_chain} iifname "{iface}" udp dport 53 drop')
+    rules.append(f'add rule inet fixhub_vm {in_chain} iifname "{iface}" tcp dport 53 drop')
+    rules.append(
+        f'add rule inet fixhub_vm {in_chain} iifname "{iface}" meta l4proto ipv6-icmp drop'
+    )
+    rules.append(f'add rule inet fixhub_vm {in_chain} iifname "{iface}" ip6 daddr ::/0 drop')
+    rules.append(f'add rule inet fixhub_vm {in_chain} iifname "{iface}" tcp dport 443 drop')
+    # Catch-all LAST: guest traffic to any other host-local service drops.
+    rules.append(f'add rule inet fixhub_vm {in_chain} iifname "{iface}" drop')
     return rules
 
 
@@ -486,26 +610,34 @@ def _nft(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run([nft, *args], capture_output=True, text=True, timeout=15)
 
 
-def _chain_specs() -> tuple[tuple[str, str], tuple[str, str]]:
-    """Chain kinds (pure, unit-testable). The forward chain is default-deny."""
+def _chain_specs() -> tuple[tuple[str, str], tuple[str, str], tuple[str, str]]:
+    """Chain kinds (pure, unit-testable).
+
+    The forward chain is default-deny. The input chain carries NO policy:
+    a base-chain drop policy on input would apply to ALL host input
+    traffic — per-task scoping comes from the `iifname` qualifier on
+    every rule plus the explicit catch-all drop instead.
+    """
     return (
         ("pre", "type nat hook prerouting priority -100;"),
         ("out", "type filter hook forward priority 0; policy drop;"),
+        ("in", "type filter hook input priority 0;"),
     )
 
 
 def _apply_nft(*, tap: str, proxy_port: int, iface: str) -> None:
     # Idempotent: create table/chains (exists is fine), flush ONLY our
     # per-task chains (never another task's), then add exactly the rules
-    # from _nft_rules(). `iface` is the veth-host device visible here.
+    # from _nft_rules() (prerouting + forward) and _nft_input_rules()
+    # (input). `iface` is the veth-host device visible here.
     if not iface:
         raise NetworkIsolationError("nft match interface is required; refusing")
-    pre, out = _chain_names(tap)
+    pre, out, in_chain = _chain_names(tap)
     proc = _nft("add", "table", "inet", "fixhub_vm")
     if proc.returncode != 0 and "exists" not in (proc.stderr or "").lower():
         raise NetworkIsolationError(f"nft table create failed: {(proc.stderr or '')[-300:]}")
     kinds = dict(_chain_specs())
-    for chain, kind in ((pre, "pre"), (out, "out")):
+    for chain, kind in ((pre, "pre"), (out, "out"), (in_chain, "in")):
         spec = kinds[kind]
         proc = _nft("add", "chain", "inet", "fixhub_vm", chain, "{", spec, "}")
         if proc.returncode != 0 and "exists" not in (proc.stderr or "").lower():
@@ -521,9 +653,11 @@ def _apply_nft(*, tap: str, proxy_port: int, iface: str) -> None:
         proc = _nft(*rule.split(" "))
         if proc.returncode != 0:
             raise NetworkIsolationError(f"nft rule add failed: {(proc.stderr or '')[-300:]}")
-    # Verify: our chains exist, default-deny, match the veth-host iface,
-    # and carry the marked redirect (a missing mark rule would silently
-    # drop ALL approved egress after the redirect).
+    for rule in _nft_input_rules(tap=tap, proxy_port=proxy_port, iface=iface):
+        proc = _nft(*rule.split(" "))
+        if proc.returncode != 0:
+            raise NetworkIsolationError(f"nft input rule add failed: {(proc.stderr or '')[-300:]}")
+    # Verify forward chain: default-deny and matches the veth-host iface.
     proc = _nft("list", "chain", "inet", "fixhub_vm", out)
     body = proc.stdout or ""
     if proc.returncode != 0 or "policy drop" not in body:
@@ -532,9 +666,25 @@ def _apply_nft(*, tap: str, proxy_port: int, iface: str) -> None:
         raise NetworkIsolationError(
             f"nft verification failed: out chain does not match {iface}"
         )
-    if f"meta mark {REDIRECT_MARK}" not in body:
+    # Verify input chain: marked proxy accept BEFORE the drops plus the
+    # catch-all drop (a missing mark rule would silently drop ALL
+    # approved egress after the redirect; a missing catch-all would
+    # leave arbitrary host-local services reachable from the guest).
+    proc = _nft("list", "chain", "inet", "fixhub_vm", in_chain)
+    in_body = proc.stdout or ""
+    if proc.returncode != 0:
+        raise NetworkIsolationError("nft verification failed: in chain missing")
+    if f"meta mark {REDIRECT_MARK}" not in in_body:
         raise NetworkIsolationError(
-            "nft verification failed: marked redirect accept missing"
+            "nft verification failed: input marked redirect accept missing"
+        )
+    if f'iifname "{iface}" drop' not in in_body:
+        raise NetworkIsolationError(
+            "nft verification failed: input catch-all drop missing"
+        )
+    if "policy drop" in in_body:
+        raise NetworkIsolationError(
+            "nft verification failed: input chain must not carry a drop policy"
         )
     proc = _nft("list", "chain", "inet", "fixhub_vm", pre)
     pre_body = proc.stdout or ""
@@ -545,8 +695,7 @@ def _apply_nft(*, tap: str, proxy_port: int, iface: str) -> None:
 def destroy_nft_chains(tap: str) -> None:
     """Best-effort removal of per-task nft chains. Never raises."""
     try:
-        pre, out = _chain_names(tap)
-        for chain in (pre, out):
+        for chain in _chain_names(tap):
             try:
                 _nft("delete", "chain", "inet", "fixhub_vm", chain)
             except Exception:
@@ -555,19 +704,26 @@ def destroy_nft_chains(tap: str) -> None:
         pass
 
 
-def _verify_topology(netns: str, tap: str, vh: str, vg: str, addrs: dict) -> None:
+def _verify_topology(
+    netns: str, tap: str, vh: str, vg: str, addrs: dict, link: dict,
+) -> None:
     """Post-setup assertions for the full packet path.
 
     - TAP up with the task gateway IP inside the task netns;
     - loopback carries the service IP (exactly once, shared);
-    - veth ends carry NO addresses (unnumbered — anything assigned here
-      would be a duplicate-IP regression);
+    - each veth end carries EXACTLY its own /31 link address (a missing
+      address breaks the path; any extra address is a duplicate-IP
+      regression across concurrent VMs);
     - static neigh entries + per-task host route present;
     - forwarding on in BOTH namespaces;
-    - no default route in the task netns.
+    - the task netns default route is exactly `default via <link-host>
+      dev <vg>` (transport to the root ns for public destinations —
+      permission still comes only from the input/forward hooks).
     """
     gw_ip, vm_ip = addrs["gw"], addrs["vm"]
     net = f"{addrs['net']}/{addrs['prefix']}"
+    host_ip, ns_ip = link["host"], link["ns"]
+    prefix = link["prefix"]
     proc = _run_ns(netns, "addr", "show", "dev", tap)
     if proc.returncode != 0 or gw_ip not in (proc.stdout or ""):
         raise NetworkIsolationError(
@@ -576,14 +732,28 @@ def _verify_topology(netns: str, tap: str, vh: str, vg: str, addrs: dict) -> Non
     proc = _run("ip", "addr", "show", "dev", "lo")
     if proc.returncode != 0 or f"{HOST_SVC_IP}/32" not in (proc.stdout or ""):
         raise NetworkIsolationError("loopback missing the service address")
-    for dev, where in ((vh, "default namespace"),):
-        proc = _run("ip", "-o", "addr", "show", "dev", dev)
-        if proc.returncode != 0:
-            raise NetworkIsolationError(f"could not read addresses of {dev}")
-        if "inet " in (proc.stdout or ""):
-            raise NetworkIsolationError(
-                f"{dev} carries an IP address in {where} (must be unnumbered)"
-            )
+    proc = _run("ip", "-o", "addr", "show", "dev", vh)
+    if proc.returncode != 0:
+        raise NetworkIsolationError(f"could not read addresses of {vh}")
+    if f"inet {host_ip}/{prefix} " not in ((proc.stdout or "") + " "):
+        raise NetworkIsolationError(
+            f"{vh} missing its /31 link address {host_ip}/{prefix}"
+        )
+    if (proc.stdout or "").count("inet ") != 1:
+        raise NetworkIsolationError(
+            f"{vh} carries extra addresses (must hold only its /31)"
+        )
+    proc = _run_ns(netns, "-o", "addr", "show", "dev", vg)
+    if proc.returncode != 0:
+        raise NetworkIsolationError(f"could not read addresses of {vg} in {netns}")
+    if f"inet {ns_ip}/{prefix} " not in ((proc.stdout or "") + " "):
+        raise NetworkIsolationError(
+            f"{vg} missing its /31 link address {ns_ip}/{prefix} in {netns}"
+        )
+    if (proc.stdout or "").count("inet ") != 1:
+        raise NetworkIsolationError(
+            f"{vg} carries extra addresses in {netns} (must hold only its /31)"
+        )
     proc = _run("ip", "neigh", "show", vm_ip, "dev", vh)
     if proc.returncode != 0 or "PERMANENT" not in (proc.stdout or "").upper():
         raise NetworkIsolationError(f"static neigh for {vm_ip} missing on {vh}")
@@ -611,9 +781,15 @@ def _verify_topology(netns: str, tap: str, vh: str, vg: str, addrs: dict) -> Non
     proc = _run_ns(netns, "route", "show")
     if proc.returncode != 0:
         raise NetworkIsolationError("could not read netns routes for verification")
-    for line in (proc.stdout or "").splitlines():
-        if line.strip().startswith("default"):
-            raise NetworkIsolationError("task netns has a default route after setup")
+    defaults = [
+        line.strip()
+        for line in (proc.stdout or "").splitlines()
+        if line.strip().startswith("default")
+    ]
+    if len(defaults) != 1 or host_ip not in defaults[0] or vg not in defaults[0]:
+        raise NetworkIsolationError(
+            f"task netns default route is not the intended one: {defaults[:2]}"
+        )
 
 
 def destroy_isolation(task_id: int | str) -> None:

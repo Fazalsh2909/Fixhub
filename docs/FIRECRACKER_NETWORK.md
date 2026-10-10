@@ -18,28 +18,49 @@ on the host; environment variables and prompt instructions are not controls.
    There is NO shared bridge and NO shared L2 at all. Interface names
    use full task ids (overlong names refuse instead of truncating into a
    collision). Created before boot; deleted on destroy.
-3. **Unnumbered veth + static adjacency**: neither veth end has an IP.
-   The netns holds a link route `10.200.0.1/32 dev vg` plus a permanent
-   neigh entry for the service IP; the root ns holds a host route
+3. **Addressed veth over per-task /31 link subnets**: each pair gets a
+   unique `/31` from `10.202.0.0/16` (RFC 3021, separate pool from the
+   guest `/30`s) — host-side end takes the even address, netns-side end
+   the odd one. ARP resolves naturally inside each point-to-point `/31`
+   (exactly two hosts; no proxy ARP, no floods cross tasks). The netns
+   holds `10.200.0.1/32 via <link-host> dev vg` plus a permanent neigh
+   entry for the service IP; the root ns holds a host route
    `<guest-net>/30 dev vh` plus a permanent neigh entry for the guest
-   IP. No ARP floods cross tasks; no addresses to collide.
-4. **nft backstop** (`inet fixhub_vm`, per-task chains, forward policy drop).
-   nft runs in the default namespace, so rules match the **veth-host**
-   device (`vh<id>`) — guest packets arrive there, never under the TAP
-   name (the TAP exists only inside the task netns; matching it would
-   silently match nothing):
-   - NAT redirect: all TCP 443 arriving on the veth-host device is marked
-     (`0x1`, proving it passed the redirect) and DNATed to the host
-     proxy (`10.200.0.1:8443`);
-   - accept established/related, plus marked packets toward the proxy
-     (before the drops — post-DNAT dst is `10.200.0.1`, which would
-     otherwise match the `10/8` drop; unmarked direct-to-proxy-port
-     connections still fall through to the drops);
-   - hard drop `169.254.169.254/32` (metadata), `10/8`, `172.16/12`,
-     `192.168/16`, `127/8` on the forward path;
-   - drop direct DNS (`udp/tcp dport 53`) — guests use the host stub
-     (`10.200.0.1:53`) only;
-   - drop all IPv6 in v1; drop residual TCP 443 (no bare accept anywhere).
+   IP. `addr replace` heals stale addresses from older layouts, and
+   verification requires each end to hold exactly its own `/31`.
+4. **Netns default route (transport, not permission)**: the task netns
+   holds exactly one default route, `default via <link-host> dev vg`,
+   so guest traffic for public destinations (guest default via the TAP
+   gateway, from the kernel cmdline) can travel TAP → veth-guest →
+   veth-host. The route grants no internet access by itself: every
+   packet still faces the root-ns hooks below, and setup refuses boot
+   unless the default is exactly the intended one.
+5. **nft on the hooks packets actually traverse** (`inet fixhub_vm`,
+   per-task chains `pre_*`/`out_*`/`in_*`). nft runs in the default
+   namespace, so rules match the **veth-host** device (`vh<id>`) —
+   guest packets arrive there, never under the TAP name (the TAP exists
+   only inside the task netns; matching it would silently match
+   nothing). Prerouting DNAT to the *local* service address delivers
+   to the INPUT hook, never forward — so enforcement is split where
+   the packets go:
+   - NAT redirect (`pre_*`): all TCP 443 arriving on the veth-host
+     device is marked (`0x1`, proving it passed the redirect) and
+     DNATed to the host proxy (`10.200.0.1:8443`);
+   - INPUT chain (`in_*`, no drop policy — a base-chain policy would hit
+     all host input; every rule is `iifname`-qualified instead): accept
+     established/related, plus marked packets toward the proxy (before
+     the drops — post-DNAT dst is `10.200.0.1`, which would otherwise
+     match the `10/8` drop; unmarked direct-to-proxy-port connections
+     still fall through to the drops), plus DNS to the host stub —
+     then the same hard drops, ending in an explicit catch-all drop so
+     guest traffic reaches NO other host-local service;
+   - FORWARD chain (`out_*`, policy drop): accept established/related
+     only, then hard drops — `169.254.169.254/32` (metadata), `10/8`
+     (covers sibling `10.201/16` subnets and the `10.202/16` link
+     pool), `172.16/12`, `192.168/16`, `127/8`; drop direct DNS
+     (`udp/tcp dport 53`) — guests use the host stub only; drop all
+     IPv6 in v1; drop residual TCP 443 (no bare accept anywhere, on
+     either hook).
 3. **Egress proxy + stub resolver** (operator-provided, allowlist =
    `FC_EGRESS_ALLOWLIST`): all guest TCP 443 is routed via the host proxy,
    which allowlists SNI/hostnames (GitHub + package registries) and logs every
@@ -62,8 +83,11 @@ on the host; environment variables and prompt instructions are not controls.
 Real-VM probes 6–7 in `test_sandbox_firecracker.py` assert forbidden targets
 drop/timeout and approved `git ls-remote` + `pip download` succeed; probe
 17 asserts sibling-VM addresses/ports are unreachable; probe 19 boots two
-VMs at once and asserts distinct subnets, mutual approved egress, no
-cross-talk, survivor-intact destroy, and idempotent recreation. nft
-counters provide host-side evidence of drops. Rule-inspection unit tests
-cover the veth-match and mark contracts, but packet filtering itself is
-proven only by these real-guest runs on the KVM host.
+VMs at once and asserts distinct guest + link subnets, guest default
+routes, host-side `/31` addresses, mutual approved egress, no
+cross-talk, survivor-intact destroy (forward + input chains), and
+idempotent recreation. nft counters provide host-side evidence of drops.
+Rule-inspection unit tests cover the veth-match, mark-order, catch-all,
+and no-input-policy contracts, but packet filtering itself is proven
+only by these real-guest runs on the KVM host — a mocked test never
+counts as filtering evidence.

@@ -503,13 +503,27 @@ def test_19_concurrent_vms_topology_and_lifecycle(tmp_path):
     (wb / "app.py").write_text("print(2)\n", encoding="utf-8")
     aa, ab = _net.guest_addrs(92001), _net.guest_addrs(92002)
     assert aa["net"] != ab["net"]
+    la, lb = _net.link_addrs(92001), _net.link_addrs(92002)
+    assert la["net"] != lb["net"]
     _fc.provision(92001, str(wa))
     _fc.provision(92002, str(wb))
     try:
-        # Each guest sees its own unique link-net (no shared guest IP).
+        # Each guest sees its own unique link-net (no shared guest IP) and
+        # a default route carrying public traffic toward the host veth.
         for tid, addrs in ((92001, aa), (92002, ab)):
             out = _exec(tid, "ip -o addr show dev eth0")
             assert addrs["vm"] in out["stdout"], (tid, out)
+            out = _exec(tid, "ip route show default")
+            assert "default" in out["stdout"], (tid, out)
+        # Host veth ends hold exactly their /31 link addresses (fail-visible
+        # evidence for the addressed-link design, per task).
+        for tid, link in ((92001, la), (92002, lb)):
+            vh = _net.veth_names(tid)[0]
+            addrs_out = _sp.run(
+                ["ip", "-o", "addr", "show", "dev", vh],
+                capture_output=True, text=True, timeout=15,
+            )
+            assert f"inet {link['host']}/{link['prefix']}" in (addrs_out.stdout or ""), (tid, addrs_out)
         # Both reach approved egress through the shared proxy path.
         for tid in (92001, 92002):
             out = _exec(tid, "git ls-remote https://github.com/git/git.git HEAD 2>&1 | head -2")
@@ -527,6 +541,13 @@ def test_19_concurrent_vms_topology_and_lifecycle(tmp_path):
         )
         assert "out_ft92002" in (chains.stdout or ""), chains
         assert "out_ft92001" not in (chains.stdout or ""), chains
+        # Survivor keeps its input-hook enforcement (marked proxy accept +
+        # catch-all host-local drop); the destroyed task's is gone.
+        inchains = _sp.run(
+            ["nft", "list", "chain", "inet", "fixhub_vm", "in_ft92002"],
+            capture_output=True, text=True, timeout=15,
+        )
+        assert "meta mark" in (inchains.stdout or ""), inchains
         # Recreating A works on the same topology (idempotent rebuild).
         _fc.provision(92001, str(wa))
         out = _exec(92001, "git ls-remote https://github.com/git/git.git HEAD 2>&1 | head -2")
