@@ -417,7 +417,7 @@ def _kill_task_procs(jail_id: str) -> None:
     try:
         if os.name != "nt":
             subprocess.run(
-                ["pkill", "-f", f"--id {jail_id}( |$)"],
+                ["pkill", "-f", "--", f"--id {jail_id}( |$)"],
                 capture_output=True,
                 timeout=10,
             )
@@ -822,21 +822,39 @@ def _spawn_jailer(
     while time.monotonic() < deadline:
         if os.path.exists(api_socket):
             return proc
-        if proc.poll() is not None:
+        rc = proc.poll()
+        if rc is not None and rc != 0:
             try:
                 with open(log_path, "rb") as fh:
                     tail = fh.read()[-2000:]
             except OSError:
                 tail = b""
             raise RuntimeError(
-                f"jailer exited rc={proc.returncode}: {tail.decode('utf-8', 'replace')[-500:]}"
+                f"jailer exited rc={rc}: "
+                f"{tail.decode('utf-8', 'replace')[-500:]}"
             )
+        # With --new-pid-ns, the launcher and Firecracker have distinct PIDs.
+        # A successful launcher exit alone is not proof that Firecracker failed.
+        # Keep waiting for the API socket; diagnose the child at the deadline.
         time.sleep(0.2)
+    child_pid = _read_fc_pid(chroot_dir)
+    child_alive = _pid_alive(child_pid)
     try:
-        proc.kill()
+        if proc.poll() is None:
+            proc.kill()
     except Exception:
         pass
-    raise RuntimeError("firecracker API socket never appeared after jailer spawn")
+    try:
+        with open(log_path, "rb") as fh:
+            tail = fh.read()[-2000:]
+    except OSError:
+        tail = b""
+    raise RuntimeError(
+        "Firecracker API socket never appeared after jailer spawn; "
+        f"launcher_rc={proc.poll()}; firecracker_pid={child_pid}; "
+        f"firecracker_alive={child_alive}; "
+        f"log_tail={tail.decode('utf-8', 'replace')[-1000:]}"
+    )
 
 
 def _configure_and_boot(

@@ -116,10 +116,16 @@ def test_04_credentials_absent_from_guest(workspace, monkeypatch):
         _fc.destroy(91005)
 
 
-def test_05_traversal_and_symlink_blocked(workspace):
+def test_05_traversal_and_symlink_blocked(tmp_path):
     _require_host()
     from app.agent import tools as _tools
     from app.config import settings as _settings
+
+    # Tool dispatch derives task ID from the workspace directory name.
+    ws = tmp_path / "task-91006"
+    ws.mkdir()
+    (ws / "app.py").write_text("print('hello')\\n", encoding="utf-8")
+    workspace = str(ws)
 
     orig = _settings.SANDBOX_BACKEND
     _settings.SANDBOX_BACKEND = "firecracker"
@@ -127,9 +133,12 @@ def test_05_traversal_and_symlink_blocked(workspace):
         _fc.provision(91006, workspace)
         assert "ERROR" in _tools.read_file(workspace, "../../etc/passwd")
         assert "ERROR" in _tools.read_file(workspace, "/etc/shadow")
-        out = _exec(91006, "ln -s /etc/passwd link06; cat link06 2>&1 | head -3")
-        # Guest agent jail must refuse to follow the escape (no root: line).
-        assert "root:" not in out["stdout"]
+        # Shell commands run inside the guest OS. Reading its own
+        # /etc/passwd is expected; the file API must reject symlink traversal.
+        out = _exec(91006, "ln -s /etc/passwd link06")
+        assert out["exit_code"] == 0, out
+        read_out = _tools.read_file(workspace, "link06")
+        assert "ERROR" in read_out, read_out
     finally:
         _settings.SANDBOX_BACKEND = orig
         _fc.destroy(91006)
@@ -369,10 +378,16 @@ def test_15_vsock_cid_matches_config(workspace):
         _fc.destroy(91018)
 
 
-def test_13_worker_executes_command_in_vm(workspace):
+def test_13_worker_executes_command_in_vm(tmp_path):
     _require_host()
     from app.agent import tools as _tools
     from app.config import settings as _settings
+
+    # Tool dispatch derives task ID from the workspace directory name.
+    ws = tmp_path / "task-91016"
+    ws.mkdir()
+    (ws / "app.py").write_text("print('hello')\\n", encoding="utf-8")
+    workspace = str(ws)
 
     orig = _settings.SANDBOX_BACKEND
     _settings.SANDBOX_BACKEND = "firecracker"
