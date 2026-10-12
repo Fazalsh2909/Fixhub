@@ -127,43 +127,73 @@ def make_tokenless_tree(src_dir: str, dest_tar_bytes: io.BytesIO | None = None) 
 
 
 class VsockClient:
-    """Length-prefixed JSON over AF_VSOCK (CID, port). One instance per VM.
+    """Host client for Firecracker's Unix-socket vsock bridge.
 
-    Timeouts are enforced at the socket level AND by the guest agent; the
-    host treats any transport error as a failed exec (never host fallback).
+    Firecracker exposes guest-initiated AF_VSOCK services to the host
+    through its configured UDS. The host connects to that UDS and sends
+    `CONNECT <port>\n`; Firecracker then proxies the stream to the guest.
     """
 
-    def __init__(self, *, cid: int, port: int, connect_timeout_s: int = 10):
-        self.cid = int(cid)
+    def __init__(self, *, uds_path: str, port: int, connect_timeout_s: int = 10):
+        self.uds_path = str(uds_path)
         self.port = int(port)
         self.connect_timeout_s = int(connect_timeout_s or 10)
+        if not self.uds_path:
+            raise ValueError("Firecracker vsock UDS path is required")
+        if not 1 <= self.port <= 65535:
+            raise ValueError("vsock port must be between 1 and 65535")
 
     def call(self, request: dict, timeout_s: int = 180) -> dict:
-        if not hasattr(socket, "AF_VSOCK"):
-            raise RuntimeError("AF_VSOCK unavailable on this host (need Linux)")
         raw = encode_frame(request)
-        sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             sock.settimeout(self.connect_timeout_s)
-            sock.connect((self.cid, self.port))
+            sock.connect(self.uds_path)
+
+            # Firecracker's host-side UDS protocol selects the guest port
+            # before the JSON frame stream begins.
+            sock.sendall(f"CONNECT {self.port}\n".encode("ascii"))
+
+            ack = bytearray()
+            while not ack.endswith(b"\n"):
+                chunk = sock.recv(1)
+                if not chunk:
+                    raise RuntimeError(
+                        "Firecracker vsock bridge closed before CONNECT acknowledgement"
+                    )
+                ack.extend(chunk)
+                if len(ack) > 128:
+                    raise RuntimeError("Firecracker vsock acknowledgement too large")
+
+            ack_text = ack.decode("ascii", errors="replace").strip()
+            parts = ack_text.split()
+            if len(parts) != 2 or parts[0] != "OK" or not parts[1].isdigit():
+                raise RuntimeError(
+                    f"Firecracker vsock CONNECT rejected: {ack_text!r}"
+                )
+
             sock.settimeout(max(1, int(timeout_s or 180)) + 5)
             sock.sendall(raw)
-            # Read length prefix then exact body.
+
+            # Read the length-prefixed JSON response.
             hdr = b""
             while len(hdr) < 4:
                 chunk = sock.recv(4 - len(hdr))
                 if not chunk:
                     raise RuntimeError("vsock closed before response header")
                 hdr += chunk
+
             (n,) = struct.unpack(">I", hdr)
             if n <= 0 or n > 4 * 1024 * 1024:
                 raise RuntimeError(f"vsock response too large: {n}")
+
             body = b""
             while len(body) < n:
                 chunk = sock.recv(min(65536, n - len(body)))
                 if not chunk:
                     raise RuntimeError("vsock closed mid-response")
                 body += chunk
+
             resp, _ = decode_frame(hdr + body)
             return resp
         finally:

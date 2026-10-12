@@ -26,7 +26,7 @@ jail-relative (`./vmlinux`, `./overlay.ext4`) because Firecracker runs
 chrooted at <chroot_dir>.
 
 Transport: Firecracker REST over the jailed API unix socket (manual HTTP over
-AF_UNIX — no new dependencies); guest exec over AF_VSOCK JSON frames
+AF_UNIX — no new dependencies); guest AF_VSOCK is reached through Firecracker's AF_UNIX bridge
 (see guest_agent.VsockClient).
 
 Windows/laptop behavior: every entry raises SandboxBlockedError with a clear
@@ -245,11 +245,10 @@ def _cfg(name: str, default=""):
 
 
 def _cid_for(task_id: int) -> int:
-    """Single source of truth for the guest vsock CID (host + config agree).
+    """Deterministic guest CID configured into this task's vsock device.
 
-    Deterministic per task so reclaim-after-crash redials the same CID.
-    Callers must pass this CID to BOTH the /vsock API object and every
-    host-side VsockClient — a mismatch means the agent never answers.
+    Host clients connect to the task's jailed Firecracker UDS; Firecracker
+    internally routes the requested port to this guest CID.
     """
     cid = _CID_BASE + (int(task_id) % _CID_MOD)
     if cid >= _CID_MAX:
@@ -297,15 +296,67 @@ def _api_put(api_socket: str, path: str, payload: dict, timeout_s: int = 10) -> 
         sock.connect(api_socket)
         sock.sendall(req)
         resp = b""
+        expected_total = None
         while True:
             try:
                 chunk = sock.recv(65536)
             except socket.timeout:
-                raise RuntimeError(f"FC API timeout on {path}")
+                preview = resp[:1000].decode("latin1", errors="replace")
+                raise RuntimeError(
+                    f"FC API timeout on {path}; received {len(resp)} bytes; "
+                    f"partial response={preview!r}"
+                )
             if not chunk:
                 break
+
             resp += chunk
             if len(resp) > 1024 * 1024:
+                raise RuntimeError(f"FC API response too large on {path}")
+
+            # Firecracker can keep the Unix socket open after sending a
+            # complete response. Stop at the HTTP message boundary, rather
+            # than waiting for EOF.
+            if expected_total is None:
+                header_end = resp.find(b"\r\n\r\n")
+                if header_end >= 0:
+                    header_bytes = resp[:header_end]
+                    lines = header_bytes.split(b"\r\n")
+                    try:
+                        status_parts = lines[0].decode("latin1").split()
+                        status_code = int(status_parts[1])
+                    except (IndexError, ValueError):
+                        raise RuntimeError(
+                            f"FC API malformed status on {path}: "
+                            f"{header_bytes[:500]!r}"
+                        )
+
+                    headers = {}
+                    for line in lines[1:]:
+                        if b":" not in line:
+                            continue
+                        name, value = line.split(b":", 1)
+                        headers[name.decode("latin1").strip().lower()] = (
+                            value.decode("latin1").strip()
+                        )
+
+                    body_start = header_end + 4
+                    if (
+                        100 <= status_code < 200
+                        or status_code in (204, 304)
+                    ):
+                        expected_total = body_start
+                    elif "content-length" in headers:
+                        try:
+                            body_length = int(headers["content-length"])
+                            if body_length < 0:
+                                raise ValueError("negative Content-Length")
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                f"FC API invalid Content-Length on {path}"
+                            ) from exc
+                        expected_total = body_start + body_length
+
+            if expected_total is not None and len(resp) >= expected_total:
                 break
     finally:
         try:
@@ -823,8 +874,7 @@ def _configure_and_boot(
         "mem_size_mib": mem,
         "smt": False,
     })
-    # The guest CID MUST equal the task's _cid_for() value: it is the same
-    # identity the host VsockClient dials. A mismatch = agent never answers.
+    # Firecracker routes this configured guest CID through its UDS bridge.
     # uds_path is absolute inside the jail (Firecracker is chrooted at the
     # jail root, so /v.sock == <chroot>/v.sock on the host).
     _api_put(api_socket, "/vsock", {
@@ -855,7 +905,7 @@ def _mac_for(cid: int) -> str:
 
 def _wait_guest_agent(vm: _VM) -> None:
     timeout = int(_cfg("FC_BOOT_TIMEOUT_S", 30) or 30)
-    client = _guest.VsockClient(cid=vm.cid, port=_GUEST_AGENT_PORT)
+    client = _guest.VsockClient(uds_path=os.path.join(vm.chroot_dir, "v.sock"), port=_GUEST_AGENT_PORT)
     deadline = time.monotonic() + max(5, timeout)
     last_err: Exception | None = None
     while time.monotonic() < deadline:
@@ -954,7 +1004,7 @@ def sync_repo_to_guest(*, task_id: int, workspace: str) -> None:
         raise RuntimeError("no live VM for repo sync")
     if not workspace or not os.path.isdir(workspace):
         raise RuntimeError("host workspace missing for repo sync")
-    client = _guest.VsockClient(cid=vm.cid, port=_GUEST_AGENT_PORT)
+    client = _guest.VsockClient(uds_path=os.path.join(vm.chroot_dir, "v.sock"), port=_GUEST_AGENT_PORT)
     _touch_owner(task_id)
     for rel, full in _collect_transfer_files(workspace):
         try:
@@ -1015,7 +1065,7 @@ def exec_in_guest(
     except ValueError as exc:
         raise _host.SandboxBlockedError(str(exc))
     timeout = timeout_s or _settings.COMMAND_TIMEOUT_S
-    client = _guest.VsockClient(cid=vm.cid, port=_GUEST_AGENT_PORT)
+    client = _guest.VsockClient(uds_path=os.path.join(vm.chroot_dir, "v.sock"), port=_GUEST_AGENT_PORT)
     _touch_owner(vm.task_id)
     started = time.monotonic()
     try:
@@ -1205,7 +1255,7 @@ def sync_guest_to_host(*, task_id: int, workspace: str) -> dict:
     if not workspace or not _os.path.isdir(workspace):
         raise _host.SandboxBlockedError("host workspace missing for result sync")
 
-    client = _guest.VsockClient(cid=vm.cid, port=_GUEST_AGENT_PORT)
+    client = _guest.VsockClient(uds_path=os.path.join(vm.chroot_dir, "v.sock"), port=_GUEST_AGENT_PORT)
     # 1. List guest tree (guest agent returns repo-relative paths).
     try:
         resp = client.call(
@@ -1552,7 +1602,7 @@ class FirecrackerBackend:
     # --- File ops over vsock (guest is authoritative when this backend is active) ---
     def _guest_call(self, workspace: str, request: dict, timeout_s: int = 30) -> dict:
         vm = self._ensure_vm(workspace)
-        client = _guest.VsockClient(cid=vm.cid, port=_GUEST_AGENT_PORT)
+        client = _guest.VsockClient(uds_path=os.path.join(vm.chroot_dir, "v.sock"), port=_GUEST_AGENT_PORT)
         try:
             return client.call(request, timeout_s=timeout_s)
         except Exception as exc:
@@ -1591,7 +1641,7 @@ class FirecrackerBackend:
     def search_code(self, workspace: str, pattern: str) -> str:
         # Regex search executes INSIDE the guest (rg/grep on guest FS).
         vm = self._ensure_vm(workspace)
-        client = _guest.VsockClient(cid=vm.cid, port=_GUEST_AGENT_PORT)
+        client = _guest.VsockClient(uds_path=os.path.join(vm.chroot_dir, "v.sock"), port=_GUEST_AGENT_PORT)
         # Quote pattern safely: argv path avoids shell injection.
         req = _guest.build_request(
             op="exec", cwd=".", argv=["sh", "-c", "rg --no-heading --line-number --max-count 40 -e \"$0\" . || grep -rn --exclude-dir=.git -m 40 -e \"$0\" .", pattern],

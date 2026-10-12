@@ -593,7 +593,7 @@ def _nft_rules(*, tap: str, proxy_port: int, iface: str = "") -> list[str]:
         # proxy port carries no mark and hits the drops (input catch-all).
         f'add rule inet fixhub_vm {pre} iifname "{iface}" tcp dport 443 '
         f"meta mark set {REDIRECT_MARK} "
-        f"dnat to {HOST_SVC_IP}:{proxy_port}",
+        f"dnat ip to {HOST_SVC_IP}:{proxy_port}",
         # NOTE: there is deliberately NO established/related accept on this
         # chain. Every packet arriving on the veth-host device is either
         # DNATed to local delivery (TCP 443 -> INPUT hook), stub DNS (local
@@ -774,7 +774,17 @@ def _apply_nft(*, tap: str, proxy_port: int, iface: str) -> None:
     in_body = proc.stdout or ""
     if proc.returncode != 0:
         raise NetworkIsolationError("nft verification failed: in chain missing")
-    if f"meta mark {REDIRECT_MARK}" not in in_body:
+    # nft may print a 32-bit packet mark with leading zeros
+    # (e.g. 0x00000001 for our configured 0x1). Compare accepted
+    # renderings without weakening the requirement for the mark rule.
+    expected_marks = {
+        REDIRECT_MARK.lower(),
+        f"0x{int(REDIRECT_MARK, 0):08x}",
+    }
+    if not any(
+        f"meta mark {mark}" in in_body.lower()
+        for mark in expected_marks
+    ):
         raise NetworkIsolationError(
             "nft verification failed: input marked redirect accept missing"
         )
@@ -793,7 +803,9 @@ def _apply_nft(*, tap: str, proxy_port: int, iface: str) -> None:
         )
     proc = _nft("list", "chain", "inet", "fixhub_vm", pre)
     pre_body = proc.stdout or ""
-    if proc.returncode != 0 or "dnat to" not in pre_body:
+    if proc.returncode != 0 or not any(
+        token in pre_body for token in ("dnat ip to", "dnat to")
+    ):
         raise NetworkIsolationError("nft verification failed: redirect chain broken")
 
 
@@ -875,22 +887,46 @@ def _verify_topology(
         raise NetworkIsolationError(
             f"static neigh for link peer {host_ip} missing on {vg} in {netns}"
         )
-    proc = _run("ip", "route", "show", net, "dev", vh)
-    if proc.returncode != 0 or vh not in (proc.stdout or ""):
-        raise NetworkIsolationError(f"host route {net} via {vh} missing")
+    # Inspect the full main routing table to verify the exact destination
+    # and host-side interface.
+    proc = _run("ip", "-4", "route", "show", "table", "main")
+    route_ok = False
+    for line in (proc.stdout or "").splitlines():
+        fields = line.split()
+        if not fields or fields[0] != net or "dev" not in fields:
+            continue
+        dev_index = fields.index("dev")
+        if dev_index + 1 < len(fields) and fields[dev_index + 1] == vh:
+            route_ok = True
+            break
+
+    if proc.returncode != 0 or not route_ok:
+        raise NetworkIsolationError(
+            f"host route {net} via {vh} missing from main routing table: "
+            f"{(proc.stdout or "").strip()!r}; "
+            f"{(proc.stderr or "").strip()!r}"
+        )
+
+    # Verify that IPv4 forwarding is enabled on both sides.
     for where, cmd in (
         ("default namespace", ("sysctl", "-n", "net.ipv4.ip_forward")),
-        (f"netns {netns}", ("ip", "netns", "exec", netns,
-                             "sysctl", "-n", "net.ipv4.ip_forward")),
+        (
+            f"netns {netns}",
+            ("ip", "netns", "exec", netns, "sysctl", "-n", "net.ipv4.ip_forward"),
+        ),
     ):
         try:
             proc = _run(*cmd)
         except OSError as exc:
-            raise NetworkIsolationError(f"forwarding unreadable ({where}): {exc}")
+            raise NetworkIsolationError(
+                f"forwarding unreadable ({where}): {exc}"
+            ) from exc
+
         if proc.returncode != 0 or (proc.stdout or "").strip() != "1":
             raise NetworkIsolationError(
                 f"IPv4 forwarding off ({where}); refusing boot"
             )
+
     proc = _run_ns(netns, "route", "show")
     if proc.returncode != 0:
         raise NetworkIsolationError("could not read netns routes for verification")
