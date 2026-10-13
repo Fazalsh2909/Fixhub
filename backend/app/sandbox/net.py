@@ -56,6 +56,20 @@ established — callers must then refuse to boot the VM (fail closed).
 On hosts without `ip`/`nft` (Windows laptop) every function raises
 immediately.
 
+Privilege delegation: when the `FC_NETD_SOCKET` environment variable is set
+and this process is not root (the production API runs as `User=fixhub` with
+`NoNewPrivileges=true`), `ensure_isolation()` / `destroy_isolation()` do NOT
+run `ip`/`nft`/`sysctl`/`conntrack` locally. They forward a strictly typed
+`{op, task_id}` request to the root-owned fixhub-netd daemon (see
+`app/sandbox/netd_client.py` + `infra/firecracker/fixhub-netd.py`), which
+executes this same module's functions as root. Interface names, addresses,
+routes, and nftables chains are always derived from `task_id` — never taken
+from the client — so one task cannot touch another's objects. When the
+daemon is unreachable, setup raises NetworkIsolationError (fail closed, no
+host fallback); teardown stays best-effort and never raises. Everywhere else
+(laptop dev, pytest, manual root runs) the direct code paths below run
+unchanged.
+
 This module never runs inside the guest.
 """
 
@@ -232,6 +246,42 @@ def ensure_isolation(task_id: int | str) -> dict:
 
     from app.sandbox import egress as _egress
 
+    # Privilege delegation first (explicit config wins): when FC_NETD_SOCKET
+    # is set and this process is not root, the root-owned daemon executes
+    # this same module server-side from the task id only. This branch is
+    # platform-independent on purpose — an unreachable daemon fails closed
+    # everywhere instead of falling through to a doomed direct attempt.
+    try:
+        from app.sandbox import netd_client as _netd
+
+        if _netd.delegation_active():
+            try:
+                tid = _netd.validate_task_id(task_id)
+            except _netd.NetdError as exc:
+                raise NetworkIsolationError(str(exc))
+            try:
+                data = _netd.setup(tid)
+            except _netd.NetdError as exc:
+                raise NetworkIsolationError(str(exc))
+            if not isinstance(data, dict) or not data.get("nft_applied"):
+                raise NetworkIsolationError(
+                    "delegation did not confirm nft enforcement; refusing boot"
+                )
+            if not data.get("netns") or not data.get("tap"):
+                raise NetworkIsolationError(
+                    "delegation returned an incomplete topology; refusing boot"
+                )
+            proxy = data.get("proxy")
+            return {
+                "netns": data["netns"],
+                "tap": data["tap"],
+                "nft_applied": True,
+                "proxy": proxy if isinstance(proxy, dict) else {},
+            }
+    except NetworkIsolationError:
+        raise
+    except Exception as exc:
+        raise NetworkIsolationError(f"privilege delegation failed: {exc}")
     if os.name == "nt":
         raise NetworkIsolationError(
             "network isolation requires Linux (ip/nft); refusing VM boot on Windows"
@@ -901,10 +951,11 @@ def _verify_topology(
             break
 
     if proc.returncode != 0 or not route_ok:
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
         raise NetworkIsolationError(
             f"host route {net} via {vh} missing from main routing table: "
-            f"{(proc.stdout or "").strip()!r}; "
-            f"{(proc.stderr or "").strip()!r}"
+            f"{out!r}; {err!r}"
         )
 
     # Verify that IPv4 forwarding is enabled on both sides.
@@ -947,6 +998,16 @@ def destroy_isolation(task_id: int | str) -> None:
     Scope is strictly per-task (see _teardown_targets): the loopback
     service address and other tasks' chains/routes are never touched.
     """
+    # Privilege delegation: the daemon performs the same scoped teardown
+    # server-side (best-effort, never raises either way).
+    try:
+        from app.sandbox import netd_client as _netd
+
+        if _netd.delegation_active():
+            _netd.teardown(task_id)
+            return
+    except Exception:
+        pass
     try:
         targets = _teardown_targets(task_id)
         # Flush first: stale ESTABLISHED entries for this guest IP must not

@@ -1,0 +1,60 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: F
+      - generic [ref=e7]:
+        - strong [ref=e8]: FixHub
+        - generic [ref=e9]: Autonomous engineering
+    - generic [ref=e10]:
+      - generic [ref=e11]: No task selected
+      - status "Worker offline — runs queue locally" [ref=e12]:
+        - generic [ref=e14]: Worker offline
+    - generic [ref=e15]:
+      - button "Refresh tasks and repositories" [ref=e16] [cursor=pointer]: Refresh
+      - generic [ref=e22]: FS
+  - generic [ref=e23]:
+    - complementary "Primary" [ref=e24]:
+      - generic [ref=e25]:
+        - button "Overview" [ref=e26] [cursor=pointer]
+        - button "Tasks" [ref=e32] [cursor=pointer]
+        - button "Issues" [ref=e38] [cursor=pointer]
+        - button "Repositories" [ref=e44] [cursor=pointer]
+        - button "Memory" [ref=e52] [cursor=pointer]
+      - button "Settings" [ref=e59] [cursor=pointer]
+    - complementary [ref=e65]:
+      - generic [ref=e66]:
+        - strong [ref=e68]: Ready to fix
+        - button "Refresh tasks and repositories" [ref=e69] [cursor=pointer]
+      - generic [ref=e75]:
+        - generic [ref=e76]: Idle
+        - strong [ref=e87]: Ready to fix
+        - generic [ref=e88]: No task selected — pick one from the list below.
+      - generic [ref=e90]:
+        - generic [ref=e91]: Recent tasks
+        - generic [ref=e92]: "0"
+      - generic [ref=e93]: No tasks yet.
+      - generic [ref=e95]: Explorer
+      - generic [ref=e97]: Select a task or click a repository to browse files.
+      - generic [ref=e99]:
+        - generic [ref=e100]: Repositories
+        - generic [ref=e101]: "0"
+      - generic [ref=e102]: No GitHub installations found.
+      - generic [ref=e104]:
+        - textbox "owner/repo" [ref=e105]
+        - textbox "installation id" [ref=e106]
+        - button "Connect repository" [ref=e107] [cursor=pointer]
+    - main [ref=e108]:
+      - generic [ref=e110]:
+        - button "Code" [ref=e111] [cursor=pointer]
+        - button "Diff Proof" [ref=e112] [cursor=pointer]
+      - generic [ref=e113]: Open a file from the Explorer.
+    - complementary [ref=e115]:
+      - heading "Agent workspace" [level=2] [ref=e118]
+      - generic [ref=e119]:
+        - heading "Ready when you are" [level=3] [ref=e124]
+        - paragraph [ref=e125]: Select a task or trigger a GitHub issue. FixHub will inspect the repository, implement the fix, validate it and open a PR.
+        - button "Browse repositories" [ref=e126] [cursor=pointer]
+  - contentinfo [ref=e127]:
+    - status [ref=e128]: Worker offline
+    - generic [ref=e130]: No task selected
+    - generic [ref=e131]: FixHub IDE

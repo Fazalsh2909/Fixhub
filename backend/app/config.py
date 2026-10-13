@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     FC_OWNER_STALE_S: int = 900
     FC_BOOT_TIMEOUT_S: int = 30
     FC_VSOCK_TIMEOUT_S: int = 10
+    # Phase 5 privilege delegation: the production API runs as User=fixhub
+    # with NoNewPrivileges=true and cannot touch netns/nft/jailer directly.
+    # FC_NETD_SOCKET set (in the API/worker environment) routes
+    # network + jail ops through the root-owned fixhub-netd daemon over this
+    # Unix socket (typed {op, task_id} requests only, never shell/argv).
+    # Empty = direct execution (laptop dev, pytest, manual root runs).
+    FC_NETD_SOCKET: str = "/run/fixhub-netd.sock"
     # Host egress services (root-ns veth address; see net.py/egress.py).
     FC_EGRESS_PROXY_ADDR: str = "10.200.0.1"
     FC_EGRESS_PROXY_PORT: int = 8443

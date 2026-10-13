@@ -264,7 +264,7 @@ def test_nft_rules_proxy_only_no_open_443():
     from app.sandbox import net as _net
 
     rules = "\n".join(_net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9"))
-    assert "dnat to 10.200.0.1:8443" in rules
+    assert "dnat ip to 10.200.0.1:8443" in rules
     assert "tcp dport 443 drop" in rules
     # The forward chain is default-deny FOR THIS TASK ONLY via an explicit
     # interface-scoped catch-all — never a base-chain drop policy (which
@@ -641,7 +641,7 @@ def test_nft_redirect_mark_before_drops():
 
     pre_fwd = _net._nft_rules(tap="ft9", proxy_port=8443, iface="vh9")
     blob = "\n".join(pre_fwd)
-    assert "meta mark set 0x1" in blob and "dnat to 10.200.0.1:8443" in blob
+    assert "meta mark set 0x1" in blob and "dnat ip to 10.200.0.1:8443" in blob
     # Forward chain carries NO local-destination accepts (dead rules would
     # be mistaken for enforcement — DNATed packets never traverse forward).
     for line in pre_fwd:
@@ -895,6 +895,10 @@ def _fake_topology_world(tid):
                 stdout=f"{addrs['vm']} lladdr aa:bb:cc:dd:ee:01 PERMANENT\n"
             )
         if cmd[:3] == ["ip", "route", "show"]:
+            return _fake_completed(
+                stdout=f"{addrs['net']}/{addrs['prefix']} dev {vh} scope link\n"
+            )
+        if cmd[:3] == ["ip", "-4", "route"]:
             return _fake_completed(
                 stdout=f"{addrs['net']}/{addrs['prefix']} dev {vh} scope link\n"
             )

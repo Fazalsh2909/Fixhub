@@ -1,0 +1,117 @@
+- generic [ref=e3]:
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]: F
+      - generic [ref=e7]:
+        - strong [ref=e8]: FixHub
+        - generic [ref=e9]: Autonomous engineering
+    - generic [ref=e10]:
+      - generic [ref=e11]: No task selected
+      - status "Worker connected · 0 queued" [ref=e132]:
+        - generic [ref=e14]: Agent online
+    - generic [ref=e15]:
+      - button "Refresh tasks and repositories" [ref=e16] [cursor=pointer]: Refresh
+      - generic [ref=e22]: FS
+  - generic [ref=e23]:
+    - complementary "Primary" [ref=e24]:
+      - generic [ref=e25]:
+        - button "Overview" [ref=e26] [cursor=pointer]
+        - button "Tasks" [ref=e32] [cursor=pointer]
+        - button "Issues" [ref=e38] [cursor=pointer]
+        - button "Repositories" [ref=e44] [cursor=pointer]
+        - button "Memory" [ref=e52] [cursor=pointer]
+      - button "Settings" [ref=e59] [cursor=pointer]
+    - complementary [ref=e65]:
+      - generic [ref=e66]:
+        - strong [ref=e68]: Ready to fix
+        - button "Refresh tasks and repositories" [ref=e69] [cursor=pointer]
+      - generic [ref=e75]:
+        - generic [ref=e76]: Idle
+        - strong [ref=e87]: Ready to fix
+        - generic [ref=e88]: No task selected — pick one from the list below.
+      - generic [ref=e90]:
+        - generic [ref=e91]: Recent tasks
+        - generic [ref=e92]: "25"
+      - generic [ref=e93]:
+        - button "#25 https://github.com/Fazalsh2909/nexus-mcp-intelligence Fazalsh2909/nexus-mcp-intelligence Cancelled" [ref=e133] [cursor=pointer]:
+          - generic [ref=e134]: "#25"
+          - generic [ref=e135]:
+            - generic [ref=e136]: https://github.com/Fazalsh2909/nexus-mcp-intelligence
+            - generic [ref=e137]: Fazalsh2909/nexus-mcp-intelligence
+          - generic [ref=e138]: Cancelled
+        - button "#24 ci · Fazalsh2909/Fixhub Fazalsh2909/Fixhub Blocked" [ref=e143] [cursor=pointer]:
+          - generic [ref=e144]: "#24"
+          - generic [ref=e145]:
+            - generic [ref=e146]: ci · Fazalsh2909/Fixhub
+            - generic [ref=e147]: Fazalsh2909/Fixhub
+          - generic [ref=e148]: Blocked
+        - button "#23 ci · Fazalsh2909/Fixhub Fazalsh2909/Fixhub Blocked" [ref=e152] [cursor=pointer]:
+          - generic [ref=e153]: "#23"
+          - generic [ref=e154]:
+            - generic [ref=e155]: ci · Fazalsh2909/Fixhub
+            - generic [ref=e156]: Fazalsh2909/Fixhub
+          - generic [ref=e157]: Blocked
+        - button "#22 ci · Fazalsh2909/Fixhub Fazalsh2909/Fixhub Blocked" [ref=e161] [cursor=pointer]:
+          - generic [ref=e162]: "#22"
+          - generic [ref=e163]:
+            - generic [ref=e164]: ci · Fazalsh2909/Fixhub
+            - generic [ref=e165]: Fazalsh2909/Fixhub
+          - generic [ref=e166]: Blocked
+        - button "#21 ci · Fazalsh2909/Fixhub Fazalsh2909/Fixhub Blocked" [ref=e170] [cursor=pointer]:
+          - generic [ref=e171]: "#21"
+          - generic [ref=e172]:
+            - generic [ref=e173]: ci · Fazalsh2909/Fixhub
+            - generic [ref=e174]: Fazalsh2909/Fixhub
+          - generic [ref=e175]: Blocked
+        - button "#20 ci · Fazalsh2909/nexus-mcp-intelligence Fazalsh2909/nexus-mcp-intelligence Completed" [ref=e179] [cursor=pointer]:
+          - generic [ref=e180]: "#20"
+          - generic [ref=e181]:
+            - generic [ref=e182]: ci · Fazalsh2909/nexus-mcp-intelligence
+            - generic [ref=e183]: Fazalsh2909/nexus-mcp-intelligence
+          - generic [ref=e184]: Completed
+        - button "#19 ci · Fazalsh2909/nexus-mcp-intelligence Fazalsh2909/nexus-mcp-intelligence Failed" [ref=e188] [cursor=pointer]:
+          - generic [ref=e189]: "#19"
+          - generic [ref=e190]:
+            - generic [ref=e191]: ci · Fazalsh2909/nexus-mcp-intelligence
+            - generic [ref=e192]: Fazalsh2909/nexus-mcp-intelligence
+          - generic [ref=e193]: Failed
+        - button "#18 ci · Fazalsh2909/nexus-mcp-intelligence Fazalsh2909/nexus-mcp-intelligence Failed" [ref=e198] [cursor=pointer]:
+          - generic [ref=e199]: "#18"
+          - generic [ref=e200]:
+            - generic [ref=e201]: ci · Fazalsh2909/nexus-mcp-intelligence
+            - generic [ref=e202]: Fazalsh2909/nexus-mcp-intelligence
+          - generic [ref=e203]: Failed
+      - generic [ref=e95]: Explorer
+      - generic [ref=e97]: Select a task or click a repository to browse files.
+      - generic [ref=e99]:
+        - generic [ref=e100]: Repositories
+        - generic [ref=e101]: "2"
+      - generic [ref=e208]:
+        - generic [ref=e209]:
+          - text: Fazalsh2909
+          - generic [ref=e210]: · 160278166
+        - button "Fazalsh2909/nexus-mcp-intelligence, connected" [ref=e212] [cursor=pointer]:
+          - generic [ref=e213]: Fazalsh2909/nexus-mcp-intelligence
+          - generic [ref=e219]: Connected
+        - button "Fazalsh2909/Fixhub, not connected" [ref=e224] [cursor=pointer]:
+          - generic [ref=e225]: Fazalsh2909/Fixhub
+          - button "Connect Fazalsh2909/Fixhub" [ref=e231]: Connect
+      - generic [ref=e104]:
+        - textbox "owner/repo" [ref=e105]
+        - textbox "installation id" [ref=e106]
+        - button "Connect repository" [ref=e107] [cursor=pointer]
+    - main [ref=e108]:
+      - generic [ref=e110]:
+        - button "Code" [active] [ref=e111] [cursor=pointer]
+        - button "Diff Proof" [ref=e112] [cursor=pointer]
+      - generic [ref=e113]: Open a file from the Explorer.
+    - complementary [ref=e115]:
+      - heading "Agent workspace" [level=2] [ref=e118]
+      - generic [ref=e119]:
+        - heading "Ready when you are" [level=3] [ref=e124]
+        - paragraph [ref=e125]: Select a task or trigger a GitHub issue. FixHub will inspect the repository, implement the fix, validate it and open a PR.
+        - button "Browse repositories" [ref=e126] [cursor=pointer]
+  - contentinfo [ref=e127]:
+    - status [ref=e128]: Worker connected
+    - generic [ref=e130]: No task selected
+    - generic [ref=e131]: FixHub IDE

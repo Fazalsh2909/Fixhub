@@ -1,0 +1,30 @@
+[Unit]
+Description=FixHub Firecracker host egress proxy + DNS stub (root, port 53)
+Documentation=file:///opt/fixhub/backend/docs/FIRECRACKER_NETWORK.md
+After=network.target
+Before=fixhub-netd.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+# Binds 10.200.0.1:53 (privileged) + 10.200.0.1:8443. Threads only (no
+# privileged children), so normal service sandboxing is safe here.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/run
+# Idempotent: `addr replace` succeeds whether or not the address exists.
+ExecStartPre=/sbin/ip addr replace 10.200.0.1/32 dev lo
+WorkingDirectory=/opt/fixhub/backend
+ExecStart=/opt/fixhub/backend/.venv/bin/python -m app.sandbox.egress serve
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

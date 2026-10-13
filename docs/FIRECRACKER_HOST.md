@@ -51,3 +51,85 @@ fast unit tests; `FIXHUB_FIRECRACKER_TEST=1` runs only on the KVM host/CI.
    `FIXHUB_FIRECRACKER_TEST=1 FC_REQUIRE_KVM=1 python -m pytest backend/tests/test_sandbox_firecracker.py -q`.
 4. Provisioning code under the `firecracker` backend fails closed on Windows
    with a clear message (never host fallback).
+
+## 5. Privilege delegation (fixhub-netd) — required on the EC2 host
+
+The API/worker runs as `User=fixhub` with `NoNewPrivileges=true` and cannot
+create netns/TAP/veth devices, nftables rules, or spawn the jailer
+(`sudo -u fixhub ip netns add …` fails on `mkdir /run/netns`). setuid
+helpers, sudo rules, and file capabilities do NOT work under
+`NoNewPrivileges` — the kernel blocks all of them. Delegation goes through
+the root-owned `fixhub-netd` daemon instead (typed `{op, task_id}` requests
+over `/run/fixhub-netd.sock`; interface names, IPs, routes, nft chains, and
+jailer argv are derived server-side, never from the client).
+
+It activates only when the API/worker environment sets
+`FC_NETD_SOCKET=/run/fixhub-netd.sock` (and the process is not root).
+Laptop dev and pytest (env unset) keep direct execution unchanged.
+
+### 5.1 Install / upgrade (as root on the host, idempotent)
+
+```bash
+sudo bash infra/firecracker/provision-host.sh
+# with a non-default checkout path:
+sudo REPO_DIR=/srv/fixhub bash infra/firecracker/provision-host.sh
+```
+
+This installs `conntrack`, creates the `fixhub` user if missing, installs
+`/usr/local/sbin/fixhub-netd` (root-owned, mode 0755 — writable only by
+root), installs `fixhub-netd.service` + `fixhub-egress.service`, drops
+`10-netd.conf` for the API/worker units (adds only
+`FC_NETD_SOCKET=/run/fixhub-netd.sock` + ordering; keeps `User=fixhub` and
+`NoNewPrivileges=true`), then enables and starts everything.
+
+### 5.2 Restart FixHub
+
+```bash
+sudo systemctl restart fixhub-api fixhub-worker
+sudo systemctl status fixhub-netd fixhub-egress fixhub-api fixhub-worker --no-pager
+```
+
+### 5.3 Verify (expected outputs)
+
+```bash
+id fixhub
+ls -l /run/fixhub-netd.sock /usr/local/sbin/fixhub-netd
+# socket: srwxrwx--- root fixhub | helper: -rwxr-xr-x root root
+stat -c '%a %U %G' /usr/local/sbin/fixhub-netd  # 755 root root
+sudo systemctl is-active fixhub-netd fixhub-egress  # active / active
+sudo journalctl -u fixhub-netd -u fixhub-egress -n 50 --no-pager
+# delegation reachable as the service user (no VM boot, no root):
+sudo -u fixhub FC_NETD_SOCKET=/run/fixhub-netd.sock \
+  python3 -c "from app.sandbox import netd_client as c; print(c.probe())"
+# full isolation dry-run for one task id (creates + verifies, then remove):
+sudo -u fixhub FC_NETD_SOCKET=/run/fixhub-netd.sock \
+  python3 -c "from app.sandbox import net as n; print(n.ensure_isolation(91099))"
+sudo nft list chain inet fixhub_vm out_ft91099 | tail -3  # ends in the catch-all drop
+sudo -u fixhub FC_NETD_SOCKET=/run/fixhub-netd.sock \
+  python3 -c "from app.sandbox import net as n; n.destroy_isolation(91099); print('torn down')"
+# real sandbox task (KVM host only):
+FIXHUB_FIRECRACKER_TEST=1 FC_REQUIRE_KVM=1 \
+  python -m pytest backend/tests/test_sandbox_firecracker.py -q
+```
+
+### 5.4 Logs
+
+```bash
+sudo journalctl -u fixhub-api -u fixhub-worker -n 200 --no-pager
+sudo journalctl -u fixhub-netd -n 200 --no-pager        # every op: op/task/peer/ok
+sudo journalctl -u fixhub-egress -n 100 --no-pager
+```
+
+### 5.5 Rollback (removes delegation, restores direct-as-root operation)
+
+```bash
+sudo systemctl disable --now fixhub-netd.service fixhub-egress.service
+sudo rm -f /usr/local/sbin/fixhub-netd \
+  /etc/systemd/system/fixhub-netd.service \
+  /etc/systemd/system/fixhub-egress.service \
+  /etc/systemd/system/fixhub-api.service.d/10-netd.conf \
+  /etc/systemd/system/fixhub-worker.service.d/10-netd.conf
+sudo systemctl daemon-reload
+# then unset FC_NETD_SOCKET and run the API/worker as root again (not recommended),
+# or keep the host on direct execution only for manual debugging.
+```

@@ -4,6 +4,42 @@ Upstream fact: Firecracker performs **no** network filtering — packets go from
 the guest virtio-net straight to the TAP device. All policy below is enforced
 on the host; environment variables and prompt instructions are not controls.
 
+## Privilege boundary (fixhub-netd)
+
+The API/worker runs as `User=fixhub` with `NoNewPrivileges=true` and cannot
+execute any of the mutations below directly. Every privileged host operation
+goes through the root-owned `fixhub-netd` daemon
+(`infra/firecracker/fixhub-netd.py`, `infra/systemd/fixhub-netd.service`)
+over `/run/fixhub-netd.sock`:
+
+- Typed ops only: `probe | setup | teardown | prepare-jail | finalize-jail |
+  spawn-jailer | destroy-jail`. There is no generic command runner (no
+  `shell=True`, no argv/paths on the wire); the client sends at most
+  `task_id` plus three bounded spawn scalars.
+- Every name/address/route/chain is derived server-side from `task_id`
+  (`fixhub-t<N>`, `ft<N>`, `vh<N>`/`vg<N>`, `/30` guest net, `/31` link net,
+  `pre/out/in_*` chains). A task can only ever address its own objects;
+  teardown scope (`_teardown_targets`) never includes the shared loopback
+  service address, the shared table, or another task's chains.
+- Peer auth via `SO_PEERCRED`: only the `fixhub` uid is served.
+- Enforcement is not reimplemented in the daemon: `setup`/`teardown` call
+  the canonical `net.ensure_isolation`/`destroy_isolation` in-process, so
+  nft rules, address pools, verification, and fail-closed semantics cannot
+  drift between direct and delegated mode.
+- Jailer spawn likewise goes through the daemon with fully derived args
+  (binary paths, uid/gid, chroot, netns, cgroups, resource limits); the API
+  only stages files into fixhub-owned jail dirs.
+- The egress proxy/DNS stub runs as its own root systemd service
+  (`fixhub-egress.service`); `ensure_available()` is probe-only and names
+  that unit when down instead of forking a copy that could never bind :53.
+- Anything unavailable → `NetworkIsolationError`/`SandboxBlockedError` and
+  the VM never boots. Teardown stays idempotent and never raises.
+
+setuid helpers, sudo rules, and `CAP_NET_ADMIN`-style file capabilities were
+rejected: `NoNewPrivileges=true` blocks all privilege gain on exec, and
+`CAP_NET_ADMIN` alone never covered netns mounts, sysctl, nft, conntrack,
+chown, cgroups, or the jailer anyway.
+
 ## Enforcement points (`backend/app/sandbox/net.py`)
 
 1. **Service address on loopback**: `10.200.0.1/32` lives exactly once on

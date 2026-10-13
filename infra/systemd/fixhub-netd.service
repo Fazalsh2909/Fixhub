@@ -1,0 +1,28 @@
+[Unit]
+Description=FixHub Firecracker network privilege daemon (root-owned boundary)
+Documentation=file:///opt/fixhub/backend/docs/FIRECRACKER_NETWORK.md
+After=network.target fixhub-egress.service
+Wants=fixhub-egress.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+# Deliberately LIGHT sandboxing: this daemon's children include the jailer
+# and the Firecracker VMM itself (chroot, cgroups, /dev/kvm, netns). Mount /
+# syscall sandboxing (ProtectSystem=strict, PrivateTmp, SystemCallFilter)
+# would be inherited by the VMM and break boots, so it is NOT applied here.
+# The daemon's own attack surface is what is constrained instead: strict typed
+# ops, SO_PEERCRED peer auth, no shell, fixed argv (see fixhub-netd.py).
+NoNewPrivileges=true
+RestrictSUIDSGID=yes
+ExecStart=/opt/fixhub/backend/.venv/bin/python /usr/local/sbin/fixhub-netd --socket /run/fixhub-netd.sock --backend-dir /opt/fixhub/backend
+# The canonical net code resolves ip/nft/conntrack via PATH.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

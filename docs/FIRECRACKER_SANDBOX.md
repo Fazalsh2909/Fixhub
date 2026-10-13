@@ -57,6 +57,14 @@ kernel API paths are jail-relative (`./…`). There is no host fallback.
 - `backend/app/sandbox/guest/agent.py` — guest-side exec server (baked into rootfs).
 - `backend/app/sandbox/net.py` — netns/TAP/veth/nft default-deny + forced
   TCP-443 redirect into the host proxy. No default route in task netns.
+  Under `FC_NETD_SOCKET` the setup/teardown entry points delegate to the
+  root-owned daemon (same functions, server-side) and fail closed when it
+  is unreachable.
+- `backend/app/sandbox/netd_client.py` — stdlib-only typed client for the
+  daemon (fixed op enum, strict task-id validation, no shell/argv/paths).
+- `infra/firecracker/fixhub-netd.py` + `infra/systemd/` — the privileged
+  boundary service, its units, and the API drop-in (see
+  `docs/FIRECRACKER_HOST.md` §5).
 - `backend/app/sandbox/egress.py` — host SNI proxy + DNS stub (the
   allowlist enforcement point; `FC_EGRESS_ALLOWLIST` suffixes, including
   `github.com` for git ls-remote/clone).

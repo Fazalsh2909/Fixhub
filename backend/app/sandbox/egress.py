@@ -341,18 +341,37 @@ def _probe_available(timeout_s: int = 5) -> tuple[bool, str]:
     return True, "proxy+dns live"
 
 
+def _autospawn_allowed() -> bool:
+    """Whether this process may fork the egress daemon itself.
+
+    Default OFF: the production API runs as fixhub and cannot bind the DNS
+    stub port (53) anyway, so implicit spawning only hides a broken host.
+    The root-owned fixhub-egress.service (systemd) owns the daemon; set
+    FC_EGRESS_AUTOSPAWN=1 only for manual root runs / dev hosts.
+    """
+    return (os.environ.get("FC_EGRESS_AUTOSPAWN", "") or "").strip() == "1"
+
+
 def ensure_available() -> dict:
-    """Start the shared egress daemon if needed; fail closed when unusable.
+    """Verify the shared egress daemon is usable; fail closed when it is not.
 
     Returns {proxy_addr, proxy_port, dns_addr}. Raises RuntimeError otherwise.
-    Idempotent: an already-running daemon (pidfile + live probes) is reused.
+    Idempotent: an already-running daemon (live probes) is reused. The daemon
+    is NOT spawned implicitly anymore (see _autospawn_allowed): when probes
+    fail the error names the systemd unit to fix instead of forking a
+    half-working copy that cannot bind port 53.
     """
     if os.name == "nt":
         raise RuntimeError("egress proxy requires Linux (refusing VM boot on Windows)")
     ok, detail = _probe_available()
     if ok:
         return {"proxy_addr": proxy_addr(), "proxy_port": proxy_port(), "dns_addr": dns_addr()}
-    # Try to start (or adopt) the daemon, then re-probe once.
+    if not _autospawn_allowed():
+        raise RuntimeError(
+            f"host egress proxy/stub unavailable: {detail} "
+            "(start fixhub-egress.service; refusing VM boot)"
+        )
+    # Explicit opt-in only (manual root runs): adopt or spawn, then re-probe once.
     _start_daemon_detached()
     deadline = time.monotonic() + 10
     last = detail

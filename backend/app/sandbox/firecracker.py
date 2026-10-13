@@ -62,6 +62,21 @@ _CID_MOD = 50000
 _CID_MAX = (1 << 32) - 1
 
 
+def _delegated() -> bool:
+    """True when jail/network ops must go through fixhub-netd (see netd_client).
+
+    Same activation rule as the network path: explicit FC_NETD_SOCKET config
+    + non-root process. Keeps provision/destroy on the direct path for laptop
+    dev, pytest, and manual root runs.
+    """
+    try:
+        from app.sandbox import netd_client as _netd
+
+        return _netd.delegation_active()
+    except Exception:
+        return False
+
+
 def _local_host() -> str:
     try:
         import socket as _socket
@@ -607,20 +622,45 @@ def provision(task_id: int, workspace: str, *, owner_worker: str = "") -> _VM:
     gid = uid
     jailer_proc: "subprocess.Popen | None" = None
     try:
-        os.makedirs(chroot, exist_ok=True)
-        os.chmod(chroot, 0o700)
-        _write_owner(task_id, worker=owner_worker)
-        _prepare_overlay(overlay)
-        _stage_boot_files(chroot, overlay, uid=uid, gid=gid)
         # Single resource read for spawn AND verification (never diverge,
         # even if operator config changes mid-provision).
         vcpu, mem_mib, pids_max = _fc_resources()
-        jailer_proc = _spawn_jailer(
-            task_id=task_id, jail_id=jail_id, chroot_dir=chroot,
-            api_socket=api_socket, netns=netinfo["netns"],
-            uid=uid, gid=gid,
-            vcpu=vcpu, mem_mib=mem_mib, pids_max=pids_max,
-        )
+        if _delegated():
+            # Unprivileged API path: the root-owned daemon owns directory
+            # creation, chown, and the jailer process itself. This process
+            # only stages files into the fixhub-owned jail dirs.
+            from app.sandbox import netd_client as _netd
+
+            try:
+                _netd.prepare_jail(task_id)
+            except _netd.NetdError as exc:
+                raise _host.SandboxBlockedError(f"jail prepare failed: {exc}")
+            _write_owner(task_id, worker=owner_worker)
+            _prepare_overlay(overlay)
+            _stage_boot_files(chroot, overlay, uid=uid, gid=gid, chown_files=False)
+            try:
+                _netd.finalize_jail(task_id)
+            except _netd.NetdError as exc:
+                raise _host.SandboxBlockedError(f"jail finalize failed: {exc}")
+            try:
+                _netd.spawn_jailer(
+                    task_id, vcpu=vcpu, mem_mib=mem_mib, pids_max=pids_max
+                )
+            except _netd.NetdError as exc:
+                raise _host.SandboxBlockedError(f"jailer spawn failed: {exc}")
+            jailer_proc = None
+        else:
+            os.makedirs(chroot, exist_ok=True)
+            os.chmod(chroot, 0o700)
+            _write_owner(task_id, worker=owner_worker)
+            _prepare_overlay(overlay)
+            _stage_boot_files(chroot, overlay, uid=uid, gid=gid)
+            jailer_proc = _spawn_jailer(
+                task_id=task_id, jail_id=jail_id, chroot_dir=chroot,
+                api_socket=api_socket, netns=netinfo["netns"],
+                uid=uid, gid=gid,
+                vcpu=vcpu, mem_mib=mem_mib, pids_max=pids_max,
+            )
         # Limits must be OBSERVED applied, not merely requested: read back
         # the cgroup files the jailer wrote. Any miss/mismatch refuses boot.
         try:
@@ -710,12 +750,16 @@ def _prepare_overlay(overlay: str) -> None:
     os.chmod(overlay, 0o600)
 
 
-def _stage_boot_files(chroot: str, overlay: str, *, uid: int, gid: int) -> None:
+def _stage_boot_files(chroot: str, overlay: str, *, uid: int, gid: int,
+                       chown_files: bool = True) -> None:
     """Hardlink (or copy) the kernel into the jail root (jailer requirement).
 
     The overlay already lives at <chroot>/overlay.ext4. Both files are
     chowned to the per-VM uid:gid because the unprivileged Firecracker
     process needs read (kernel) and read+write (RW drive) access.
+    `chown_files=False` skips the chown for the delegated path (the
+    root-owned daemon performs it via finalize-jail); staging itself needs
+    no privilege.
     """
     kernel = _images.kernel_image()
     dest = os.path.join(chroot, os.path.basename(kernel) or "vmlinux")
@@ -724,6 +768,8 @@ def _stage_boot_files(chroot: str, overlay: str, *, uid: int, gid: int) -> None:
             os.link(kernel, dest)
         except OSError:
             shutil.copyfile(kernel, dest)
+    if not chown_files:
+        return
     try:
         os.chown(dest, uid, gid)
         os.chown(overlay, uid, gid)
@@ -1361,6 +1407,15 @@ def destroy(task_id: int) -> None:
                 pass
             _kill_task_procs(jail_id_for(task_id))
     finally:
+        # Delegated path first: the daemon owns the jailer/firecracker
+        # processes (root) and removes the tree + network as root.
+        try:
+            if _delegated():
+                from app.sandbox import netd_client as _netd
+
+                _netd.destroy_jail(task_id)
+        except Exception:
+            pass
         try:
             _remove_jail_tree(task_id, jail_id_for(task_id))
         except Exception:
@@ -1486,6 +1541,14 @@ def destroy_orphans(*, max_runtime_s: int | None = None) -> int:
                 _kill_task_procs(jail_id_for(tid))
                 _remove_jail_tree(tid, jail_id_for(tid))
                 try:
+                    # Delegated path: root-owned procs/tree need the daemon.
+                    if _delegated():
+                        from app.sandbox import netd_client as _netd
+
+                        _netd.destroy_jail(tid)
+                except Exception:
+                    pass
+                try:
                     _net.destroy_isolation(tid)
                 except Exception:
                     pass
@@ -1499,6 +1562,13 @@ def _cleanup_partial(task_id: int) -> None:
     """Remove a half-provisioned jail + its network. Never raises."""
     try:
         _kill_task_procs(jail_id_for(task_id))
+    except Exception:
+        pass
+    try:
+        if _delegated():
+            from app.sandbox import netd_client as _netd
+
+            _netd.destroy_jail(task_id)
     except Exception:
         pass
     try:
