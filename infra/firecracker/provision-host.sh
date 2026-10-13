@@ -30,6 +30,11 @@ echo "[host] check: [ -r /dev/kvm ] && [ -w /dev/kvm ] && echo KVM-OK || echo KV
 REPO_DIR="${REPO_DIR:-/opt/fixhub}"
 echo "[netd] repo=$REPO_DIR"
 id fixhub >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin fixhub
+# The jail base must remain root-owned and non-writable, but the unprivileged
+# API must be able to traverse it to stage files inside task-specific jail dirs.
+# Mode 0700 blocks that traversal even when the task directory is chowned to fixhub.
+chown root:fixhub /srv/firecracker/jails
+chmod 750 /srv/firecracker/jails
 # Daemon (root-owned, non-writable by fixhub — the privilege boundary).
 install -o root -g root -m 755 "$REPO_DIR/infra/firecracker/fixhub-netd.py" /usr/local/sbin/fixhub-netd
 # Units (repo paths are /opt/fixhub/...; rewrite when REPO_DIR differs).
