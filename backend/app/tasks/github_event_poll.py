@@ -73,7 +73,7 @@ def _list_recent_failed_runs(token: str, full_name: str, cutoff: datetime) -> li
         params={
             "status": "completed",
             "per_page": 30,
-            "created": f">={cutoff.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+            "created": f">={cutoff.strftime('%Y-%m-%d')}",
         },
         timeout=30,
     )
