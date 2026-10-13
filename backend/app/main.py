@@ -46,10 +46,16 @@ def _start_ci_watcher() -> None:
         while True:
             _time.sleep(60)
             try:
+                # GitHub App permissions do not deliver events by themselves.
+                # Poll connected installations so users do not need to configure
+                # a repository webhook or expose a local backend URL.
+                from app.tasks import github_event_poll as _event_poll
                 from app.tasks import ciwatch as _ciwatch
 
+                _event_poll.poll_github_events()
                 _ciwatch.check_awaiting_ci()
             except Exception:
+                # The poller logs per-repository failures; never kill the watcher.
                 pass
 
     threading.Thread(target=_tick, daemon=True, name="ci-watcher").start()
