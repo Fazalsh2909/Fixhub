@@ -48,6 +48,7 @@ except ImportError:  # Windows/dev: gid resolution unavailable, fail closed late
 import signal
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -337,8 +338,53 @@ def op_finalize_jail(task_id: int) -> dict:
     return {"uid": uid, "gid": gid}
 
 
+def _grant_api_socket_access(
+    task_id: int, api_socket: str, fixhub_ids: tuple[int, int] | None
+) -> None:
+    """Allow the unprivileged API to reach only this VM's Firecracker socket.
+
+    Firecracker runs as a per-VM UID. Its socket and parent directories must
+    explicitly grant the fixhub group access. Paths are derived from task_id,
+    never accepted from the client.
+    """
+    if fixhub_ids is None:
+        raise RuntimeError("fixhub service user unknown; refusing API socket access")
+    _fixhub_uid, fixhub_gid = fixhub_ids
+    chroot = chroot_dir_for(task_id)
+    expected_socket = api_socket_for(chroot)
+    if os.path.abspath(api_socket) != os.path.abspath(expected_socket):
+        raise RuntimeError("unexpected Firecracker API socket path")
+
+    base = os.path.abspath(_cfg("FC_CHROOT_BASE"))
+    id_dir = os.path.dirname(chroot)
+    # Reject symlinked/unexpected path components before changing permissions.
+    for path in (base, os.path.join(base, "firecracker"), id_dir, chroot):
+        try:
+            st = os.lstat(path)
+        except OSError as exc:
+            raise RuntimeError(f"jail directory unavailable {path}: {exc}") from exc
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise RuntimeError(f"unsafe jail directory component: {path}")
+
+    # Keep the VM UID as owner, grant only group traversal, and never grant
+    # group write on directories.
+    for path in (id_dir, chroot):
+        os.chown(path, -1, fixhub_gid)
+        os.chmod(path, 0o710)
+
+    try:
+        st = os.lstat(api_socket)
+    except OSError as exc:
+        raise RuntimeError(f"Firecracker API socket unavailable: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISSOCK(st.st_mode):
+        raise RuntimeError("Firecracker API path is not a Unix socket")
+    os.chown(api_socket, -1, fixhub_gid)
+    os.chmod(api_socket, 0o660)
+
+
 def op_spawn_jailer(
-    task_id: int, *, vcpu: int, mem_mib: int, pids_max: int
+    task_id: int, *, vcpu: int, mem_mib: int, pids_max: int,
+    fixhub_ids: tuple[int, int] | None = None,
 ) -> dict:
     """Exec the jailer as root with fully server-derived args; wait for socket."""
     jailer = _cfg("JAILER_BINARY")
@@ -407,6 +453,7 @@ def op_spawn_jailer(
     deadline = time.monotonic() + _SPAWN_WAIT_S
     while time.monotonic() < deadline:
         if os.path.exists(api_socket):
+            _grant_api_socket_access(task_id, api_socket, fixhub_ids)
             with _PROCS_LOCK:
                 _PROCS[int(task_id)] = proc
             return {"api_socket": api_socket}
@@ -519,6 +566,7 @@ def handle_request(
                     "data": op_spawn_jailer(
                         tid, vcpu=norm["vcpu"], mem_mib=norm["mem_mib"],
                         pids_max=norm["pids_max"],
+                        fixhub_ids=fixhub_ids,
                     ),
                 }
             if op == "destroy-jail":
