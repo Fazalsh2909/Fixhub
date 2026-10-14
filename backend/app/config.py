@@ -59,6 +59,8 @@ class Settings(BaseSettings):
     LLM_TOOL_RESULT_MAX_CHARS: int = 3000
     # CI fixes should converge quickly; validation gates provide a second check.
     LLM_CI_MAX_ITERATIONS: int = 12
+    # Task-wide cap shared by the initial CI fix and any gate-repair rounds.
+    LLM_CI_MAX_REQUESTS_PER_TASK: int = 16
     # Thrash guard: stop rewriting the same file after this many writes/edits
     # and finish with what exists instead of burning the iteration budget.
     LLM_MAX_REWRITES_PER_PATH: int = 8
