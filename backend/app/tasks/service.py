@@ -1051,6 +1051,12 @@ def _usage_limit_reason(db, task: Task, buf: list[dict] | None = None) -> str:
     from app.config import settings as _settings
 
     max_req = int(_settings.MAX_LLM_REQUESTS_PER_TASK or 0)
+    if task.trigger_type == "ci":
+        # Bound the whole CI task across the initial fix AND every gate-repair
+        # round, regardless of a larger legacy MAX_LLM_REQUESTS_PER_TASK value
+        # in the deployment .env. This is checked before every provider call.
+        ci_max = int(getattr(_settings, "LLM_CI_MAX_REQUESTS_PER_TASK", 16) or 16)
+        max_req = min(max_req, ci_max) if max_req > 0 else ci_max
     cap_in = int(_settings.MAX_INPUT_TOKENS_PER_TASK or 0)
     cap_out = int(_settings.MAX_OUTPUT_TOKENS_PER_TASK or 0)
     pending = len(buf or [])
