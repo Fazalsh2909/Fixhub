@@ -51,14 +51,14 @@ class Settings(BaseSettings):
     # backoff instead of killing the run: attempts × (20s, 40s, 80s, …).
     LLM_RETRY_ATTEMPTS: int = 4
     LLM_RETRY_BASE_S: float = 20.0
-    LLM_MAX_ITERATIONS: int = 40
+    LLM_MAX_ITERATIONS: int = 20
     # Conversation compaction. Provider input usage is cumulative across calls,
     # so large tool outputs and write payloads must not be replayed indefinitely.
-    LLM_HISTORY_GROUPS: int = 3
-    LLM_CONTEXT_MAX_CHARS: int = 10000
-    LLM_TOOL_RESULT_MAX_CHARS: int = 4000
+    LLM_HISTORY_GROUPS: int = 2
+    LLM_CONTEXT_MAX_CHARS: int = 8000
+    LLM_TOOL_RESULT_MAX_CHARS: int = 3000
     # CI fixes should converge quickly; validation gates provide a second check.
-    LLM_CI_MAX_ITERATIONS: int = 24
+    LLM_CI_MAX_ITERATIONS: int = 12
     # Thrash guard: stop rewriting the same file after this many writes/edits
     # and finish with what exists instead of burning the iteration budget.
     LLM_MAX_REWRITES_PER_PATH: int = 8
@@ -172,7 +172,7 @@ class Settings(BaseSettings):
     # Final hardening: per-user LLM usage limits (config defaults, env-overridable).
     # 0/None semantics: 0 concurrent/daily/request = unlimited is FORBIDDEN in
     # prod (fail-closed); token caps 0/None = off (providers may omit usage).
-    MAX_LLM_REQUESTS_PER_TASK: int = 40
+    MAX_LLM_REQUESTS_PER_TASK: int = 20
     MAX_TASKS_PER_USER_PER_DAY: int = 20
     MAX_INPUT_TOKENS_PER_TASK: int = 0
     MAX_OUTPUT_TOKENS_PER_TASK: int = 0
