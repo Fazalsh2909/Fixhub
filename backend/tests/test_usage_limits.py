@@ -8,10 +8,10 @@ from app.db.models import LLMUsage, Task
 from tests.conftest import make_user
 
 
-def _task(db, owner=None, repo="acme/limits"):
+def _task(db, owner=None, repo="acme/limits", trigger="issue"):
     t = Task(
         repository=repo,
-        trigger_type="issue",
+        trigger_type=trigger,
         issue_number=1,
         issue_title="t",
         issue_body="b",
@@ -60,6 +60,18 @@ def test_request_cap_per_task(db, monkeypatch):
     assert _svc._usage_limit_reason(db, t) == ""
     _usage(db, u, t, requests=1)
     assert "max LLM requests" in _svc._usage_limit_reason(db, t)
+
+
+def test_ci_request_budget_caps_all_rounds_below_general_limit(db, monkeypatch):
+    from app.config import settings as _s
+    from app.tasks import service as _svc
+
+    monkeypatch.setattr(_s, "MAX_LLM_REQUESTS_PER_TASK", 40)
+    monkeypatch.setattr(_s, "LLM_CI_MAX_REQUESTS_PER_TASK", 16)
+    u = make_user(db, email="ci-cap@example.com")
+    t = _task(db, owner=u, trigger="ci")
+    _usage(db, u, t, requests=16)
+    assert _svc._usage_limit_reason(db, t) == "max LLM requests per task reached (16)"
 
 
 def test_null_usage_never_fabricated(db, monkeypatch):
