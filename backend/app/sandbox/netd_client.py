@@ -45,6 +45,7 @@ OPS = frozenset(
         "prepare-jail",
         "finalize-jail",
         "spawn-jailer",
+        "grant-vsock",
         "destroy-jail",
     }
 )
@@ -259,6 +260,12 @@ def spawn_jailer(task_id: int | str, *, vcpu: int, mem_mib: int, pids_max: int) 
         {"task_id": tid, "vcpu": vcpu, "mem_mib": mem_mib, "pids_max": pids_max},
         timeout_s=_REQUEST_TIMEOUT_S,
     )
+
+
+def grant_vsock(task_id: int | str) -> dict:
+    """Grant the fixhub group access to this VM's host-side vsock socket."""
+    tid = validate_task_id(task_id)
+    return _call("grant-vsock", {"task_id": tid}, timeout_s=10)
 
 
 def destroy_jail(task_id: int | str) -> dict:
