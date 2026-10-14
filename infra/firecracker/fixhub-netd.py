@@ -67,6 +67,7 @@ OPS = frozenset(
         "prepare-jail",
         "finalize-jail",
         "spawn-jailer",
+        "grant-vsock",
         "destroy-jail",
     }
 )
@@ -338,26 +339,27 @@ def op_finalize_jail(task_id: int) -> dict:
     return {"uid": uid, "gid": gid}
 
 
-def _grant_api_socket_access(
-    task_id: int, api_socket: str, fixhub_ids: tuple[int, int] | None
+def _grant_vm_socket_access(
+    task_id: int, socket_name: str, socket_path: str,
+    fixhub_ids: tuple[int, int] | None,
 ) -> None:
-    """Allow the unprivileged API to reach only this VM's Firecracker socket.
+    """Grant fixhub access to one known socket inside a single VM jail.
 
-    Firecracker runs as a per-VM UID. Its socket and parent directories must
-    explicitly grant the fixhub group access. Paths are derived from task_id,
-    never accepted from the client.
+    Only the two fixed socket names are accepted. Their paths are derived from
+    task_id; no client-supplied filesystem path reaches this function.
     """
+    if socket_name not in {"api.socket", "v.sock"}:
+        raise RuntimeError("unsupported VM socket name")
     if fixhub_ids is None:
-        raise RuntimeError("fixhub service user unknown; refusing API socket access")
+        raise RuntimeError("fixhub service user unknown; refusing socket access")
     _fixhub_uid, fixhub_gid = fixhub_ids
     chroot = chroot_dir_for(task_id)
-    expected_socket = api_socket_for(chroot)
-    if os.path.abspath(api_socket) != os.path.abspath(expected_socket):
-        raise RuntimeError("unexpected Firecracker API socket path")
+    expected_socket = os.path.join(chroot, socket_name)
+    if os.path.abspath(socket_path) != os.path.abspath(expected_socket):
+        raise RuntimeError("unexpected Firecracker socket path")
 
     base = os.path.abspath(_cfg("FC_CHROOT_BASE"))
     id_dir = os.path.dirname(chroot)
-    # Reject symlinked/unexpected path components before changing permissions.
     for path in (base, os.path.join(base, "firecracker"), id_dir, chroot):
         try:
             st = os.lstat(path)
@@ -366,20 +368,39 @@ def _grant_api_socket_access(
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
             raise RuntimeError(f"unsafe jail directory component: {path}")
 
-    # Keep the VM UID as owner, grant only group traversal, and never grant
-    # group write on directories.
+    # FixHub gets traversal only, not directory write access.
     for path in (id_dir, chroot):
         os.chown(path, -1, fixhub_gid)
         os.chmod(path, 0o710)
 
     try:
-        st = os.lstat(api_socket)
+        st = os.lstat(socket_path)
     except OSError as exc:
-        raise RuntimeError(f"Firecracker API socket unavailable: {exc}") from exc
+        raise RuntimeError(f"Firecracker socket unavailable: {exc}") from exc
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISSOCK(st.st_mode):
-        raise RuntimeError("Firecracker API path is not a Unix socket")
-    os.chown(api_socket, -1, fixhub_gid)
-    os.chmod(api_socket, 0o660)
+        raise RuntimeError("Firecracker path is not a Unix socket")
+    os.chown(socket_path, -1, fixhub_gid)
+    os.chmod(socket_path, 0o660)
+
+
+def _grant_api_socket_access(
+    task_id: int, api_socket: str, fixhub_ids: tuple[int, int] | None
+) -> None:
+    _grant_vm_socket_access(task_id, "api.socket", api_socket, fixhub_ids)
+
+
+def _grant_vsock_socket_access(
+    task_id: int, fixhub_ids: tuple[int, int] | None
+) -> None:
+    chroot = chroot_dir_for(task_id)
+    _grant_vm_socket_access(
+        task_id, "v.sock", os.path.join(chroot, "v.sock"), fixhub_ids
+    )
+
+
+def op_grant_vsock(task_id: int, fixhub_ids: tuple[int, int] | None) -> dict:
+    _grant_vsock_socket_access(task_id, fixhub_ids)
+    return {"vsock_socket": api_socket_for(chroot_dir_for(task_id)).replace("api.socket", "v.sock")}
 
 
 def op_spawn_jailer(
@@ -560,6 +581,8 @@ def handle_request(
                 return {"ok": True, "data": op_prepare_jail(tid, fixhub_ids)}
             if op == "finalize-jail":
                 return {"ok": True, "data": op_finalize_jail(tid)}
+            if op == "grant-vsock":
+                return {"ok": True, "data": op_grant_vsock(tid, fixhub_ids)}
             if op == "spawn-jailer":
                 return {
                     "ok": True,
