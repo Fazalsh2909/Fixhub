@@ -175,7 +175,8 @@ class Settings(BaseSettings):
     # 0/None semantics: 0 concurrent/daily/request = unlimited is FORBIDDEN in
     # prod (fail-closed); token caps 0/None = off (providers may omit usage).
     MAX_LLM_REQUESTS_PER_TASK: int = 20
-    MAX_TASKS_PER_USER_PER_DAY: int = 20
+    # Self-hosted development default; production deployments can lower this.
+    MAX_TASKS_PER_USER_PER_DAY: int = 100
     MAX_INPUT_TOKENS_PER_TASK: int = 0
     MAX_OUTPUT_TOKENS_PER_TASK: int = 0
     # Phase 4.5 PG statement guard (0 = off). Applied to app connections only.
