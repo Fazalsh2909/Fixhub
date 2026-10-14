@@ -1283,17 +1283,23 @@ def run_task_inline(
                 overview = scoped + "\n\n---\n\n" + overview if overview else scoped
         ci_info = ""
         if task.trigger_type == "ci":
+            # The webhook already attaches a bounded failing-log excerpt when
+            # available. Fetch a second copy only for older/partial tasks that
+            # do not contain one; duplicating the same log nearly doubles the
+            # fixed context on every provider request.
+            excerpt = (task.ci_excerpt or "")[:2500]
             ci_info = (
                 f"workflow={task.ci_workflow} job={task.ci_job} sha={task.ci_sha} "
-                f"run={task.ci_url}\nexcerpt:\n{task.ci_excerpt[:4000]}"
+                f"run={task.ci_url}\nexcerpt:\n{excerpt}"
             )
-            ci_info += _enrich_ci_logs(
-                repository=task.repository,
-                installation_id=installation_id,
-                run_id=task.ci_run_id,
-                job_name=task.ci_job or task.ci_workflow,
-                check_url=task.ci_url,
-            )
+            if "--- failing logs ---" not in (task.ci_excerpt or "").lower():
+                ci_info += _enrich_ci_logs(
+                    repository=task.repository,
+                    installation_id=installation_id,
+                    run_id=task.ci_run_id,
+                    job_name=task.ci_job or task.ci_workflow,
+                    check_url=task.ci_url,
+                )[:2500]
 
         # --- agent (tool events persisted live so progress is visible
         # immediately and survives a mid-run crash) ---
