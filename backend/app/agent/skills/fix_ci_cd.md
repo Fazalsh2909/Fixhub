@@ -1,6 +1,6 @@
 # Fix CI/CD — minimal root-cause repair
 
-Goal: fix the software/configuration that caused CI to fail, not make CI appear green.
+Goal: fix the software/configuration that caused CI to fail. Do not MAKE CI APPEAR GREEN by hiding or suppressing the actual failure.
 
 ## Work efficiently
 - Use the failing step, logs, workflow contents, SHA and changed files already in task context. Do not fetch/read the same workflow again when its contents are supplied.
