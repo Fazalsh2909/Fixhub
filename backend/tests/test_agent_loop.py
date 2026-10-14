@@ -118,6 +118,31 @@ def test_window_compacts_large_history_to_budget(monkeypatch):
     assert "condensed" in serialized
 
 
+def test_ci_task_context_bounds_logs_and_keeps_workflow_visible():
+    from app.agent.context import CIContext, TaskContext, build_task_message
+
+    ctx = TaskContext(
+        repository="example/repo",
+        trigger_type="ci",
+        ci=CIContext(
+            workflow_name="CI",
+            workflow_file=".github/workflows/ci.yml",
+            workflow_content="workflow-setting " * 1000,
+            failure_logs=("routine log " * 500) + "UNIQUE_FAILURE_TAIL",
+            annotations="annotation " * 500,
+            changed_files="src/failing_module.py",
+        ),
+        memory_overview="old memory " * 1000,
+        skill="fix-ci-cd",
+        skill_instructions="CI discipline " * 500,
+    )
+    message = build_task_message(ctx)
+    assert len(message) <= 5500
+    assert "Workflow content:" in message
+    assert "UNIQUE_FAILURE_TAIL" in message
+    assert "src/failing_module.py" in message
+
+
 def test_ci_context_workflow_counts_as_evidence_without_re_read():
     from app.agent import phase
 
