@@ -54,9 +54,11 @@ class Settings(BaseSettings):
     LLM_MAX_ITERATIONS: int = 40
     # Conversation compaction. Provider input usage is cumulative across calls,
     # so large tool outputs and write payloads must not be replayed indefinitely.
-    LLM_HISTORY_GROUPS: int = 4
-    LLM_CONTEXT_MAX_CHARS: int = 18000
-    LLM_TOOL_RESULT_MAX_CHARS: int = 7000
+    LLM_HISTORY_GROUPS: int = 3
+    LLM_CONTEXT_MAX_CHARS: int = 10000
+    LLM_TOOL_RESULT_MAX_CHARS: int = 4000
+    # CI fixes should converge quickly; validation gates provide a second check.
+    LLM_CI_MAX_ITERATIONS: int = 24
     # Thrash guard: stop rewriting the same file after this many writes/edits
     # and finish with what exists instead of burning the iteration budget.
     LLM_MAX_REWRITES_PER_PATH: int = 8
