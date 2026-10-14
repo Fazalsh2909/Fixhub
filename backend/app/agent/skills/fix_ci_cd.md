@@ -4,16 +4,36 @@
 FIX THE SOFTWARE THAT CAUSED CI TO FAIL. Not: MAKE CI APPEAR GREEN.
 
 ## Workflow
-IDENTIFY FAILURE → INSPECT WORKFLOW → READ EXACT ERROR → TRACE FAILURE → REPRODUCE → DIAGNOSE ROOT CAUSE → IMPLEMENT MINIMAL FIX → RUN CI-EQUIVALENT VALIDATION → FINISH
+IDENTIFY THE FAILED STEP → TRACE ITS ROOT CAUSE → MINIMAL FIX → ONE TARGETED CHECK → FINISH
+
+## Token discipline (required)
+- Treat the failure logs, workflow contents, commit SHA and changed-file list
+  already included in the task context as evidence. Do not re-read the workflow
+  just to repeat context the task already supplies.
+- Start with the single failed step and the most specific file/path in its logs.
+  Search only for the implicated symbol/config; avoid repository-wide searches.
+- Read only the relevant file section (use read_file offset/limit if large).
+  Do not reread a file unchanged or dump entire directories.
+- Run the exact failing command once when practical. After the fix, run one
+  targeted equivalent check. FixHub's deterministic local gates run before
+  publishing, so do not repeat the full test/lint suite unless the first check
+  shows a reason to expand.
+- Never rewrite a whole file when a small edit suffices. Prefer edit_file with a
+  short, unique old/new snippet. Do not emit huge write_file payloads.
+- Stop investigating once the root cause is evidenced; do not keep searching
+  for unrelated possible causes.
+- Avoid printing dependency trees, verbose logs, full diffs, or entire files.
+  For commands, use quiet/short output and report the specific failing lines.
 
 ## 1. Identify
 - Workflow name, job name, failed step, commit/branch, relevant changed files.
 - Read the structured CI context first; changed files / failure output outrank memory.
 
 ## 2. Investigation procedure (inspect before editing)
-- Read the failing workflow YAML under `.github/workflows/` FIRST.
-- Read the scripts invoked by the failed step, package/dependency config,
-  environment assumptions, and the relevant application code.
+- Use workflow contents from the task context when provided. Otherwise read
+  the relevant workflow YAML under `.github/workflows/`.
+- Inspect only the script/config/code implicated by the failed step and logs.
+  Do not inspect unrelated modules or the whole repository.
 - Read the exact error (failure logs / annotations), not a paraphrase.
 - Determine whether the failure is application code, configuration,
   dependencies, environment, tests, tooling, or CI configuration.
@@ -37,9 +57,11 @@ IDENTIFY FAILURE → INSPECT WORKFLOW → READ EXACT ERROR → TRACE FAILURE →
   hide a real failure.
 
 ## 5. Validation rules
-- Run the exact failed command or the closest local equivalent.
-- Run relevant tests; inspect `git_diff` before finishing.
-- Validation failure → stay in VALIDATING / return to IMPLEMENTING.
+- Run the exact failed command once when practical; after editing run the
+  narrowest relevant check. FixHub's local gates perform the configured lint
+  and test checks before publish.
+- Inspect `git_diff` once before finishing.
+- Validation failure → fix the specific failure, then rerun only that check.
 
 ## 6. Prohibited behavior — DO NOT fix CI by
 - Deleting tests, weakening tests/assertions, disabling lint / type checking /
