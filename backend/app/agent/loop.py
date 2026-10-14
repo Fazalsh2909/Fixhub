@@ -140,6 +140,12 @@ def run_agent(
         except Exception:
             ctx.skill_instructions = ""
     tracker = _phase.InvestigationTracker(skill=ctx.skill or _skill.name)
+    if (
+        ctx.trigger_type == "ci"
+        and (ctx.ci.workflow_content or "").strip()
+        and (ctx.ci.workflow_file or "").strip()
+    ):
+        tracker.seed_ci_workflow_context(ctx.ci.workflow_file)
     workspace = ctx.workspace_root or workspace
     repository = ctx.repository or repository
     state = AgentState(
@@ -207,7 +213,14 @@ def run_agent(
             lease_lost=True,
         )
 
-    for i in range(settings.LLM_MAX_ITERATIONS):
+    iteration_limit = int(settings.LLM_MAX_ITERATIONS)
+    if (ctx.trigger_type or trigger_type) == "ci":
+        iteration_limit = min(
+            iteration_limit,
+            max(1, int(getattr(settings, "LLM_CI_MAX_ITERATIONS", 24))),
+        )
+
+    for i in range(iteration_limit):
         iterations = i + 1
         if _cancelled():
             return LoopResult(
@@ -534,16 +547,16 @@ def _message_size(message: dict) -> int:
 
 def _compact_tool_result(name: str, result: str) -> str:
     """Keep tool output useful, but prevent one log/diff from dominating context."""
-    base = max(1000, int(getattr(settings, "LLM_TOOL_RESULT_MAX_CHARS", 7000) or 7000))
+    base = max(1000, int(getattr(settings, "LLM_TOOL_RESULT_MAX_CHARS", 4000) or 4000))
     limits = {
-        "list_directory": min(base, 2500),
-        "read_file": min(base, 5500),
-        "search_code": min(base, 4500),
-        "write_file": min(base, 700),
-        "edit_file": min(base, 700),
-        "run_command": min(base, 7000),
-        "git_status": min(base, 2500),
-        "git_diff": min(base, 6000),
+        "list_directory": min(base, 1800),
+        "read_file": min(base, 3500),
+        "search_code": min(base, 3000),
+        "write_file": min(base, 500),
+        "edit_file": min(base, 500),
+        "run_command": min(base, 4000),
+        "git_status": min(base, 1800),
+        "git_diff": min(base, 3500),
     }
     return _clip_middle(result, limits.get(name, base))
 
