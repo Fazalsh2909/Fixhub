@@ -220,7 +220,7 @@ class InvestigationTracker:
         self.workflow_reads = max(self.workflow_reads, 1)
         self.read_paths.add(normalized)
 
-    def record(self, tool: str, ok: bool, args: dict | None = None) -> None
+    def record(self, tool: str, ok: bool, args: dict | None = None) -> None:
         if not ok:
             return
         if tool in INVESTIGATION_TOOLS:
