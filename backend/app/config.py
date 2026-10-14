@@ -100,7 +100,7 @@ class Settings(BaseSettings):
     # Worker-side runtime cap per microVM (seconds, enforced by the orphan/
     # overstay reaper). Must stay below JOB_TIMEOUT_S so the RQ kill (not a
     # leaked VM) is what bounds runaway work.
-    FC_VM_MAX_RUNTIME_S: int = 1500
+    FC_VM_MAX_RUNTIME_S: int = 7500
     # Owner heartbeat age (seconds) past which a dead owner is considered
     # stale. A stale heartbeat alone never reaps a live-leased task.
     FC_OWNER_STALE_S: int = 900
