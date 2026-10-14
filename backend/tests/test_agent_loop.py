@@ -73,6 +73,61 @@ def test_window_passthrough_when_short(monkeypatch):
     assert _loop._window(msgs, []) == msgs
 
 
+def test_window_compacts_large_history_to_budget(monkeypatch):
+    import json
+
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "LLM_CONTEXT_MAX_CHARS", 8000)
+    monkeypatch.setattr(_settings, "LLM_HISTORY_GROUPS", 3)
+    monkeypatch.setattr(_settings, "LLM_TOOL_RESULT_MAX_CHARS", 2000)
+    msgs = [
+        {"role": "system", "content": "system " * 40},
+        {"role": "user", "content": "CI logs and task context " * 1000},
+    ]
+    for n in range(8):
+        tid = f"big-{n}"
+        name = "write_file" if n == 7 else "run_command"
+        args = (
+            {"path": "src/fix.py", "content": "x" * 12000}
+            if name == "write_file"
+            else {"command": "pytest -q " + ("verbose " * 100)}
+        )
+        msgs.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": tid, "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args)},
+            }],
+        })
+        msgs.append({
+            "role": "tool", "tool_call_id": tid, "content": "diagnostic " * 3000,
+        })
+
+    out = _loop._window(msgs, [{"tool": "run_command", "ok": True}] * 8)
+    serialized = json.dumps(out, ensure_ascii=False)
+    assert len(serialized) <= 8000
+    assert "[12000 characters omitted from history; file was written]" in serialized
+    ids_called = {
+        tc["id"] for m in out for tc in (m.get("tool_calls") or [])
+    }
+    assert all(
+        m.get("tool_call_id") in ids_called for m in out if m.get("role") == "tool"
+    )
+    assert "condensed" in serialized
+
+
+def test_compacted_command_output_preserves_diagnostic_tail(monkeypatch):
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "LLM_TOOL_RESULT_MAX_CHARS", 1600)
+    value = "routine output " * 500 + "\nFAILED test_specific_case: assertion mismatch\n"
+    result = _loop._compact_tool_result("run_command", value)
+    assert len(result) <= 1600
+    assert "FAILED test_specific_case" in result
+
+
 def test_thrash_guard_stops_rewrites(monkeypatch, tmp_path):
     from app.config import settings as _settings
 
