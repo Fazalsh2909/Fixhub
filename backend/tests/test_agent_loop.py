@@ -118,6 +118,18 @@ def test_window_compacts_large_history_to_budget(monkeypatch):
     assert "condensed" in serialized
 
 
+def test_ci_context_workflow_counts_as_evidence_without_re_read():
+    from app.agent import phase
+
+    tracker = phase.InvestigationTracker(skill="fix-ci-cd")
+    tracker.seed_ci_workflow_context(".github/workflows/ci.yml")
+    # Provided workflow counts, but a second distinct evidence item is still required.
+    assert tracker.evidence_met() is False
+    tracker.record("search_code", True, {"pattern": "failing_symbol"})
+    assert tracker.evidence_met() is True
+    assert tracker.phase == phase.DIAGNOSED
+
+
 def test_compacted_command_output_preserves_diagnostic_tail(monkeypatch):
     from app.config import settings as _settings
 
