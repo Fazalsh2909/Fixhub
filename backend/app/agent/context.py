@@ -55,8 +55,20 @@ class TaskContext:
     skill_instructions: str = ""  # task-specific instructions layered on baseline
 
 
+def _bounded(text: str, limit: int, *, tail_ratio: float = 0.5) -> str:
+    """Bound repeated task context while retaining the diagnostic tail."""
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    marker = f"\\n...[{len(value) - limit} characters omitted]...\\n"
+    budget = max(0, limit - len(marker))
+    tail = min(budget, int(budget * max(0.0, min(1.0, tail_ratio))))
+    head = budget - tail
+    return value[:head] + marker + (value[-tail:] if tail else "")
+
+
 def build_task_message(ctx: TaskContext) -> str:
-    """First user message: CI failure first (root-cause job, not exploration)."""
+    """First user message: bounded evidence first, memory last."""
     head = (
         f"Repository: {ctx.repository} (default branch: {ctx.default_branch})\n"
         f"You are operating INSIDE this repository at its root.\n"
@@ -65,7 +77,7 @@ def build_task_message(ctx: TaskContext) -> str:
         f"\nRepository memory (background only — it may describe issues that "
         f"are already fixed; the CI failure above is NEWER than everything in "
         f"memory and is the current ground truth):\n"
-        f"{ctx.memory_overview or '(no memory yet)'}\n"
+        f"{_bounded(ctx.memory_overview or '(no memory yet)', 500)}\n"
     )
     if ctx.trigger_type == "ci":
         ci = ctx.ci
@@ -81,27 +93,30 @@ def build_task_message(ctx: TaskContext) -> str:
                 f"Commit: {ci.commit_sha}",
                 f"Branch: {ci.branch}",
                 f"Job: {ci.job}",
-                f"Step: {ci.step or '(see failure logs)'}",
+                f"Step: {_bounded(ci.step or '(see failure logs)', 250)}",
                 f"Exit code: {ci.exit_code or 'unknown'}",
                 "",
                 "Failure:",
-                ci.failure_logs or "(no log excerpt captured)",
+                _bounded(ci.failure_logs or "(no log excerpt captured)", 1500, tail_ratio=0.65),
                 "",
-                f"Annotations: {ci.annotations or 'none'}",
-                f"Changed files: {ci.changed_files or 'unknown'}",
+                f"Annotations: {_bounded(ci.annotations or 'none', 250)}",
+                f"Changed files: {_bounded(ci.changed_files or 'unknown', 250)}",
                 f"Run URL: {ci.url}",
             ] if line
         )
-        wf = f"\nWorkflow content:\n{ci.workflow_content}\n" if ci.workflow_content else ""
-        base = f"{head}\n{block}\n{wf}{mem}"
+        wf = (
+            f"\nWorkflow content:\n{_bounded(ci.workflow_content, 1000, tail_ratio=0.5)}\n"
+            if ci.workflow_content else ""
+        )
+        base = f"{head}\n{wf}\n{block}\n{mem}"
         if ctx.skill_instructions:
-            base += f"\nActive skill ({ctx.skill or 'fix-ci-cd'}):\n{ctx.skill_instructions}\n"
+            base += f"\nActive skill ({ctx.skill or 'fix-ci-cd'}):\n{_bounded(ctx.skill_instructions, 1000)}\n"
         return base
     issue = ctx.issue
     base = (
         f"{head}\nIssue #{issue.number}: {issue.title}\n"
-        f"Issue body:\n{issue.body}\n\nURL: {issue.url}\n{mem}"
+        f"Issue body:\n{_bounded(issue.body, 3000, tail_ratio=0.35)}\n\nURL: {issue.url}\n{mem}"
     )
     if ctx.skill_instructions:
-        base += f"\nActive skill ({ctx.skill or 'fix-issues'}):\n{ctx.skill_instructions}\n"
+        base += f"\nActive skill ({ctx.skill or 'fix-issues'}):\n{_bounded(ctx.skill_instructions, 1800)}\n"
     return base
