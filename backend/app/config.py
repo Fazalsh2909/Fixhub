@@ -52,9 +52,11 @@ class Settings(BaseSettings):
     LLM_RETRY_ATTEMPTS: int = 4
     LLM_RETRY_BASE_S: float = 20.0
     LLM_MAX_ITERATIONS: int = 40
-    # Conversation window: how many recent tool-exchange blocks are resent to
-    # the LLM per call (older ones are replaced by a one-line summary).
-    LLM_HISTORY_GROUPS: int = 12
+    # Conversation compaction. Provider input usage is cumulative across calls,
+    # so large tool outputs and write payloads must not be replayed indefinitely.
+    LLM_HISTORY_GROUPS: int = 4
+    LLM_CONTEXT_MAX_CHARS: int = 18000
+    LLM_TOOL_RESULT_MAX_CHARS: int = 7000
     # Thrash guard: stop rewriting the same file after this many writes/edits
     # and finish with what exists instead of burning the iteration budget.
     LLM_MAX_REWRITES_PER_PATH: int = 8
