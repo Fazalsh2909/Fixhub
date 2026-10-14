@@ -547,7 +547,7 @@ def _message_size(message: dict) -> int:
 
 def _compact_tool_result(name: str, result: str) -> str:
     """Keep tool output useful, but prevent one log/diff from dominating context."""
-    base = max(1000, int(getattr(settings, "LLM_TOOL_RESULT_MAX_CHARS", 4000) or 4000))
+    base = max(1000, int(getattr(settings, "LLM_TOOL_RESULT_MAX_CHARS", 3000) or 3000))
     limits = {
         "list_directory": min(base, 1800),
         "read_file": min(base, 3500),
@@ -624,8 +624,8 @@ def _window(messages: list[dict], events: list[dict]) -> list[dict]:
     system/task context, a few recent exchanges, compact historical write args,
     and only bounded tool output. Older exchanges are replaced by a short recap.
     """
-    max_chars = max(8000, int(getattr(settings, "LLM_CONTEXT_MAX_CHARS", 10000) or 10000))
-    keep = max(1, min(4, int(getattr(settings, "LLM_HISTORY_GROUPS", 3) or 3)))
+    max_chars = max(8000, int(getattr(settings, "LLM_CONTEXT_MAX_CHARS", 8000) or 8000))
+    keep = max(1, min(4, int(getattr(settings, "LLM_HISTORY_GROUPS", 2) or 2)))
     head = [dict(m) for m in messages[:2]]
     if len(head) < 2:
         return head
@@ -690,7 +690,7 @@ def _window(messages: list[dict], events: list[dict]) -> list[dict]:
         out.append({
             "role": "user",
             "content": _clip_middle(
-                f"[Earlier exchanges omitted/compacted to stay within the context budget. "
+                f"[Earlier exchanges condensed to stay within the context budget. "
                 f"Tool calls so far: {recap or 'none'}. Use the latest outputs and current repository state.]",
                 800,
             ),
