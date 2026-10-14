@@ -436,7 +436,7 @@ def run_agent(
                     )
                     state.last_failure = msg
                     continue
-            result = _execute(workspace, tc.name, args)
+            result = _compact_tool_result(tc.name, _execute(workspace, tc.name, args))
             ok = not result.startswith("ERROR")
             meta = (
                 _parse_command_result(result) if tc.name == "run_command" and ok else {}
@@ -509,20 +509,123 @@ def run_agent(
     )
 
 
-def _window(messages: list[dict], events: list[dict]) -> list[dict]:
-    """Sliding conversation window: system + task message always, then the most
-    recent tool-exchange blocks. Older blocks are replaced by a one-line
-    summary (built from persisted event metadata) instead of being resent
-    every call — this is what keeps input tokens from snowballing on long runs.
+def _clip_middle(text: str, limit: int) -> str:
+    """Bound context while preserving both the beginning and the diagnostic tail."""
+    text = str(text or "")
+    limit = max(0, int(limit))
+    if len(text) <= limit:
+        return text
+    marker = f"\n...[omitted {len(text) - limit} characters]...\n"
+    if limit <= len(marker):
+        return text[:limit]
+    budget = limit - len(marker)
+    head = int(budget * 0.65)
+    tail = budget - head
+    return text[:head] + marker + (text[-tail:] if tail else "")
 
-    Only whole assistant+tool-response blocks are ever dropped, so tool_call
-    ids always have their matching responses.
+
+def _message_size(message: dict) -> int:
+    """Approximate serialized request size in characters (includes tool args)."""
+    try:
+        return len(json.dumps(message, ensure_ascii=False, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return len(str(message))
+
+
+def _compact_tool_result(name: str, result: str) -> str:
+    """Keep tool output useful, but prevent one log/diff from dominating context."""
+    base = max(1000, int(getattr(settings, "LLM_TOOL_RESULT_MAX_CHARS", 7000) or 7000))
+    limits = {
+        "list_directory": min(base, 2500),
+        "read_file": min(base, 5500),
+        "search_code": min(base, 4500),
+        "write_file": min(base, 700),
+        "edit_file": min(base, 700),
+        "run_command": min(base, 7000),
+        "git_status": min(base, 2500),
+        "git_diff": min(base, 6000),
+    }
+    return _clip_middle(result, limits.get(name, base))
+
+
+def _compact_history_message(message: dict) -> dict:
+    """Copy a historical message, omitting bulky payloads already applied to disk."""
+    import copy as _copy
+
+    out = _copy.deepcopy(message)
+    if isinstance(out.get("content"), str):
+        cap = 600 if out.get("role") == "assistant" and out.get("tool_calls") else 1200
+        out["content"] = _clip_middle(out["content"], cap)
+    calls = out.get("tool_calls") or []
+    for call in calls:
+        fn = call.get("function") or {}
+        name = str(fn.get("name") or "")
+        raw = fn.get("arguments") or "{}"
+        try:
+            args = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except (TypeError, ValueError):
+            fn["arguments"] = "{}"
+            continue
+        if name == "write_file":
+            content = args.get("content")
+            if isinstance(content, str) and len(content) > 160:
+                args["content"] = f"[{len(content)} characters omitted from history; file was written]"
+        elif name == "edit_file":
+            for field_name in ("old", "new"):
+                value = args.get(field_name)
+                if isinstance(value, str):
+                    args[field_name] = _clip_middle(value, 240)
+        elif name == "run_command" and isinstance(args.get("command"), str):
+            args["command"] = _clip_middle(args["command"], 500)
+        elif name == "search_code" and isinstance(args.get("pattern"), str):
+            args["pattern"] = _clip_middle(args["pattern"], 240)
+        fn["arguments"] = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+    if out.get("role") == "tool" and isinstance(out.get("content"), str):
+        out["content"] = _compact_tool_result("tool", out["content"])
+    return out
+
+
+def _fit_history_span(span: list[dict], budget: int) -> list[dict] | None:
+    """Shrink a single exchange enough to fit without breaking tool-call pairing."""
+    import copy as _copy
+
+    fitted = _copy.deepcopy(span)
+    tool_messages = [m for m in fitted if m.get("role") == "tool"]
+    if not tool_messages:
+        return fitted if sum(_message_size(m) for m in fitted) <= budget else None
+    # Tool outputs share the remaining budget. Keep both ends (test failures often
+    # appear at the end of stderr), and keep every response paired to its call ID.
+    fixed = sum(_message_size(m) for m in fitted if m.get("role") != "tool")
+    per_result = max(120, (budget - fixed - 200) // max(1, len(tool_messages)))
+    for message in tool_messages:
+        message["content"] = _clip_middle(str(message.get("content", "")), per_result)
+    if sum(_message_size(m) for m in fitted) <= budget:
+        return fitted
+    return None
+
+
+def _window(messages: list[dict], events: list[dict]) -> list[dict]:
+    """Token-conscious conversation window with a hard serialized-character budget.
+
+    The provider counts prompt tokens again on every stateless request. We keep
+    system/task context, a few recent exchanges, compact historical write args,
+    and only bounded tool output. Older exchanges are replaced by a short recap.
     """
-    keep = max(1, settings.LLM_HISTORY_GROUPS)
-    head = messages[:2]
+    max_chars = max(8000, int(getattr(settings, "LLM_CONTEXT_MAX_CHARS", 18000) or 18000))
+    keep = max(1, min(6, int(getattr(settings, "LLM_HISTORY_GROUPS", 4) or 4)))
+    head = [dict(m) for m in messages[:2]]
+    if len(head) < 2:
+        return head
+
+    # Reserve roughly one third for recent evidence. Keep system instructions intact;
+    # clip only the task payload if the incoming webhook/context is unusually large.
+    system_size = _message_size(head[0])
+    task_budget = max(2500, max_chars - system_size - min(5000, max_chars // 3))
+    if isinstance(head[1].get("content"), str):
+        head[1]["content"] = _clip_middle(head[1]["content"], task_budget)
+    head_size = sum(_message_size(m) for m in head)
+
     rest = messages[2:]
-    # Split rest into spans: lone message, or assistant-with-tool_calls plus
-    # all following tool responses.
     spans: list[list[dict]] = []
     j = 0
     while j < len(rest):
@@ -536,32 +639,60 @@ def _window(messages: list[dict], events: list[dict]) -> list[dict]:
                 and rest[k].get("tool_call_id") in ids
             ):
                 k += 1
-            spans.append(rest[j:k])
+            spans.append([_compact_history_message(x) for x in rest[j:k]])
             j = k
         else:
-            spans.append([m])
+            spans.append([_compact_history_message(m)])
             j += 1
-    if len(spans) <= keep:
-        return messages
-    dropped = len(spans) - keep
-    tool_names: dict[str, int] = {}
-    for ev in events:
-        tool_names[ev.get("tool", "?")] = tool_names.get(ev.get("tool", "?"), 0) + 1
-    recap = ", ".join(
-        f"{n} {t}" for t, n in sorted(tool_names.items(), key=lambda x: -x[1])[:6]
-    )
-    summary = {
-        "role": "user",
-        "content": (
-            f"[context condensed: {dropped} earlier step(s) omitted to save tokens. "
-            f"Tool calls so far — {recap or 'none'}. Continue from the latest state below.]"
-        ),
-    }
-    out = head + [summary]
-    for span in spans[-keep:]:
-        out.extend(span)
-    return out
 
+    selected: list[list[dict]] = []
+    reserve_summary = 900 if spans else 0
+    remaining = max(0, max_chars - head_size - reserve_summary)
+    for span in reversed(spans):
+        if len(selected) >= keep:
+            break
+        size = sum(_message_size(m) for m in span)
+        if size <= remaining:
+            selected.append(span)
+            remaining -= size
+            continue
+        if not selected and remaining >= 1200:
+            fitted = _fit_history_span(span, remaining)
+            if fitted is not None:
+                selected.append(fitted)
+                remaining -= sum(_message_size(m) for m in fitted)
+        break
+    selected.reverse()
+
+    dropped = len(spans) - len(selected)
+    out = head
+    if dropped > 0:
+        tool_names: dict[str, int] = {}
+        for ev in events:
+            name = ev.get("tool", "?")
+            tool_names[name] = tool_names.get(name, 0) + 1
+        recap = ", ".join(
+            f"{n} {name}" for name, n in sorted(tool_names.items(), key=lambda x: -x[1])[:5]
+        )
+        out.append({
+            "role": "user",
+            "content": _clip_middle(
+                f"[Earlier exchanges omitted/compacted to stay within the context budget. "
+                f"Tool calls so far: {recap or 'none'}. Use the latest outputs and current repository state.]",
+                800,
+            ),
+        })
+    for span in selected:
+        out.extend(span)
+    # In the unlikely event of a large single message/metadata edge case, enforce
+    # the cap on the final payload while retaining the mandatory system/task head.
+    while len(out) > 2 and sum(_message_size(m) for m in out) > max_chars:
+        tool_idx = next((i for i in range(2, len(out)) if out[i].get("role") == "tool"), None)
+        if tool_idx is None:
+            break
+        content = str(out[tool_idx].get("content", ""))
+        out[tool_idx]["content"] = _clip_middle(content, max(120, len(content) // 2))
+    return out
 
 def _require(args: dict, *fields: str) -> str | None:
     """Validate required tool args. Returns an ERROR message or None when ok.
