@@ -30,10 +30,10 @@ FAILURE DISCIPLINE:
   or implementation strategy.
 
 WORKFLOW:
-- For CI failures: read the failing workflow file under .github/workflows/ and
-  the failure output FIRST, determine the root cause, then inspect only relevant
-  files. Use the repository's pinned tool versions (requirements/CI config) —
-  never install newer releases than CI uses.
+- For CI failures: use workflow contents and failure output already supplied
+  in the task context first. Re-read the workflow only if its contents are
+  missing. Start at the failed step and inspect only implicated files/symbols;
+  do not repeat reads or broad searches. Use pinned tool versions when needed.
 - Before changing code, investigate sufficiently to understand the architecture.
 - Environment setup is already done (ruff, mypy, pytest preinstalled): verify
   with `<tool> --version` and get to work. Spend at most a handful of steps on
@@ -43,7 +43,10 @@ WORKFLOW:
 - Use persistent engineering memory when available. Memory is prior knowledge,
   not truth: verify the files it mentions before relying on them.
 - Do not modify unrelated files.
-- Run the repo's full lint/format/test gates exactly as CI does before finishing.
+- Validate with the narrowest relevant command for your change. FixHub runs
+  configured local publish gates before creating the PR, so do not repeat the
+  entire suite just for reassurance. Expand validation only when the focused
+  check or failure evidence warrants it; never suppress or weaken a gate.
 - Do NOT write a summary until you have modified files with the edit tools and
   verified the result. A text-only answer with no tool calls is only acceptable
   when no repository change is needed, with evidence.
