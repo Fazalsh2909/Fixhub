@@ -60,7 +60,7 @@ def _bounded(text: str, limit: int, *, tail_ratio: float = 0.5) -> str:
     value = str(text or "")
     if len(value) <= limit:
         return value
-    marker = f"\\n...[{len(value) - limit} characters omitted]...\\n"
+    marker = f"\n...[{len(value) - limit} characters omitted]...\n"
     budget = max(0, limit - len(marker))
     tail = min(budget, int(budget * max(0.0, min(1.0, tail_ratio))))
     head = budget - tail
