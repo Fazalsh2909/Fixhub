@@ -624,8 +624,8 @@ def _window(messages: list[dict], events: list[dict]) -> list[dict]:
     system/task context, a few recent exchanges, compact historical write args,
     and only bounded tool output. Older exchanges are replaced by a short recap.
     """
-    max_chars = max(8000, int(getattr(settings, "LLM_CONTEXT_MAX_CHARS", 18000) or 18000))
-    keep = max(1, min(6, int(getattr(settings, "LLM_HISTORY_GROUPS", 4) or 4)))
+    max_chars = max(8000, int(getattr(settings, "LLM_CONTEXT_MAX_CHARS", 10000) or 10000))
+    keep = max(1, min(4, int(getattr(settings, "LLM_HISTORY_GROUPS", 3) or 3)))
     head = [dict(m) for m in messages[:2]]
     if len(head) < 2:
         return head
