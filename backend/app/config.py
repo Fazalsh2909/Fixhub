@@ -23,12 +23,12 @@ class Settings(BaseSettings):
     DB_POOL_TIMEOUT: int = 30
     DB_POOL_RECYCLE: int = 1800
     # Phase 4: concurrency caps (0 = unlimited). Enforced at enqueue + claim.
-    MAX_RUNNING_TASKS_GLOBAL: int = 20
-    MAX_RUNNING_PER_USER: int = 5
-    MAX_RUNNING_PER_REPO: int = 2
+    MAX_RUNNING_TASKS_GLOBAL: int = 100
+    MAX_RUNNING_PER_USER: int = 100
+    MAX_RUNNING_PER_REPO: int = 100
     # Phase 4: claim lease seconds (must exceed JOB_TIMEOUT_S so slow workers
     # are never reaped mid-run; recovery reaps only expired leases).
-    TASK_LEASE_S: int = 3600
+    TASK_LEASE_S: int = 10800
 
     # LLM provider switch: "bynara" | "xkiro" (both OpenAI-compatible).
     # Switch providers by setting LLM_PROVIDER only — no other edits needed.
@@ -51,20 +51,20 @@ class Settings(BaseSettings):
     # backoff instead of killing the run: attempts × (20s, 40s, 80s, …).
     LLM_RETRY_ATTEMPTS: int = 4
     LLM_RETRY_BASE_S: float = 20.0
-    LLM_MAX_ITERATIONS: int = 20
+    LLM_MAX_ITERATIONS: int = 100
     # Conversation compaction. Provider input usage is cumulative across calls,
     # so large tool outputs and write payloads must not be replayed indefinitely.
     LLM_HISTORY_GROUPS: int = 2
     LLM_CONTEXT_MAX_CHARS: int = 8000
     LLM_TOOL_RESULT_MAX_CHARS: int = 3000
     # CI fixes should converge quickly; validation gates provide a second check.
-    LLM_CI_MAX_ITERATIONS: int = 12
+    LLM_CI_MAX_ITERATIONS: int = 100
     # Task-wide cap shared by the initial CI fix and any gate-repair rounds.
-    LLM_CI_MAX_REQUESTS_PER_TASK: int = 16
+    LLM_CI_MAX_REQUESTS_PER_TASK: int = 1000
     # Thrash guard: stop rewriting the same file after this many writes/edits
     # and finish with what exists instead of burning the iteration budget.
-    LLM_MAX_REWRITES_PER_PATH: int = 8
-    LLM_MAX_RUNTIME_S: int = 900
+    LLM_MAX_REWRITES_PER_PATH: int = 25
+    LLM_MAX_RUNTIME_S: int = 3600
     LLM_MAX_OUTPUT_BYTES: int = 200_000
 
     # Agent tool bounds
@@ -162,7 +162,7 @@ class Settings(BaseSettings):
     # for slow free-tier models must preserve the ordering (see
     # DEV_SLOW_MODEL + validate_timeout_ladder below; docs/TIMEOUTS.md).
     LEASE_RENEW_EVERY_S: int = 120
-    AGENT_BUDGET_S: int = 2100
+    AGENT_BUDGET_S: int = 7200
     # Final hardening: tool/process cleanup margin. A worker that finishes a
     # long tool call gets this much grace to renew/revalidate the lease before
     # continuing. Must be << LEASE_RENEW_EVERY_S and << TASK_LEASE_S.
@@ -174,9 +174,9 @@ class Settings(BaseSettings):
     # Final hardening: per-user LLM usage limits (config defaults, env-overridable).
     # 0/None semantics: 0 concurrent/daily/request = unlimited is FORBIDDEN in
     # prod (fail-closed); token caps 0/None = off (providers may omit usage).
-    MAX_LLM_REQUESTS_PER_TASK: int = 20
+    MAX_LLM_REQUESTS_PER_TASK: int = 1000
     # Self-hosted development default; production deployments can lower this.
-    MAX_TASKS_PER_USER_PER_DAY: int = 100
+    MAX_TASKS_PER_USER_PER_DAY: int = 10000
     MAX_INPUT_TOKENS_PER_TASK: int = 0
     MAX_OUTPUT_TOKENS_PER_TASK: int = 0
     # Phase 4.5 PG statement guard (0 = off). Applied to app connections only.
@@ -196,7 +196,7 @@ class Settings(BaseSettings):
     AUTO_PUBLISH: int = 1
     # Phase 4.5: must exceed AGENT_BUDGET_S + clone/gates/publish slack so the
     # cumulative budget (not the RQ kill) is what normally bounds agent work.
-    JOB_TIMEOUT_S: int = 2400
+    JOB_TIMEOUT_S: int = 9000
 
 
 settings = Settings()
