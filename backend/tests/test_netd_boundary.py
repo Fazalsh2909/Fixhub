@@ -396,6 +396,38 @@ def test_daemon_grants_fixhub_group_access_to_only_vm_api_socket(monkeypatch, tm
         sock.close()
 
 
+@pytest.mark.skipif(not hasattr(_socket_mod, "AF_UNIX"), reason="Unix sockets unavailable")
+def test_daemon_grants_fixhub_group_access_to_guest_agent_vsock(monkeypatch, tmp_path):
+    base = tmp_path / "jails"
+    chroot = base / "firecracker" / "task-7" / "root"
+    chroot.mkdir(parents=True)
+    sock_path = chroot / "v.sock"
+    sock = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
+    sock.bind(str(sock_path))
+    sock.listen(1)
+    try:
+        monkeypatch.setattr(
+            _daemon, "_cfg",
+            lambda name: str(base) if name == "FC_CHROOT_BASE" else "",
+        )
+        uid, gid = os.getuid(), os.getgid()
+        resp = _daemon.handle_request(
+            {"op": "grant-vsock", "task_id": 7},
+            peer_uid=uid,
+            allowed_uid=uid,
+            netmod=_StubNet(),
+            egressmod=_StubEgress(),
+            fixhub_ids=(uid, gid),
+        )
+        assert resp["ok"] is True, resp
+        assert stat.S_IMODE(os.stat(chroot.parent).st_mode) == 0o710
+        assert stat.S_IMODE(os.stat(chroot).st_mode) == 0o710
+        assert os.stat(sock_path).st_gid == gid
+        assert stat.S_IMODE(os.stat(sock_path).st_mode) == 0o660
+    finally:
+        sock.close()
+
+
 def test_per_task_derivation_matches_firecracker_contract(monkeypatch):
     # Daemon and backend must agree on jail identity (drift = wrong-VM kill).
     assert _daemon.jail_id_for(91021) == _fc.jail_id_for(91021) == "task-91021"
