@@ -203,7 +203,24 @@ class InvestigationTracker:
     workflow_reads: int = 0
     transitions: list[str] = field(default_factory=list)
 
-    def record(self, tool: str, ok: bool, args: dict | None = None) -> None:
+    def seed_ci_workflow_context(self, path: str) -> None:
+        """Count workflow content already supplied in TaskContext as evidence.
+
+        The webhook fetches the real workflow file before the agent starts.
+        Requiring the model to fetch identical content again burns a tool turn;
+        it still must gather one additional, distinct piece of evidence.
+        """
+        if self.skill != "fix-ci-cd" or not path:
+            return
+        normalized = path.replace("\\", "/").lower()
+        if not normalized.startswith(_WORKFLOW_PREFIX) and "workflow" not in normalized:
+            return
+        self.investigation_calls = max(self.investigation_calls, 1)
+        self.reads = max(self.reads, 1)
+        self.workflow_reads = max(self.workflow_reads, 1)
+        self.read_paths.add(normalized)
+
+    def record(self, tool: str, ok: bool, args: dict | None = None) -> None
         if not ok:
             return
         if tool in INVESTIGATION_TOOLS:
