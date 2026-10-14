@@ -12,6 +12,7 @@ test_sandbox_backend.py; real filtering proof requires the KVM host suite
 import importlib.util
 import json
 import os
+import stat
 import socket as _socket_mod
 import sys
 import types
@@ -368,6 +369,31 @@ def test_teardown_inventory_never_covers_shared_state():
     assert t7["vh"] != "lo" and t7["tap"] != "lo"
     assert _net.HOST_SVC_IP not in blob  # loopback service addr never torn down
     assert "fixhub_vm" not in blob  # table itself (shared) never addressed
+
+
+@pytest.mark.skipif(not hasattr(_socket_mod, "AF_UNIX"), reason="Unix sockets unavailable")
+def test_daemon_grants_fixhub_group_access_to_only_vm_api_socket(monkeypatch, tmp_path):
+    base = tmp_path / "jails"
+    id_dir = base / "firecracker" / "task-7"
+    chroot = id_dir / "root"
+    chroot.mkdir(parents=True)
+    sock_path = chroot / "api.socket"
+    sock = _socket_mod.socket(_socket_mod.AF_UNIX, _socket_mod.SOCK_STREAM)
+    sock.bind(str(sock_path))
+    sock.listen(1)
+    try:
+        monkeypatch.setattr(_daemon, "_cfg", lambda name: str(base) if name == "FC_CHROOT_BASE" else "")
+        gid = os.getgid()
+        _daemon._grant_api_socket_access(7, str(sock_path), (os.getuid(), gid))
+
+        assert stat.S_IMODE(os.stat(id_dir).st_mode) == 0o710
+        assert stat.S_IMODE(os.stat(chroot).st_mode) == 0o710
+        assert os.stat(id_dir).st_gid == gid
+        assert os.stat(chroot).st_gid == gid
+        assert stat.S_IMODE(os.stat(sock_path).st_mode) == 0o660
+        assert os.stat(sock_path).st_gid == gid
+    finally:
+        sock.close()
 
 
 def test_per_task_derivation_matches_firecracker_contract(monkeypatch):
