@@ -974,6 +974,14 @@ def _wait_guest_agent(vm: _VM) -> None:
     last_err: Exception | None = None
     while time.monotonic() < deadline:
         try:
+            # Firecracker creates v.sock when vsock is configured/started.
+            # The jailer runs Firecracker as a per-VM UID, so the host-side
+            # guest-agent client needs a narrow root-mediated group permission
+            # handoff after this socket exists.
+            if _delegated():
+                from app.sandbox import netd_client as _netd
+
+                _netd.grant_vsock(vm.task_id)
             resp = client.call(
                 _guest.build_request(op="exec", argv=["echo", "ok"], timeout_s=5),
                 timeout_s=8,
