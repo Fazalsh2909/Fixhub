@@ -12,10 +12,11 @@ Group=root
 # and the Firecracker VMM itself (chroot, cgroups, /dev/kvm, netns). Mount /
 # syscall sandboxing (ProtectSystem=strict, PrivateTmp, SystemCallFilter)
 # would be inherited by the VMM and break boots, so it is NOT applied here.
-# The daemon's own attack surface is what is constrained instead: strict typed
-# ops, SO_PEERCRED peer auth, no shell, fixed argv (see fixhub-netd.py).
+# The daemon's own attack surface is constrained by strict typed ops,
+# SO_PEERCRED peer auth, no shell, and fixed argv (see fixhub-netd.py).
+# Do NOT set RestrictSUIDSGID here: jailer must setgid/setuid to drop to the
+# per-VM UID/GID when it execs Firecracker; systemd's restriction blocks it.
 NoNewPrivileges=true
-RestrictSUIDSGID=yes
 ExecStart=/opt/fixhub/backend/.venv/bin/python /usr/local/sbin/fixhub-netd --socket /run/fixhub-netd.sock --backend-dir /opt/fixhub/backend
 # The canonical net code resolves ip/nft/conntrack via PATH.
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
