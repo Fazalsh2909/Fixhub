@@ -49,6 +49,88 @@ def failing_logs_excerpt(*, token: str, full_name: str, run_id: str, max_bytes: 
     return out_capped
 
 
+def _signal_line(line: str) -> bool:
+    """True when a log line looks like failure evidence (not progress noise)."""
+    s = line.strip()
+    if not s:
+        return False
+    if len(s) > 500:
+        s = s[:500]
+    probes = ("FAILED", "failed", "Error", "ERROR", "Traceback",
+              "assert", "raise ", "E   ", "F   ")
+    return any(p in line for p in probes)
+
+
+def extract_failure_signal(lines: list[str], *, max_bytes: int = 6000) -> str:
+    """Select failure-relevant sections from CI job log lines.
+
+    The full log is already downloaded by the caller; a plain tail keeps the
+    summary but drops the failure bodies that precede it (e.g. pytest's
+    FAILURES section). This keeps, in original order:
+    - pytest-style failure/summary sections (FAILURES, short test summary,
+      ERRORS) and any line matching failure probes;
+    - the trailing lines (result/summary line always survives);
+    and drops the pytest warnings-summary section (usually the bulkiest,
+    lowest-signal part). Non-pytest logs without any signal fall back to a
+    plain tail. Bounded with a middle cut that preserves both ends.
+    """
+    import re as _re
+
+    header_re = _re.compile(r"^=+ (.+) =+$")
+    keep_ranges: list[tuple[int, int]] = []
+    drop_ranges: list[tuple[int, int]] = []
+    current: tuple[int, str] | None = None  # (start, kind)
+    for i, ln in enumerate(lines):
+        m = header_re.match(ln.strip())
+        if not m:
+            continue
+        if current is not None:
+            start, kind = current
+            (keep_ranges if kind == "keep" else drop_ranges).append((start, i))
+            current = None
+        title = m.group(1).strip().lower()
+        if "warnings summary" in title:
+            current = (i, "drop")
+        elif ("failure" in title or "short test summary" in title
+                or title.startswith("errors")):
+            current = (i, "keep")
+    if current is not None:
+        start, kind = current
+        (keep_ranges if kind == "keep" else drop_ranges).append((start, len(lines)))
+
+    dropped = set()
+    for start, end in drop_ranges:
+        dropped.update(range(start, end))
+
+    tail_start = max(0, len(lines) - 60)
+    signal_hit = bool(keep_ranges) or any(
+        i < tail_start and i not in dropped and _signal_line(ln)
+        for i, ln in enumerate(lines)
+    )
+    if not signal_hit:
+        # No recognizable signal (ruff/mypy/npm style logs): plain tail.
+        return "\n".join(lines[-120:])
+
+    keep: set[int] = set()
+    for start, end in keep_ranges:
+        keep.update(i for i in range(start, end) if i not in dropped)
+    for i, ln in enumerate(lines):
+        if i not in dropped and _signal_line(ln):
+            keep.add(i)
+    # Trailing lines always survive (result/summary line).
+    keep.update(range(tail_start, len(lines)))
+    keep = {i for i in keep if i not in dropped}
+
+    selected = "\n".join(lines[i] for i in sorted(keep))
+    if len(selected) <= max_bytes:
+        return selected
+    marker = f"\n...[{len(selected) - max_bytes} characters omitted]...\n"
+    budget = max(0, max_bytes - len(marker))
+    head = int(budget * 0.6)
+    tail = budget - head
+    return selected[:head] + marker + (selected[-tail:] if tail else "")
+
+
 def failed_log_tail(
     *,
     token: str,
@@ -58,11 +140,13 @@ def failed_log_tail(
     max_lines: int = 120,
     max_bytes: int = 6000,
 ) -> str:
-    """Download the log of the failed job and return its tail.
+    """Download the log of the failed job and return its failure signal.
 
-    Gives the agent the exact error text (e.g. ruff's "Would reformat: ...")
-    instead of just a step name. Bounded; raises on API failure so callers
-    can fall back to failing_logs_excerpt().
+    Gives the agent the exact error text (e.g. pytest's FAILURES section,
+    ruff's "Would reformat: ...") instead of just a step name. The full log
+    is downloaded; failure sections are extracted and noise (warnings
+    summaries, timestamps) is dropped. Bounded; raises on API failure so
+    callers can fall back to failing_logs_excerpt().
     """
     jobs_url = f"{settings.GITHUB_API_URL}/repos/{full_name}/actions/runs/{run_id}/jobs"
     resp = httpx.get(url=jobs_url, headers=_headers(token), timeout=30)
@@ -84,9 +168,12 @@ def failed_log_tail(
     import re as _re
 
     clean = [_re.sub(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z\s?", "", ln) for ln in lines]
-    tail = "\n".join(clean[-max_lines:])
-    header = f"JOB {job.get('name')} log tail (last {max_lines} lines):\n"
-    out = header + tail
+    signal = extract_failure_signal(clean, max_bytes=max_bytes)
+    if signal == "\n".join(clean[-max_lines:]):
+        header = f"JOB {job.get('name')} log tail (last {max_lines} lines):\n"
+    else:
+        header = f"JOB {job.get('name')} failure signal (extracted sections + tail):\n"
+    out = header + signal
     return out[:max_bytes] if len(out) > max_bytes else out
 
 

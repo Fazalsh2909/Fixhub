@@ -89,7 +89,7 @@ def build_task_message(ctx: TaskContext) -> str:
                 f"Exit code: {ci.exit_code or 'unknown'}",
                 "",
                 "Failure:",
-                _bounded(ci.failure_logs or "(no log excerpt captured)", 1500, tail_ratio=0.65),
+                _bounded(ci.failure_logs or "(no log excerpt captured)", 3500, tail_ratio=0.65),
                 "",
                 f"Annotations: {_bounded(ci.annotations or 'none', 250)}",
                 f"Changed files: {_bounded(ci.changed_files or 'unknown', 250)}",

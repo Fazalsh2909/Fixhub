@@ -1250,7 +1250,7 @@ def run_task_inline(
                     run_id=task.ci_run_id,
                     job_name=task.ci_job or task.ci_workflow,
                     check_url=task.ci_url,
-                )[:2500]
+                )[:4000]
 
         # --- agent (tool events persisted live so progress is visible
         # immediately and survives a mid-run crash) ---
