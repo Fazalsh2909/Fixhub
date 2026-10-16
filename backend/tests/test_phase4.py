@@ -195,12 +195,17 @@ def test_lease_sweep_ignores_live_lease(db):
 
 
 def test_lease_sweep_fails_ancient_unleased(db):
+    from app.config import settings as _settings
     from app.db.database import utcnow
 
     from app.main import _sweep_stale_running_tasks
 
     t = _task(db, status="RUNNING")
-    t.updated_at = utcnow() - timedelta(seconds=3600)
+    # The sweep fails unleased rows older than JOB_TIMEOUT_S + 600: derive
+    # the age from settings so budget changes cannot stale this test.
+    t.updated_at = utcnow() - timedelta(
+        seconds=int(_settings.JOB_TIMEOUT_S) + 600 + 60
+    )
     db.commit()
     _sweep_stale_running_tasks()
     db.expire_all()

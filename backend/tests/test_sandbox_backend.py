@@ -1103,6 +1103,12 @@ def test_owner_reclaimable_db_unknown_requires_runtime_cap(monkeypatch):
 
     from app.sandbox import firecracker as _fc
 
+    cap = _fc.vm_max_runtime_s()
+    stale = 900
+    # Past stale but below the runtime cap -> not reclaimable.
+    below_cap = max(stale + 100, cap - 500) if cap > stale + 600 else stale + 100
+    # Past the runtime cap -> reclaimable (dead pid, DB unknown).
+    past_cap = max(stale, cap) + 500
     owner = {
         "task_id": 424260,
         "host": _fc._local_host(),
@@ -1110,21 +1116,22 @@ def test_owner_reclaimable_db_unknown_requires_runtime_cap(monkeypatch):
         "pid": _dead_pid(),
         "pid_start": "",
         "user": "",
-        "heartbeat": _time.time() - 1000,  # past stale(900), below cap(1500)
+        "heartbeat": _time.time() - below_cap,
     }
     monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: None)
-    assert _fc._owner_reclaimable(dict(owner), stale_s=900) is False
-    owner["heartbeat"] = _time.time() - 2000  # past the runtime cap
-    assert _fc._owner_reclaimable(dict(owner), stale_s=900) is True
+    if below_cap < max(stale, cap):
+        assert _fc._owner_reclaimable(dict(owner), stale_s=stale) is False
+    owner["heartbeat"] = _time.time() - past_cap  # past the runtime cap
+    assert _fc._owner_reclaimable(dict(owner), stale_s=stale) is True
     # Live lease always protects, even with dead pid + ancient heartbeat.
     monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: True)
-    assert _fc._owner_reclaimable(dict(owner), stale_s=900) is False
+    assert _fc._owner_reclaimable(dict(owner), stale_s=stale) is False
     # Definite not-running lease + dead pid + stale heartbeat reaps.
     monkeypatch.setattr(_fc, "_db_lease_live", lambda tid: False)
-    assert _fc._owner_reclaimable(dict(owner), stale_s=900) is True
+    assert _fc._owner_reclaimable(dict(owner), stale_s=stale) is True
     # Clock skew (future heartbeat) never reaps.
     owner["heartbeat"] = _time.time() + 60
-    assert _fc._owner_reclaimable(dict(owner), stale_s=900) is False
+    assert _fc._owner_reclaimable(dict(owner), stale_s=stale) is False
 
 
 def test_cgroup_verify_reads_back_limits(tmp_path, monkeypatch):
