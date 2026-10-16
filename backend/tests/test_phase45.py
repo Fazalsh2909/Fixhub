@@ -5,7 +5,7 @@ lease heartbeat/fence, timeout coherence, fallback event. Deterministic."""
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db.models import LoginAttempt, Memory, Repository, Task
+from app.db.models import LoginAttempt, Repository, Task
 from app.main import app
 from tests.conftest import make_user, session_cookies
 
@@ -229,16 +229,6 @@ def test_legacy_null_rows_invisible(db):
             issue_title="t",
             issue_body="b",
             status="RUNNING",
-            owner_id=None,
-        )
-    )
-    db.add(
-        Memory(
-            repository="acme/legacy",
-            path="__overview__",
-            summary="old",
-            commit_sha="",
-            last_analyzed_rev="",
             owner_id=None,
         )
     )

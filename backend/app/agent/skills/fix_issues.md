@@ -16,7 +16,6 @@ UNDERSTAND → INVESTIGATE → REPRODUCE → DIAGNOSE → IMPLEMENT → VALIDATE
 - Inspect repository structure (`list_directory`) before guessing file paths.
 - Locate relevant files with `search_code` / `read_file`; trace the execution path.
 - Inspect related tests, configuration, and dependencies when relevant.
-- Use repository memory as background only — verify every memory-mentioned file with `read_file` before relying on it.
 
 ## 3. Required evidence (before any write/edit)
 - At least 2 investigation calls including 1 `read_file`, spanning 2+

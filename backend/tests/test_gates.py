@@ -156,7 +156,6 @@ def _seams(monkeypatch, svc, summary="did stuff", loop_result=None, meaningful=T
         monkeypatch.setattr(svc._pub, "has_meaningful_changes", lambda path: True)
     monkeypatch.setattr(svc._pub, "changed_files", lambda path: ["a.py"])
     monkeypatch.setattr(_ws, "head_sha", lambda path: "abc123")
-    monkeypatch.setattr(svc, "_update_memory", lambda *a, **k: None)
     monkeypatch.setattr(svc, "_cleanup", lambda task_id: None)
     res = loop_result or LoopResult(True, summary, 2, 1, [])
     monkeypatch.setattr(svc._loop, "run_agent", lambda **k: res)

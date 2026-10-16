@@ -76,7 +76,6 @@ export const api = {
     F(`/api/github/file?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}&ref=${encodeURIComponent(ref)}`).then(j),
   publishedDiff: (id: number) => F(`/api/tasks/${id}/published-diff`).then(j),
   tasks: () => F("/api/tasks").then(j),
-  task: (id: number) => F(`/api/tasks/${id}`).then(j),
   runTask: (id: number, sync = false) => F(`/api/tasks/${id}/run${sync ? "?sync=true" : ""}`, { method: "POST" }).then(j),
   cancelTask: (id: number) => F(`/api/tasks/${id}/cancel`, { method: "POST" }).then(j),
   fromIssue: (repository: string, issue_number: number) =>

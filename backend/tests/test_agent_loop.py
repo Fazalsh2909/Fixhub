@@ -132,7 +132,6 @@ def test_ci_task_context_bounds_logs_and_keeps_workflow_visible():
             annotations="annotation " * 500,
             changed_files="src/failing_module.py",
         ),
-        memory_overview="old memory " * 1000,
         skill="fix-ci-cd",
         skill_instructions="CI discipline " * 500,
     )

@@ -40,8 +40,6 @@ WORKFLOW:
   setup; install a repo-pinned version only when CI parity demands it, then
   move on. FixHub's validation gates re-check your diff with pinned tools
   afterward, so a missing local tool is never a reason to stall.
-- Use persistent engineering memory when available. Memory is prior knowledge,
-  not truth: verify the files it mentions before relying on them.
 - Do not modify unrelated files.
 - Validate with the narrowest relevant command for your change. FixHub runs
   configured local publish gates before creating the PR, so do not repeat the

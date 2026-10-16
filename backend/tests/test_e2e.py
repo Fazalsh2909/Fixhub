@@ -5,13 +5,12 @@ Proves Milestone 1 locally without GitHub/LLM keys:
 - Task row created as the webhook would
 - LLM stubbed to behave like a real agent: read -> edit -> run tests -> finish
 - run_task_inline clones, runs the loop, commits, pushes branch fixhub-fixes/*
-- assert branch exists on remote, commit recorded, memory written from real changes
+- assert branch exists on remote, commit recorded, agent events persisted
 """
-import json
 import subprocess
 
 from app.agent import loop as _loop
-from app.db.models import Memory, Task, TaskEvent
+from app.db.models import Task, TaskEvent
 from app.llm.client import AssistantMessage, ToolCall
 from app.tasks import service as _svc
 
@@ -86,9 +85,3 @@ def test_e2e_issue_to_push(db, tmp_path, monkeypatch):
     types = [e.type for e in db.query(TaskEvent).filter(TaskEvent.task_id == task.id).all()]
     for need in ("TASK_CREATED" if False else "AGENT_STARTED", "TOOL_CALL", "FILE_CHANGED", "COMMAND_RUN", "AGENT_FINISHED", "COMMIT_CREATED"):
         assert need in types, types
-
-    # Memory came from the REAL change, not faked?
-    mems = db.query(Memory).filter(Memory.repository == "acme/calc").all()
-    assert mems, "memory must be written after a real task"
-    blob = json.dumps([m.summary for m in mems])
-    assert "calc" in blob.lower() or "add" in blob.lower()

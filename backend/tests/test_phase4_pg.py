@@ -145,7 +145,7 @@ def pg_url():
 
 
 TABLES = (
-    "task_events memories pull_requests llm_usage llm_credentials "
+    "task_events pull_requests llm_usage llm_credentials "
     "github_connections user_sessions tasks repositories users "
     "webhook_deliveries"
 ).split()
@@ -830,9 +830,10 @@ def test_pg_fresh_migration_to_head_without_create_all(pg_url, monkeypatch):
         tables = set(inspect(eng).get_table_names())
     finally:
         eng.dispose()
-    for required in ("users", "tasks", "repositories", "task_events", "memories",
+    for required in ("users", "tasks", "repositories", "task_events",
                      "pull_requests", "webhook_deliveries", "alembic_version"):
         assert required in tables, tables
+    assert "memories" not in tables, tables
 
 
 def test_pg_legacy_upgrade_preserves_data_and_ownerless_policy(pg_url):
@@ -866,11 +867,8 @@ def test_pg_legacy_upgrade_preserves_data_and_ownerless_policy(pg_url):
                 "created_at, updated_at) "
                 "VALUES ('legacy/repo', :rid, 'COMPLETED', 'legacy work', now(), now())"
             ), {"rid": repo_id})
-            conn.execute(text(
-                "INSERT INTO memories (repository, path, summary, updated_at) "
-                "VALUES ('legacy/repo', 'a.py', 'legacy memory', now())"
-            ))
-        # Upgrade to head (0002 adds owner_id + users; 0004 claims; 0005 misc).
+        # Upgrade to head (0002 adds owner_id + users; 0004 claims; 0005 misc;
+        # 0006 drops the memories table).
         _settings.DATABASE_URL = url
         try:
             assert _migrate.upgrade_head(strict=True) is True
@@ -885,10 +883,9 @@ def test_pg_legacy_upgrade_preserves_data_and_ownerless_policy(pg_url):
                 "SELECT issue_title FROM tasks WHERE repository='legacy/repo'"
             )).scalar()
             assert title == "legacy work"
-            summary = conn.execute(text(
-                "SELECT summary FROM memories WHERE repository='legacy/repo'"
-            )).scalar()
-            assert summary == "legacy memory"
+            # 0006 drops the memories table: stale prior-run summaries are gone
+            # by design, while task data is preserved.
+            assert "memories" not in inspect(eng).get_table_names()
             # Legacy rows are still ownerless ...
             assert conn.execute(text(
                 "SELECT owner_id FROM tasks WHERE repository='legacy/repo'"

@@ -180,53 +180,9 @@ def test_i_service_loads_ci_context_event(db, tmp_path):
         "failure_logs": "F401 here", "run_id": "9"})))
     db.commit()
     ctx = _svc._build_task_context(db, t, path=str(tmp_path), default_branch="main",
-                                   ci_info="legacy", overview="")
+                                   ci_info="legacy")
     assert ctx.ci.job == "backend" and ctx.ci.run_id == "9"
     assert "F401 here" in ctx.ci.failure_logs
-
-
-def test_i_fresh_failure_outranks_stale_memory():
-    from app.agent import context as _ctx
-
-    ctx = _ctx.TaskContext(
-        repository="o/r", trigger_type="ci",
-        ci=_ctx.CIContext(job="backend", failure_logs="FAILED tests/test_probe.py"),
-        memory_overview="Old saga: validation settings were broken, since fixed.",
-    )
-    msg = _ctx.build_task_message(ctx)
-    assert "NEWER than everything in memory" in msg
-    assert "Start with the files named" in msg
-    # Failure block precedes memory background.
-    assert msg.index("CI FAILURE") < msg.index("Repository memory")
-
-
-def test_i_relevant_memory_scoped_to_failure(db):
-    from app.db.models import Task
-    from app.memory.store import save_memory
-    from app.tasks import service as _svc
-
-    save_memory(db, repository="o/r", path="apps/api/tests/test_old.py",
-                summary="Old saga about validation settings, long since fixed.", rev="old")
-    save_memory(db, repository="o/r", path="apps/api/tests/test_probe.py",
-                summary="Probe test for the login endpoint.", rev="new")
-    t = Task(repository="o/r", trigger_type="ci", ci_sha="abc", ci_job="backend",
-             ci_excerpt="FAILED apps/api/tests/test_probe.py", status="RUNNING")
-    db.add(t)
-    db.commit()
-    out = _svc._relevant_memory(db, repository="o/r", task=t)
-    assert "test_probe.py" in out
-    assert "test_old.py" not in out
-
-
-def test_i_relevant_memory_empty_when_no_match(db):
-    from app.db.models import Task
-    from app.tasks import service as _svc
-
-    t = Task(repository="o/r", trigger_type="ci", ci_sha="abc", ci_job="backend",
-             ci_excerpt="FAILED apps/api/tests/test_probe.py", status="RUNNING")
-    db.add(t)
-    db.commit()
-    assert _svc._relevant_memory(db, repository="o/r", task=t) == ""
 
 
 def test_prompt_states_env_setup_discipline():

@@ -46,7 +46,7 @@ def changed_files(path: str) -> list[str]:
     for ln in proc.stdout.splitlines():
         name = ln[3:].strip().strip('"')
         # Same exclusion as has_meaningful_changes: interpreter bytecode from
-        # in-sandbox test runs must never leak into diffs, memory, or PRs.
+        # in-sandbox test runs must never leak into diffs or PRs.
         if name and "__pycache__" not in name:
             files.append(name)
     return files[:200]

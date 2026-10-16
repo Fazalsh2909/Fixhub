@@ -4,7 +4,7 @@ Harness: `backend/tests/benchmark/` — `README.md`, `runner.py`, `scenarios.py`
 
 ## What it measures
 
-- No network, no GitHub, no paid APIs. Fixtures live in throwaway tmp dirs; the LLM is a deterministic script. The real `TaskContext`, agent loop, tools, sandbox, workspace, validation gates, memory, and task lifecycle execute — nothing is bypassed (`benchmark/README.md`).
+- No network, no GitHub, no paid APIs. Fixtures live in throwaway tmp dirs; the LLM is a deterministic script. The real `TaskContext`, agent loop, tools, sandbox, workspace, validation gates, and task lifecycle execute — nothing is bypassed (`benchmark/README.md`).
 - `lifecycle` scenarios (01–10, S2, J-repair) run full `run_task_inline`. Success requires the real fix, passing validation on a fresh clone of the pushed branch, in-scope diff, normal termination, and no unsafe behavior. PR creation alone never counts.
 - `loop` scenarios (S1, S3, R/F/K probes) call `run_agent` directly for timeout, security, path discipline, duplicate protection, and cancellation contracts.
 - Reliability probes (A–O in `scenarios.py`) assert relative paths, absolute/traversal rejection, fixed cwd, structured exit codes, duplicate handling, strategy change, CI-first context, workflow-aware validation, bounded repair, cancellation, isolated workspaces/branches, and one PR per task.

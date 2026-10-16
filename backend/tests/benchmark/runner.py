@@ -6,7 +6,7 @@ Usage (from backend/):
 No network, no GitHub, no paid APIs: fixtures live in tmp dirs, the LLM is a
 deterministic script, GitHub API is mocked only where a scenario demands the
 token path (J-repair). Real TaskContext, agent loop, tools, sandbox,
-workspace, gates, memory, and task lifecycle execute throughout.
+workspace, gates, and task lifecycle execute throughout.
 
 Results: results/latest.json (+ run-<ts>.json); --write-baseline also writes
 baseline.json + baseline.md (committed).

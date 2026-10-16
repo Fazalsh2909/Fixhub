@@ -1,4 +1,4 @@
-"""Core tables: repositories, tasks, task_events, memories, pull_requests.
+"""Core tables: repositories, tasks, task_events, pull_requests.
 
 Plus webhook_deliveries for GitHub duplicate-delivery prevention.
 Designed for SQLite dev and PostgreSQL prod (no PG-only DDL here).
@@ -122,26 +122,6 @@ class TaskEvent(Base):
     )
 
     __table_args__ = (Index("ix_task_events_task_poll", "task_id", "id"),)
-
-
-class Memory(Base):
-    __tablename__ = "memories"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    repository: Mapped[str] = mapped_column(String(255), index=True)
-    commit_sha: Mapped[str] = mapped_column(String(128), default="")
-    path: Mapped[str] = mapped_column(
-        String(512), default=""
-    )  # file/dir scope or "__overview__"
-    summary: Mapped[str] = mapped_column(Text, default="")
-    last_analyzed_rev: Mapped[str] = mapped_column(String(128), default="")
-    # Phase 2: owning FixHub user (copied from the task's owner at write time).
-    owner_id: Mapped[int | None] = mapped_column(
-        ForeignKey("users.id"), nullable=True, index=True
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
-    )
 
 
 class PullRequest(Base):

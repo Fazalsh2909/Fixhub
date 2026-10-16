@@ -86,9 +86,6 @@ _SCHEMA_PATCHES = {
     "repositories": [
         ("owner_id", "INTEGER REFERENCES users(id)"),
     ],
-    "memories": [
-        ("owner_id", "INTEGER REFERENCES users(id)"),
-    ],
 }
 
 

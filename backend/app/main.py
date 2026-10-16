@@ -772,7 +772,7 @@ def list_tasks(
 def task_detail(
     task_id: int, user: User = Depends(get_current_user), db: Session = Depends(_db)
 ) -> dict:
-    from app.db.models import Memory, TaskEvent
+    from app.db.models import TaskEvent
 
     t = require_owned_task(task_id, user, db)
     events = (
@@ -781,17 +781,10 @@ def task_detail(
         .order_by(TaskEvent.id.asc())
         .all()
     )
-    mems = (
-        db.query(Memory)
-        .filter(Memory.repository == t.repository, Memory.owner_id == user.id)
-        .order_by(Memory.id.asc())
-        .all()
-    )
     out = _task_summary(t)
     out["events"] = [
         {"type": e.type, "data": e.data_json, "at": str(e.created_at)} for e in events
     ]
-    out["memory"] = [{"path": m.path, "summary": m.summary} for m in mems]
     return out
 
 

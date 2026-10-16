@@ -45,7 +45,6 @@ npm run build # tsc + vite build -> dist/ (served by nginx in Docker)
   `NEEDS_REVIEW` keeps the workspace for IDE review; `approve` cleans up.
 - IDE APIs (`backend/app/api/ide.py`) share the agent's path/sensitive-file guards.
   Terminal runs through the same sandbox denylist + env scrub.
-- Memory is prior knowledge, not truth: verify files before trusting it.
 - Never log secrets, tokens, or clone URLs.
 - Keep PRs small and add/extend a test under `backend/tests/` for behavior changes.
 - Run before opening a PR: `python -m pytest tests/ -q` from `backend/`, plus `python tests/benchmark/runner.py` when the agent loop, tools, sandbox, gates, or task lifecycle changed. Frontend changes need `npm run build` (`tsc --noEmit` + `vite build`) clean from `frontend/`.

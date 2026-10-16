@@ -47,7 +47,6 @@ class TaskContext:
     branch: str = ""  # standing branch (fixhub-fixes), reserved before publish
     base_commit: str = ""
     default_branch: str = "main"
-    memory_overview: str = ""
     # Phase 1 skill routing (context + event persistence, no DB migration).
     # Resolved deterministically from trigger_type: issue -> fix-issues,
     # ci -> fix-ci-cd. Stored here + SKILL_SELECTED event for auditability.
@@ -68,24 +67,17 @@ def _bounded(text: str, limit: int, *, tail_ratio: float = 0.5) -> str:
 
 
 def build_task_message(ctx: TaskContext) -> str:
-    """First user message: bounded evidence first, memory last."""
+    """First user message: bounded trigger evidence (no prior state)."""
     head = (
         f"Repository: {ctx.repository} (default branch: {ctx.default_branch})\n"
         f"You are operating INSIDE this repository at its root.\n"
-    )
-    mem = (
-        f"\nRepository memory (background only — it may describe issues that "
-        f"are already fixed; the CI failure above is NEWER than everything in "
-        f"memory and is the current ground truth):\n"
-        f"{_bounded(ctx.memory_overview or '(no memory yet)', 500)}\n"
     )
     if ctx.trigger_type == "ci":
         ci = ctx.ci
         block = "\n".join(
             line for line in [
                 "CI FAILURE — determine the root cause of this failure. Do not broadly explore.",
-                "Start with the files named under Changed files / in the failure output, "
-                "not with files mentioned in memory.",
+                "Start with the files named under Changed files / in the failure output.",
                 f"Provider: {ci.provider}",
                 f"Workflow: {ci.workflow_name}",
                 f"Workflow file: {ci.workflow_file or '(read it from the repo first)'}",
@@ -108,14 +100,14 @@ def build_task_message(ctx: TaskContext) -> str:
             f"\nWorkflow content:\n{_bounded(ci.workflow_content, 1000, tail_ratio=0.5)}\n"
             if ci.workflow_content else ""
         )
-        base = f"{head}\n{wf}\n{block}\n{mem}"
+        base = f"{head}\n{wf}\n{block}\n"
         if ctx.skill_instructions:
             base += f"\nActive skill ({ctx.skill or 'fix-ci-cd'}):\n{_bounded(ctx.skill_instructions, 1000)}\n"
         return base
     issue = ctx.issue
     base = (
         f"{head}\nIssue #{issue.number}: {issue.title}\n"
-        f"Issue body:\n{_bounded(issue.body, 3000, tail_ratio=0.35)}\n\nURL: {issue.url}\n{mem}"
+        f"Issue body:\n{_bounded(issue.body, 3000, tail_ratio=0.35)}\n\nURL: {issue.url}\n"
     )
     if ctx.skill_instructions:
         base += f"\nActive skill ({ctx.skill or 'fix-issues'}):\n{_bounded(ctx.skill_instructions, 1800)}\n"

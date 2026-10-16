@@ -2,12 +2,12 @@
 
 Pattern: user A owns repo A + task A; user B owns repo B + task B.
 A->A ok, A->B 404 (no leak), B->B ok. Same shape for tasks, task events,
-memories, pull requests, terminal/files, and client-supplied ID tampering.
+pull requests, terminal/files, and client-supplied ID tampering.
 """
 
 from fastapi.testclient import TestClient
 
-from app.db.models import Memory, PullRequest, Repository, Task, TaskEvent
+from app.db.models import PullRequest, Repository, Task, TaskEvent
 from app.main import app
 from tests.conftest import make_user, session_cookies
 
@@ -66,24 +66,14 @@ def test_cross_user_task_events_forbidden(db):
     assert c.get(f"/api/tasks/{ta.id}/verification", cookies=cb).status_code == 404
 
 
-def test_cross_user_memories_not_leaked(db):
+def test_task_detail_has_no_memory_surface(db):
     _, ca, _, ta = _owned(db, "a4@example.com", "acme/a4")
     _, cb, _, _ = _owned(db, "b4@example.com", "acme/b4")
-    db.add(
-        Memory(
-            repository="acme/a4",
-            path="__overview__",
-            summary="A secret",
-            commit_sha="",
-            last_analyzed_rev="",
-            owner_id=ta.owner_id,
-        )
-    )
-    db.commit()
     c = TestClient(app)
     body = c.get(f"/api/tasks/{ta.id}", cookies=ca).json()
-    assert any(m["summary"] == "A secret" for m in body["memory"])
-    # B cannot even open A's task, so A's memory is unreachable.
+    assert "memory" not in body
+    assert "events" in body
+    # B cannot even open A's task, so the detail endpoint stays unreachable.
     assert c.get(f"/api/tasks/{ta.id}", cookies=cb).status_code == 404
 
 

@@ -19,7 +19,6 @@ flowchart TB
   GT --> PB[backend/app/github/publisher.py<br/>FixHub owns git]
   PB -->|commit/push + create-or-update PR| GH2[GitHub PR]
   GH2 --> CW[backend/app/tasks/ciwatch.py<br/>60s tick + POST /api/cron/ci-watch<br/>AWAITING_CI to COMPLETED / repair max 3]
-  SV --> MM[backend/app/memory/store.py<br/>LIKE search, no embeddings]
   SV --> IDE[backend/app/api/ide.py + backend/app/main.py<br/>task-scoped IDE APIs]
   IDE --> FE[frontend/src/App.tsx + components<br/>React IDE]
 ```
@@ -47,18 +46,17 @@ flowchart TB
 - One attempt per task, no hidden retries. Retry explicitly via `POST /api/tasks/{id}/run`.
 - Pre-agent stale check (CI only): if a green FixHub PR already touches the failing files, the task completes as `SUPERSEDED` without spending a run.
 - Workspace: `clone_repo(source, task_id, branch?)` wipes `WORKSPACE_ROOT/task-{id}` first, clones, then for CI tasks checks out the exact failing SHA (`CI_CHECKOUT`, fallback to default branch when unreachable).
-- Memory: generic overview plus CI-scoped retrieval (`_relevant_memory`, top 3 rows matching job/workflow/paths). CI failure text outranks stale memory.
 - Agent: `run_agent(...)` with live `TOOL_CALL`/`FILE_CHANGED`/`COMMAND_RUN` persistence, cancel polling (`cancel_requested`), crash handling (LLM-blocked → `BLOCKED`; crash with real changes → `NEEDS_REVIEW` with workspace kept; crash without changes → `FAILED`).
 - No-change finish → `COMPLETED` (`no_changes: True`).
 - Stale-guard before publish: green upstream FixHub PR touching the same files wins (`SUPERSEDED`).
 - Gates: `detect_gates` → `VALIDATION_STARTED` → `run_gates` → up to 2 follow-up agent rounds on `VALIDATION_FAILED` → `VALIDATION_PASSED` or `NEEDS_REVIEW` (`gate_failed`).
 - Review gate: when `AUTO_PUBLISH=0`, stop at `NEEDS_REVIEW` (workspace kept); publish later via `approve_task()` / `POST /api/tasks/{id}/approve`.
-- Publish: `_publish_task` enforces the branch-collision guard, resolves installation token, calls `publisher.publish` (or local commit+push when no token), records `COMMIT_CREATED`/`PR_CREATED`/`AWAITING_CI`, writes memory from the real diff + summary, then cleans the workspace unless `WORKSPACE_KEEP=1`.
+- Publish: `_publish_task` enforces the branch-collision guard, resolves installation token, calls `publisher.publish` (or local commit+push when no token), records `COMMIT_CREATED`/`PR_CREATED`/`AWAITING_CI`, then cleans the workspace unless `WORKSPACE_KEEP=1`.
 
 ### Agent loop (`backend/app/agent/loop.py`, `tools.py`, `paths.py`, `prompt.py`, `context.py`)
 
-- `TaskContext` is built once per run (repository, trigger, issue/CI structs, branch, base commit, memory overview). The LLM never constructs workspace paths.
-- System prompt (`prompt.py`) enforces repository-relative paths, per-call `cwd`, structured command results, failure discipline (never repeat an identical failed call), CI-first reading order, pinned toolchain, memory-as-background-only, and no self-managed git.
+- `TaskContext` is built once per run (repository, trigger, issue/CI structs, branch, base commit, skill). The LLM never constructs workspace paths.
+- System prompt (`prompt.py`) enforces repository-relative paths, per-call `cwd`, structured command results, failure discipline (never repeat an identical failed call), CI-first reading order, pinned toolchain, and no self-managed git.
 - Tools: 8 total, all jailed. `resolve()` rejects empty, NUL, absolute, `~`, drive-letter, and `..`-escaping paths. `is_sensitive()` blocks `.env`, `.git/*`, `*.pem`, `*.key`, secrets/tokens/credentials for read/write/search.
 - `run_command(workspace, command, cwd)` runs with a fixed repo-relative cwd; results render as `exit_code` (authoritative, `null` only on timeout), `cwd`, `duration_ms`, `timed_out`, stdout/stderr sections.
 - Loop policy: identical-success reuse (cached result), identical-failure block after 2 repeats with a strategy-change instruction, rewrite cap (8 per path), premature-done nudge (max 2), sliding window (`LLM_HISTORY_GROUPS=12`) with condensed summary of dropped spans.
@@ -86,11 +84,6 @@ flowchart TB
 - `_pytest_gate` runs each command with a 300s sandbox timeout; missing-dependency output (`ModuleNotFoundError`, `No module named`, `ImportError` with no test summary) votes skip, not failure.
 - `_ruff_gate` installs the pinned version (`python -m pip install -q ruff==x.y.z`) then runs `python -m ruff check` and `python -m ruff format --check` as single-purpose commands (no shell chaining, `python -m` for interpreter consistency).
 
-### Memory (`backend/app/memory/store.py`)
-
-- Tables: `memories(repository, path, summary, commit_sha, last_analyzed_rev)`. Special path `__overview__` holds the repo overview.
-- `search_memory` is case-insensitive token overlap over `path + summary` (tokens longer than 2 chars, max 8). No embeddings; the schema allows adding an embedding column later without touching the loop.
-
 ### Workspaces (`backend/app/repo/workspace.py`)
 
 - `WORKSPACE_ROOT/task-{id}` per task. `clone_repo` removes any existing tree first (Windows-robust retry), clones quietly, optionally checks out a branch. `checkout_ref` supports detached-SHA checkout for CI tasks. `head_sha` records the base/published commit. `destroy_workspace` is best-effort and skipped when `WORKSPACE_KEEP=1`.
@@ -104,11 +97,11 @@ flowchart TB
 
 - `main.py` mounts `github/webhook.py` + `api/ide.py`, creates tables on startup, sweeps stale `RUNNING` tasks (older than `JOB_TIMEOUT_S + 600s`) to `FAILED`, and starts the CI-watcher thread.
 - Repository routes: `GET /api/repositories`, `POST /api/repositories/connect`, `GET /api/github/installations`, `GET /api/github/repos`, `GET /api/github/issues?repo=`, `POST /api/tasks/from-issue`.
-- Task routes: `GET /api/tasks`, `GET /api/tasks/{id}` (summary + events + memory), `POST /api/tasks/{id}/run?sync=`, `POST /api/tasks/{id}/cleanup`, `POST /api/tasks/{id}/cancel`, `POST /api/cron/ci-watch`.
+- Task routes: `GET /api/tasks`, `GET /api/tasks/{id}` (summary + events), `POST /api/tasks/{id}/run?sync=`, `POST /api/tasks/{id}/cleanup`, `POST /api/tasks/{id}/cancel`, `POST /api/cron/ci-watch`.
 - IDE routes (`api/ide.py`, all task-workspace-scoped): files list, file read (offset/limit, 200KB cap), file save, diff (status + unified), events poll (`?after=`), verification view, terminal (sandboxed), chat append, chat SSE stream, approve-to-publish. Sensitive files return 403; expired workspaces return 410.
 - Frontend (`frontend/src/`): `App.tsx` shell (left tasks/explorer/repos, center code/diff + terminal, right review/trace/chat), `api.ts` client, `types.ts` contracts, `components/DirTree.tsx`, `EditorTabs.tsx` (Monaco), `TerminalPanel.tsx` (xterm), `TraceView.tsx` (SSE + poll), `ReviewPanel.tsx`, `DiffView.tsx`, `ChatPanel.tsx`, `styles.css`. Build: `tsc --noEmit` + `vite build` → `dist/` served by nginx (`frontend/nginx.conf` proxies `/api/`, `/webhooks/`, `/health` to `backend:8000`).
 
 ### Persistence (`backend/app/db/`)
 
-- `models.py`: `repositories`, `tasks` (issue + CI fields, branch/commit/PR, error, `ci_attempt_count`, `last_ci_failure`, `cancel_requested`), `task_events` (operational tool/git/validation/CI events; no chain-of-thought stored), `memories`, `pull_requests`, `webhook_deliveries`.
+- `models.py`: `repositories`, `tasks` (issue + CI fields, branch/commit/PR, error, `ci_attempt_count`, `last_ci_failure`, `cancel_requested`), `task_events` (operational tool/git/validation/CI events; no chain-of-thought stored), `pull_requests`, `webhook_deliveries`.
 - SQLite dev (`sqlite:///./fixhub.db`, Docker shared path `sqlite:////srv/backend/data/fixhub.db`), Postgres prod string supported. No PG-only DDL.

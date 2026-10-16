@@ -78,7 +78,7 @@ All entries describe behavior in the current implementation. Follow the check or
 
 - Check the trace first: `TOOL_CALL` args show the exact repo-relative path attempted. Absolute paths, `/tmp` prefixes, workspace-root prefixes, and `..` escapes are rejected by `backend/app/agent/paths.py` — use the repository-relative path (e.g. `apps/api/app/core/config.py`) and per-call `cwd` (e.g. `apps/api`).
 - Sensitive paths (`.env`, `.git/*`, `*.pem`, `*.key`, secrets/tokens/credentials) are blocked for reads/writes/search by design.
-- Memory is background only and may describe already-fixed files; the CI failure/issue text is the ground truth. Verify files before trusting memory.
+- The CI failure/issue text is the ground truth: verify the implicated files with `read_file` before changing them.
 
 ## Frontend dev proxy issues
 

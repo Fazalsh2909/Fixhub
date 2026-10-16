@@ -33,7 +33,7 @@ Sources: `backend/app/main.py` (task/repo routes), `backend/app/api/ide.py` (IDE
 ## Tasks
 
 - `GET /api/tasks` → up to 200 task summaries `{id, repository, trigger_type, issue_number, issue_title, status, branch, commit_sha, pr_number, pr_url, error, created_at, updated_at}`.
-- `GET /api/tasks/{id}` → summary plus `events: [{type, data, at}]` (operational trace, no chain-of-thought) and `memory: [{path, summary}]` for the task repository.
+- `GET /api/tasks/{id}` → summary plus `events: [{type, data, at}]` (operational trace, no chain-of-thought).
 - `POST /api/tasks/{id}/run?sync=false` → default enqueues to Redis (`{task_id, queued: True, job_id}`); `?sync=true` runs inline (`{task_id, result, sync: True}`). When Redis is unavailable, falls back to inline and returns `{queue_fallback}`. 404 when the task is missing.
 - `POST /api/tasks/{id}/cleanup` → `{task_id, removed}` (manual workspace wipe).
 - `POST /api/tasks/{id}/cancel` → `{task_id, status, cancel_requested? | already_terminal?}`. Sets a flag the agent loop polls every iteration and before every tool call.

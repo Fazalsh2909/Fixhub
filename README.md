@@ -14,14 +14,13 @@ This README documents the **current implementation as frozen**. No deployed demo
 
 - Listens for `issues.opened/reopened` and failed `workflow_run` / `check_run` events on `POST /webhooks/github` (`backend/app/github/webhook.py`). Verifies `sha256=` HMAC, dedupes by delivery ID, creates a `Task` with status `RUNNING`.
 - Enqueues the run on RQ/Redis (`backend/app/tasks/queue.py`). When `AUTO_RUN_ON_WEBHOOK=0`, it only creates the task; run it via `POST /api/tasks/{id}/run`. `?sync=true` runs inline for tests and local dev without Redis.
-- Runs one attempt per task with no hidden retries (`backend/app/tasks/service.py:run_task_inline`). Fresh clone to `WORKSPACE_ROOT/task-{id}` → repository memory overview → agent loop → local gates → review → FixHub-owned git publish → PR.
+- Runs one attempt per task with no hidden retries (`backend/app/tasks/service.py:run_task_inline`). Fresh clone to `WORKSPACE_ROOT/task-{id}` → skill-selected agent loop → local gates → review → FixHub-owned git publish → PR.
 - The agent loop (`backend/app/agent/loop.py`) is bounded: 40 iterations, 900s runtime, 8 rewrites per path, duplicate/failure policy per tool call, user-cancel polling. Tools (8 total, `backend/app/agent/tools.py`): `list_directory`, `read_file`, `search_code`, `write_file`, `edit_file`, `run_command`, `git_status`, `git_diff`. All paths are repository-relative and jailed (`backend/app/agent/paths.py`); sensitive files (`.env`, `*.pem`, `*.key`, secrets/tokens/credentials) are blocked.
 - Commands run sandboxed (`backend/app/sandbox/sandbox.py`): fixed cwd inside the workspace, wall timeout, output cap, env scrub (`LLM_API_KEY`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`), secret redaction registry, destructive-pattern denylist, process-tree kill on timeout.
 - Local gates before any push (`backend/app/verify/gates.py`): repo-pinned `ruff check` + `ruff format --check` on changed Python files, plus the repo's exact CI test commands (allowlisted to test/lint/typecheck/format only). Up to 2 agent fix rounds; persistent red goes to `NEEDS_REVIEW` instead of a red PR.
 - FixHub owns git (`backend/app/github/publisher.py`): the LLM never branches/commits/pushes. One task = one workspace = one branch = one PR. Branches are deterministic per task: `fixhub-fixes/issue-<n>-task-<id>` and `fixhub-fixes/ci-<shortsha>-task-<id>`. A collision guard fails loudly (`branch_collision`) instead of last-writer-wins. `__pycache__` output is excluded from diffs and commits.
 - Post-publish CI watcher (`backend/app/tasks/ciwatch.py`): published PRs enter `AWAITING_CI`. A 60s in-process tick (plus manual `POST /api/cron/ci-watch`) completes the task on green checks or enqueues a repair round on the same task/branch/PR (max 3, then `FAILED`).
 - Waste guards: duplicate CI deliveries for an already-`RUNNING` repo+sha+job reuse the active task; a pre-agent check and a pre-publish check skip runs when a green FixHub PR already touches the same files (`SUPERSEDED`).
-- Memory (`backend/app/memory/store.py`, `memories` table) is token-overlap `LIKE` search over path+summary (no embeddings). It is injected as background prior knowledge and written only from real diffs plus the agent summary. The prompt instructs the model to verify memory against files.
 - Task statuses observed in code: `RUNNING`, `NEEDS_REVIEW`, `AWAITING_CI`, `CANCELLED`, `COMPLETED`, `FAILED`, `BLOCKED`. `BLOCKED` means missing key, unreachable gateway, or no clone source. `FAILED` means agent crash, limits exceeded, publish failure, or exhausted CI repairs.
 
 ```mermaid
@@ -32,8 +31,7 @@ flowchart LR
   Q -->|enqueued| W[worker: run_task_inline]
   Q -->|redis down| S[sync inline fallback]
   W --> C[fresh clone<br/>WORKSPACE_ROOT/task-id]
-  C --> M[memory overview]
-  M --> A[agent loop<br/>40 iter / 900s<br/>8 tools]
+  C --> A[agent loop<br/>40 iter / 900s<br/>8 tools]
   A --> G[local gates<br/>pinned ruff + pytest<br/>max 2 fix rounds]
   G -->|green| P[FixHub-owned<br/>commit/push/PR]
   G -->|red| R[NEEDS_REVIEW]
@@ -46,7 +44,7 @@ flowchart LR
 
 - **Live GitHub run (observed 2026-09-29):** probe breakage on branch `live-e2e-test` of `Fazalsh2909/nexus-mcp-intelligence` (off-by-one in `apps/api/app/core/pagination.py` + probe test), CI failed (`assert 3 == 4`). FixHub task #20 loaded CI context, checked out the failing SHA, made a one-line ceiling-division fix, ran pytest + pinned ruff 0.8.0 + mypy locally, pushed `fixhub-fixes/ci-ce814b9-task-20`, opened PR #11 (first and only PR for the task), watcher observed green checks → `COMPLETED`. About 20 minutes wall time (dominated by free-tier LLM latency), 12 tool calls, 31 events. Trace: `docs/examples/real-ci-repair-trace.md`. PR: <https://github.com/Fazalsh2909/nexus-mcp-intelligence/pull/11> (public at time of writing). A live repair round on real GitHub was **not** observed; repair is covered by unit/mocked tests only.
 - **Deterministic benchmark:** `backend/tests/benchmark/` (runner + 17 scenarios + committed `results/baseline.json`). Baseline: **17/17 pass, 0 unexpected failures** — 11/11 bug-fix, 3/3 safe-failure, 3/3 reliability probes. Averages: 4.8 steps (median 4), 4.1 tool calls, 2.7s runtime. PR creation alone never counts; success requires the real fix plus passing validation on a fresh clone. See `docs/BENCHMARK.md`.
-- **Test suite:** backend `pytest` suite green (117 passed at last full validation per `docs/FINAL_ENGINEERING_REPORT.md`), no keys needed. Covers e2e (`test_e2e.py`), queue fallback (`test_queue.py`), IDE approve flow (`test_ide.py`), concurrency/branch isolation (`test_concurrency.py`), gates, sandbox/tools, memory, webhook, reliability probes. Frontend: `tsc --noEmit` + `vite build` clean.
+- **Test suite:** backend `pytest` suite green (117 passed at last full validation per `docs/FINAL_ENGINEERING_REPORT.md`), no keys needed. Covers e2e (`test_e2e.py`), queue fallback (`test_queue.py`), IDE approve flow (`test_ide.py`), concurrency/branch isolation (`test_concurrency.py`), gates, sandbox/tools, webhook, reliability probes. Frontend: `tsc --noEmit` + `vite build` clean.
 
 Full limitations are listed in [Known limitations](#known-limitations) below and in `docs/FINAL_ENGINEERING_REPORT.md`.
 

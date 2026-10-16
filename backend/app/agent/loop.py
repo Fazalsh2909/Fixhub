@@ -56,7 +56,6 @@ class AgentState:
     ci_attempt: int = 0
     last_failure: str = ""
     last_successful_action: str = ""
-    memory_context: str = ""
     # Bumps on every successful file-changing call. Duplicate policy keys off
     # it: identical calls are only redundant within the same version, so test
     # reruns after edits are always allowed.
@@ -79,7 +78,6 @@ def run_agent(
     issue_title: str = "",
     issue_body: str = "",
     ci_info: str = "",
-    memory_overview: str = "",
     on_tool=None,
     is_cancelled=None,
     ctx=None,
@@ -116,7 +114,6 @@ def run_agent(
             default_branch=default_branch,
             trigger_type=trigger_type,
             issue=_ctxmod.IssueContext(title=issue_title, body=issue_body),
-            memory_overview=memory_overview,
         )
         if trigger_type == "ci":
             ctx.ci = _ctxmod.CIContext(failure_logs=ci_info)
@@ -152,7 +149,6 @@ def run_agent(
         workspace_root=workspace,
         branch=ctx.branch,
         base_commit=ctx.base_commit,
-        memory_context=ctx.memory_overview,
     )
     messages = [
         {

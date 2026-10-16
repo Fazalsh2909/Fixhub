@@ -1,4 +1,4 @@
-"""Task orchestration: workspace -> memory -> agent -> git -> PR.
+"""Task orchestration: workspace -> agent -> git -> PR.
 
 FixHub owns git. Statuses: RUNNING | COMPLETED | FAILED | BLOCKED.
 No hidden retries: one attempt, explicit POST /api/tasks/{id}/run to retry.
@@ -16,7 +16,6 @@ from app.db.database import SessionLocal
 from app.db.models import PullRequest, Repository, Task, TaskEvent
 from app.github import app_auth as _app_auth
 from app.github import publisher as _pub
-from app.memory import store as _mem
 from app.repo import workspace as _ws
 
 
@@ -213,7 +212,7 @@ def _likely_paths(text: str) -> list[str]:
 
 
 def _build_task_context(
-    db, task: Task, *, path: str, default_branch: str, ci_info: str, overview: str
+    db, task: Task, *, path: str, default_branch: str, ci_info: str
 ):
     """Authoritative TaskContext, established once per run.
 
@@ -287,46 +286,9 @@ def _build_task_context(
         branch=task.branch or "",
         base_commit=_ws.head_sha(path),
         default_branch=default_branch,
-        memory_overview=overview,
         skill=skill.name,
         skill_instructions=skill_instructions,
     )
-
-
-def _relevant_memory(db, *, repository: str, task: Task) -> str:
-    """Memory rows matching the failing area (paths/job/workflow), top 3.
-
-    Returns "" when nothing matches. Never raises. Scoped retrieval keeps a
-    stale generic overview from steering the agent toward already-fixed files.
-    """
-    try:
-        query = " ".join(
-            part
-            for part in [
-                task.ci_job or "",
-                task.ci_workflow or "",
-                " ".join(
-                    _likely_paths(
-                        f"{task.ci_excerpt}\n{task.ci_job}\n{task.ci_workflow}"
-                    )
-                ),
-            ]
-            if part
-        )
-        if not query.strip():
-            return ""
-        rows = _mem.search_memory(
-            db, repository=repository, query=query, limit=3, owner_id=task.owner_id
-        )
-        if not rows:
-            return ""
-        lines = [
-            f"Memory relevant to this failure ({r.path}): {r.summary[:600]}"
-            for r in rows
-        ]
-        return "\n\n".join(lines)[:2000]
-    except Exception:
-        return ""
 
 
 def _last_summary(db, task_id: int) -> str:
@@ -478,7 +440,6 @@ def _publish_task(
                 "COMMIT_CREATED",
                 {"branch": branch, "sha": sha, "via": "approve"},
             )
-            _update_memory(db, task, path, summary, changed=changed)
             db.commit()
             _cleanup(task.id)
             return {
@@ -559,7 +520,6 @@ def _publish_task(
                 commit_sha=pub["commit_sha"],
             )
         )
-    _update_memory(db, task, path, summary, changed=changed)
     db.commit()
     _cleanup(task.id)
     return {"status": "AWAITING_CI", "branch": pub["branch"], "pr": pub["pr_url"]}
@@ -1271,22 +1231,7 @@ def run_task_inline(
             _cleanup(task.id)
             return {"status": "BLOCKED", "error": task.error}
 
-        # --- memory (prior knowledge) ---
-        overview = _mem.get_repository_overview(
-            db, repository=task.repository, owner_id=task.owner_id
-        )
-        if task.trigger_type == "ci":
-            # Arbitration: a stale overview (e.g. describing already-fixed
-            # issues) must not outrank the fresh CI failure. Scope retrieval
-            # to the failing area and put it first; the generic overview stays
-            # last as background only.
-            scoped = _relevant_memory(
-                db,
-                repository=task.repository,
-                task=task,
-            )
-            if scoped:
-                overview = scoped + "\n\n---\n\n" + overview if overview else scoped
+        # --- CI failure evidence (the trigger is the ground truth) ---
         ci_info = ""
         if task.trigger_type == "ci":
             # The webhook already attaches a bounded failing-log excerpt when
@@ -1372,7 +1317,6 @@ def run_task_inline(
                 path=path,
                 default_branch=default_branch,
                 ci_info=ci_info,
-                overview=overview,
             )
         except Exception as exc:
             # Unknown/unsupported trigger: fail safe, never default to wrong skill.
@@ -1429,7 +1373,6 @@ def run_task_inline(
                     issue_title=task.issue_title,
                     issue_body=task.issue_body,
                     ci_info=ci_info,
-                    memory_overview=overview,
                     on_tool=_live,
                     is_cancelled=_cancel_flag(task.id),
                     ctx=ctx,
@@ -1475,13 +1418,6 @@ def run_task_inline(
                     task.id,
                     "NEEDS_REVIEW",
                     {"reason": "agent_crash", "branch": branch},
-                )
-                _update_memory(
-                    db,
-                    task,
-                    path,
-                    f"crashed mid-run: {exc}"[:800],
-                    changed=_pub.changed_files(path),
                 )
                 db.commit()
                 return {"status": "NEEDS_REVIEW", "branch": branch}
@@ -1535,7 +1471,6 @@ def run_task_inline(
             if not _pub.has_meaningful_changes(path):
                 _set(db, task, status="COMPLETED", error="")
                 _event(db, task.id, "AGENT_FINISHED", {"result": "no changes produced"})
-                _update_memory(db, task, path, result.summary, changed=[])
                 db.commit()
                 _cleanup(task.id)
                 return {
@@ -1561,7 +1496,6 @@ def run_task_inline(
         if green:
             _set(db, task, status="COMPLETED", branch=branch, error="")
             _event(db, task.id, "SUPERSEDED", {"by": green})
-            _update_memory(db, task, path, result.summary, changed=changed)
             db.commit()
             _cleanup(task.id)
             return {
@@ -1602,7 +1536,6 @@ def run_task_inline(
                     ci_info=ci_info
                     + "\nLOCAL GATE FAILED — fix exactly this, then re-run the same gate commands:\n"
                     + gate_out,
-                    memory_overview=overview,
                     on_tool=_live,
                     is_cancelled=_cancel_flag(task.id),
                     deadline_mono=agent_deadline,
@@ -1666,7 +1599,6 @@ def run_task_inline(
             _event(
                 db, task.id, "NEEDS_REVIEW", {"reason": "gate_failed", "branch": branch}
             )
-            _update_memory(db, task, path, result.summary, changed=changed)
             db.commit()
             return {
                 "status": "NEEDS_REVIEW",
@@ -1682,7 +1614,6 @@ def run_task_inline(
             _event(
                 db, task.id, "NEEDS_REVIEW", {"branch": branch, "files": changed[:20]}
             )
-            _update_memory(db, task, path, result.summary, changed=changed)
             db.commit()
             return {
                 "status": "NEEDS_REVIEW",
@@ -1735,31 +1666,3 @@ def _local_commit_push(path: str, branch: str, title: str, start: str = "") -> N
         ]
     )
     _run(["push", "-u", "origin", branch])
-
-
-def _update_memory(db, task: Task, path: str, summary: str, changed: list[str]) -> None:
-    """Memory comes from ACTUAL interactions: changed files + agent summary. Never faked."""
-    rev = _ws.head_sha(path)
-    prev = _mem.get_repository_overview(
-        db, repository=task.repository, owner_id=task.owner_id
-    )
-    delta = f"Task #{task.id} ({task.trigger_type}): {summary[:800]}"
-    if changed:
-        delta += f"\nChanged: {', '.join(changed[:20])}"
-    merged = (prev + "\n" + delta).strip()[-4000:] if prev else delta[:4000]
-    _mem.update_repository_memory(
-        db,
-        repository=task.repository,
-        summary=merged,
-        rev=rev or task.ci_sha,
-        owner_id=task.owner_id,
-    )
-    for f in changed[:10]:
-        _mem.save_memory(
-            db,
-            repository=task.repository,
-            path=f,
-            summary=f"touched by task #{task.id}: {summary[:300]}",
-            rev=rev,
-            owner_id=task.owner_id,
-        )

@@ -9,7 +9,6 @@ import EditorTabs from "./components/EditorTabs";
 import {
   ArrowRight,
   ArrowUpRight,
-  BookOpen,
   Bot,
   Check,
   ChevronDown,
@@ -36,7 +35,7 @@ import "./styles.css";
 
 type CenterTab = "code" | "diff";
 
-type NavView = "Overview" | "Tasks" | "Issues" | "Repositories" | "Memory" | "Settings";
+type NavView = "Overview" | "Tasks" | "Issues" | "Repositories" | "Settings";
 
 interface RepoBlockProps {
   account: string;
@@ -120,7 +119,6 @@ export default function App() {
   const [browse, setBrowse] = useState<{ repo: string; ref: string } | null>(null);
   // Task ids whose workspace reported expired (410): show published changes.
   const [expiredWs, setExpiredWs] = useState<Record<number, boolean>>({});
-  const [taskDetail, setTaskDetail] = useState<{ memory?: { path: string; summary: string }[] } | null>(null);
   // Phase 2 auth state: unknown until /auth/me resolves.
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
@@ -134,22 +132,6 @@ export default function App() {
 
   // Title fallback for tasks without an issue title (e.g. CI runs).
   const taskTitle = (t: TaskSummary) => t.issue_title || `${t.trigger_type} · ${t.repository}`;
-
-  useEffect(() => {
-    if (!taskId) {
-      setTaskDetail(null);
-      return;
-    }
-    let live = true;
-    api.task(taskId).then((d) => {
-      if (live) setTaskDetail(d);
-    }).catch(() => {
-      if (live) setTaskDetail(null);
-    });
-    return () => {
-      live = false;
-    };
-  }, [taskId]);
 
   const loadAll = useCallback(async () => {
     try {
@@ -260,7 +242,6 @@ export default function App() {
     { label: "Tasks", Icon: ListChecks },
     { label: "Issues", Icon: CircleDot },
     { label: "Repositories", Icon: LayoutGrid },
-    { label: "Memory", Icon: BookOpen },
   ];
 
   const progressSteps = ["Understand issue", "Inspect repository", "Implement fix", "Validate changes", "Open pull request"];
@@ -336,7 +317,7 @@ export default function App() {
             <IconButton title="Refresh" aria-label="Refresh tasks and repositories" onClick={loadAll}><RefreshCw size={15} /></IconButton>
           </div>
 
-          {(nav === "Overview" || nav === "Tasks" || nav === "Memory") && (
+          {(nav === "Overview" || nav === "Tasks") && (
             <Card className="ready-card">
               <TaskStatus status={task?.status} />
               <strong>{task ? taskTitle(task) : "Ready to fix"}</strong>
@@ -412,20 +393,6 @@ export default function App() {
                 <Input value={connInst} onChange={(e) => setConnInst(e.target.value)} placeholder="installation id" />
                 <Button variant="outline" onClick={connect}>Connect repository</Button>
               </div>
-            </>
-          )}
-
-          {nav === "Memory" && (
-            <>
-              <SectionLabel action={task ? <span className="muted">{task.repository}</span> : undefined}>Repository memory</SectionLabel>
-              {!task && <div className="empty-state">Select a task to inspect its repository memory.</div>}
-              {task && (!(taskDetail?.memory?.length) ? <div className="empty-state">No memory recorded for {task.repository} yet.</div> :
-                taskDetail!.memory!.map((m) => (
-                  <Card key={m.path} className="memory-item">
-                    <div className="memory-path">{m.path}</div>
-                    <div className="memory-summary">{m.summary}</div>
-                  </Card>
-                )))}
             </>
           )}
 

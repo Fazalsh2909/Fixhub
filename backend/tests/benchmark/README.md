@@ -4,7 +4,7 @@ Deterministic measurement of whether the FixHub coding agent solves real
 repository tasks reliably. No network, no GitHub, no paid APIs: fixtures live
 in throwaway tmp dirs and the LLM is a deterministic script. The real
 `TaskContext`, agent loop, tools, sandbox, workspace, validation gates,
-memory, and task lifecycle execute throughout — nothing is bypassed.
+and task lifecycle execute throughout — nothing is bypassed.
 
 ## Run
 

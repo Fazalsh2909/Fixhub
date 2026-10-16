@@ -214,4 +214,4 @@ def test_task_detail_api(db):
     assert r.status_code == 200 and r.json()[0]["pr_url"] == "http://pr/9"
     tid = r.json()[0]["id"]
     d = c.get(f"/api/tasks/{tid}", cookies=cookies)
-    assert d.status_code == 200 and "memory" in d.json() and "events" in d.json()
+    assert d.status_code == 200 and "memory" not in d.json() and "events" in d.json()
