@@ -118,6 +118,19 @@ def test_window_compacts_large_history_to_budget(monkeypatch):
     assert "condensed" in serialized
 
 
+def test_state_brief_recap_names_files_not_just_counts():
+    events = [
+        {"tool": "read_file", "args": {"path": "calc.py"}, "ok": True},
+        {"tool": "read_file", "args": {"path": "test_calc.py"}, "ok": True},
+        {"tool": "run_command", "args": {"command": "pytest -q"}, "ok": True, "exit_code": 1},
+        {"tool": "read_file", "args": {"path": "nope.py"}, "ok": False},
+    ]
+    brief = _loop._state_brief(events)
+    assert "calc.py" in brief and "test_calc.py" in brief
+    assert "pytest -q" in brief and "exit 1" in brief
+    assert _loop._state_brief([]) == "No tool calls yet."
+
+
 def test_ci_task_context_bounds_logs_and_keeps_workflow_visible():
     from app.agent.context import CIContext, TaskContext, build_task_message
 

@@ -613,6 +613,56 @@ def _fit_history_span(span: list[dict], budget: int) -> list[dict] | None:
     return None
 
 
+def _state_brief(events: list[dict]) -> str:
+    """Deterministic state brief from persisted tool events (no LLM call).
+
+    Replaces the generic "tool X ran N times" recap when older exchanges are
+    condensed out of the window: files read, files changed, commands with
+    exit codes, and failure counts, so a resumed context knows the story
+    instead of just the statistics. Bounded; never raises.
+    """
+    try:
+        if not events:
+            return "No tool calls yet."
+        reads: list[str] = []
+        changed: list[str] = []
+        commands: list[str] = []
+        failed = 0
+        for ev in events or []:
+            if not isinstance(ev, dict):
+                continue
+            name = str(ev.get("tool", "?"))
+            args = ev.get("args", {}) or {}
+            ok = bool(ev.get("ok", True))
+            if name == "read_file" and ok:
+                path = str(args.get("path", ""))[:120]
+                if path and path not in reads:
+                    reads.append(path)
+            elif name in ("write_file", "edit_file") and ok:
+                path = str(args.get("path", ""))[:120]
+                if path and path not in changed:
+                    changed.append(path)
+            elif name == "run_command" and not ev.get("cached"):
+                cmd = str(args.get("command", ""))[:100]
+                commands.append(f"`{cmd}` -> exit {ev.get('exit_code', '?')}")
+            if not ok and not ev.get("blocked") and not ev.get("cached"):
+                failed += 1
+        parts = []
+        if reads:
+            parts.append("Read: " + ", ".join(reads[-8:]))
+        if changed:
+            parts.append("Changed: " + ", ".join(changed[-8:]))
+        if commands:
+            parts.append("Ran: " + "; ".join(commands[-4:]))
+        if failed:
+            parts.append(f"Failed calls: {failed}")
+        if not parts:
+            return "No completed tool calls yet."
+        return _clip_middle(" | ".join(parts), 600)
+    except Exception:
+        return "Earlier exchanges condensed."
+
+
 def _window(messages: list[dict], events: list[dict]) -> list[dict]:
     """Token-conscious conversation window with a hard serialized-character budget.
 
@@ -676,18 +726,13 @@ def _window(messages: list[dict], events: list[dict]) -> list[dict]:
     dropped = len(spans) - len(selected)
     out = head
     if dropped > 0:
-        tool_names: dict[str, int] = {}
-        for ev in events:
-            name = ev.get("tool", "?")
-            tool_names[name] = tool_names.get(name, 0) + 1
-        recap = ", ".join(
-            f"{n} {name}" for name, n in sorted(tool_names.items(), key=lambda x: -x[1])[:5]
-        )
+        brief = _state_brief(events)
         out.append({
             "role": "user",
             "content": _clip_middle(
                 f"[Earlier exchanges condensed to stay within the context budget. "
-                f"Tool calls so far: {recap or 'none'}. Use the latest outputs and current repository state.]",
+                f"Progress so far: {brief} "
+                f"Use the latest outputs and current repository state.]",
                 800,
             ),
         })

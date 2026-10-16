@@ -59,7 +59,7 @@ flowchart TB
 - System prompt (`prompt.py`) enforces repository-relative paths, per-call `cwd`, structured command results, failure discipline (never repeat an identical failed call), CI-first reading order, pinned toolchain, and no self-managed git.
 - Tools: 8 total, all jailed. `resolve()` rejects empty, NUL, absolute, `~`, drive-letter, and `..`-escaping paths. `is_sensitive()` blocks `.env`, `.git/*`, `*.pem`, `*.key`, secrets/tokens/credentials for read/write/search.
 - `run_command(workspace, command, cwd)` runs with a fixed repo-relative cwd; results render as `exit_code` (authoritative, `null` only on timeout), `cwd`, `duration_ms`, `timed_out`, stdout/stderr sections.
-- Loop policy: identical-success reuse (cached result), identical-failure block after 2 repeats with a strategy-change instruction, rewrite cap (8 per path), premature-done nudge (max 2), sliding window (`LLM_HISTORY_GROUPS=12`) with condensed summary of dropped spans.
+- Loop policy: identical-success reuse (cached result), identical-failure block after 2 repeats with a strategy-change instruction, rewrite cap (8 per path), premature-done nudge (max 2), sliding window (`LLM_HISTORY_GROUPS=4`, `LLM_CONTEXT_MAX_CHARS=16000`) with an event-derived state brief (files read/changed, commands + exit codes) for dropped spans.
 - Cancel: `is_cancelled` checked every iteration and before every tool call → `LoopResult(cancelled=True)` → task `CANCELLED`.
 
 ### Sandbox (`backend/app/sandbox/sandbox.py`)
