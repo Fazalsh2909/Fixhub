@@ -7,7 +7,13 @@ import json
 from fastapi.testclient import TestClient
 
 from app.config import settings
-from app.db.models import GitHubConnection, Repository, Task, WebhookDelivery
+from app.db.models import (
+    GitHubConnection,
+    Repository,
+    Task,
+    TaskEvent,
+    WebhookDelivery,
+)
 from app.github.webhook import verify_signature
 from app.main import app
 from tests.conftest import make_user
@@ -302,33 +308,103 @@ def test_check_run_non_actions_ignored(db, monkeypatch):
     assert db.query(Task).count() == 0
 
 
-def test_check_run_enriches_excerpt(db, monkeypatch):
-    import app.github.webhook as _wh
+def test_check_run_webhook_stays_fast_and_sets_run_id(db, monkeypatch):
+    """The webhook stores a one-line excerpt and the parent workflow run id.
 
-    monkeypatch.setattr(
-        _wh,
-        "_ci_log_excerpt",
-        lambda *,
-        repo_name,
-        run_id,
-        check_name: "JOB Lint failed\n  step ruff conclusion=failure",
-    )
+    Real logs are fetched worker-side before the agent starts; the webhook
+    must not download logs (it used to attach metadata-only "logs" that made
+    the worker skip enrichment).
+    """
     _checks_on(monkeypatch)
     _own(db)
     c = TestClient(app)
     r = _post(c, _check(), "d-cr", "check_run")
     assert r.json()["task_id"]
     t = db.query(Task).filter(Task.ci_job == "backend").first()
-    assert t and "failing logs" in t.ci_excerpt and "ruff" in t.ci_excerpt
+    assert t and t.ci_run_id == "4242"
+    assert t.ci_excerpt == "check backend failed"
+
+
+def test_build_ci_context_check_run_fetches_workflow(monkeypatch):
+    """check_run must carry the workflow file/content, not just the job name."""
+    import app.github.webhook as _wh
+    from app.github import client as _gh
+
+    monkeypatch.setattr(_wh, "_repo_token", lambda repo_name: "t")
+    monkeypatch.setattr(_wh, "_gh_steps", lambda token, repo_name, run_id: [])
+    monkeypatch.setattr(
+        _gh,
+        "get_workflow_run",
+        lambda *, token, full_name, run_id: {
+            "name": "CI",
+            "path": ".github/workflows/ci.yml",
+            "head_sha": "sha1",
+            "head_branch": "main",
+        },
+    )
+    monkeypatch.setattr(
+        _gh,
+        "get_workflow_content",
+        lambda *, token, full_name, path, ref="", max_bytes=8000: "name: CI\n",
+    )
+    ctx = _wh.build_ci_context(
+        event_type="check_run", payload=_check(), repo_name="acme/demo"
+    )
+    assert ctx["workflow_name"] == "CI"
+    assert ctx["workflow_file"] == ".github/workflows/ci.yml"
+    assert ctx["workflow_content"].startswith("name: CI")
+    assert ctx["run_id"] == "4242"
+
+
+def test_ci_context_event_json_survives_a_full_workflow(db, monkeypatch):
+    """CI_CONTEXT_LOADED must stay parseable when the workflow is ~6000 chars.
+
+    The old 4000-char event cap cut the JSON mid-object; the worker then got
+    json.loads() == ValueError and silently lost workflow/job/step fields.
+    """
+    import app.github.webhook as _wh
+    from app.github import client as _gh
+
+    workflow = "name: CI\n" + ("# padding line for a realistic workflow\n" * 160)
+    assert len(workflow) > 6000
+    monkeypatch.setattr(_wh, "_repo_token", lambda repo_name: "t")
+    monkeypatch.setattr(_wh, "_gh_steps", lambda token, repo_name, run_id: [])
+    monkeypatch.setattr(
+        _gh,
+        "get_workflow_run",
+        lambda *, token, full_name, run_id: {
+            "name": "CI",
+            "path": ".github/workflows/ci.yml",
+            "head_sha": "def456",
+            "head_branch": "main",
+        },
+    )
+    monkeypatch.setattr(
+        _gh,
+        "get_workflow_content",
+        lambda *, token, full_name, path, ref="", max_bytes=8000: workflow,
+    )
+    _checks_on(monkeypatch)
+    _own(db)
+    c = TestClient(app)
+    r = _post(c, _check(), "d-cr-long", "check_run")
+    assert r.json()["task_id"]
+
+    ev = (
+        db.query(TaskEvent)
+        .filter(TaskEvent.type == "CI_CONTEXT_LOADED")
+        .order_by(TaskEvent.id.desc())
+        .first()
+    )
+    assert ev is not None
+    data = json.loads(ev.data_json)  # must not be truncated mid-object
+    assert data["workflow_file"] == ".github/workflows/ci.yml"
+    assert data["workflow_name"] == "CI"
+    assert len(data["workflow_content"]) == 6000
+    assert data["run_id"] == "4242"
 
 
 def test_check_run_enrichment_failure_falls_back(db, monkeypatch):
-    import app.github.webhook as _wh
-
-    # No installation id / no logs available -> plain one-line excerpt, still triggers.
-    monkeypatch.setattr(
-        _wh, "_ci_log_excerpt", lambda *, repo_name, run_id, check_name: ""
-    )
     _checks_on(monkeypatch)
     # Ownership still required: seed a connected repo + owner row.
     u = make_user(db, email="wh2@example.com")

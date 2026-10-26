@@ -33,20 +33,40 @@ def create_pull_request(
 
 
 def failing_logs_excerpt(*, token: str, full_name: str, run_id: str, max_bytes: int = 8000) -> str:
-    """Fetch failed jobs for a workflow run and return a bounded log excerpt."""
-    jobs_url = f"{settings.GITHUB_API_URL}/repos/{full_name}/actions/runs/{run_id}/jobs"
-    resp = httpx.get(url=jobs_url, headers=_headers(token), timeout=30)
+    """Failure-signal excerpt for a failed run (real log, not step metadata).
+
+    Delegates to failed_log_tail() so callers get the exact error text
+    (pytest FAILURES, ruff, npm) instead of "JOB x conclusion=failure".
+    Raises on API failure; callers treat this as best-effort.
+    """
+    return failed_log_tail(
+        token=token,
+        full_name=full_name,
+        run_id=run_id,
+        max_bytes=min(int(max_bytes or 6000), 6000),
+    )
+
+
+def get_workflow_run(*, token: str, full_name: str, run_id: str) -> dict:
+    """Workflow-run metadata behind a check_run (name/path/sha/branch).
+
+    A check_run payload only carries the job; the workflow file and run-level
+    branch/sha live on the parent run. Raises on API failure.
+    """
+    url = f"{settings.GITHUB_API_URL}/repos/{full_name}/actions/runs/{run_id}"
+    resp = httpx.get(url, headers=_headers(token), timeout=30)
     resp.raise_for_status()
-    jobs = resp.json().get("jobs", [])
-    failed = [j for j in jobs if j.get("conclusion") == "failure"] or jobs[:1]
-    chunks: list[str] = []
-    for job in failed[:3]:
-        chunks.append(f"JOB {job.get('name')} conclusion={job.get('conclusion')}")
-        for step in (job.get("steps") or [])[-6:]:
-            chunks.append(f"  step {step.get('name')} conclusion={step.get('conclusion')}")
-    out = "\n".join(chunks)
-    out_capped = out[:max_bytes] if len(out) > max_bytes else out
-    return out_capped
+    data = resp.json()
+    return {
+        "id": str(data.get("id", run_id)),
+        "name": data.get("name", "") or "",
+        "path": data.get("path", "") or "",
+        "head_sha": data.get("head_sha", "") or "",
+        "head_branch": data.get("head_branch", "") or "",
+        "html_url": data.get("html_url", "") or "",
+        "conclusion": data.get("conclusion", "") or "",
+        "pull_requests": data.get("pull_requests") or [],
+    }
 
 
 def _signal_line(line: str) -> bool:

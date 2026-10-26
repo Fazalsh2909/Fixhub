@@ -33,7 +33,8 @@ flowchart TB
 - `workflow_run`: only `completed` runs whose conclusion is a break (`failure`/`timed_out`/`startup_failure`) create tasks. `check_run` is opt-in (`CI_TRIGGER_EVENTS`) because it fires per job; when enabled, only GitHub Actions checks are accepted by default (`CI_ACTIONS_CHECKS_ONLY`).
 - Trigger policy: `CI_WORKFLOW_ALLOWLIST`, `CI_BRANCH_POLICY` (`all`/`default_only`/`allowlist`), and `CI_IGNORE_BRANCH_PREFIXES` (default `fixhub-fixes/`, repaired by the CI watcher on the existing task).
 - One CI task per commit: `tasks.dedupe_key = ci:<owner/repo>:<head_sha>` plus a unique index. Concurrent or replayed deliveries return the existing task (`duplicate: dedupe_key`). Issue tasks keep `dedupe_key = NULL` and use the active-task check.
-- Builds structured CI context (`build_ci_context`: provider, workflow file/content, run ID, SHA, branch, job, step, annotations, changed files, URL) and persists `TASK_CREATED` + `CI_CONTEXT_LOADED` events.
+- Builds structured CI context (`build_ci_context`: provider, workflow file/content, run ID, SHA, branch, job, step, annotations, changed files, URL) and persists `TASK_CREATED` + `CI_CONTEXT_LOADED` events. For `check_run`, the parent workflow run is fetched so the workflow file/content and run-level SHA/branch are present (the payload names only the job).
+- The webhook stores a one-line failure summary only. The worker fetches the real failing-job log tail (`failed_log_tail`), persists it on the task, and emits `CI_EVIDENCE` (`has_logs`, `has_workflow`, `signal`) before the agent starts. Metadata-only excerpts (`JOB ... conclusion=failure` + step names) do not count as evidence (`context.has_failure_signal`).
 - Every created task is enqueued immediately (`_start_task`). A failed enqueue writes `QUEUE_FAILED` + `task.error` instead of leaving a silent `QUEUED` row; the QUEUED reconciler retries once infrastructure recovers.
 
 ### Queue and worker (`backend/app/tasks/queue.py`, `worker.py`)

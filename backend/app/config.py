@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = "https://router.bynara.id/v1"
     LLM_API_KEY: str = ""
     LLM_MODEL: str = "nemotron-3.5-lightning-free"
+    # Optional stronger model for CI repair tasks (empty = inherit LLM_MODEL /
+    # the task owner's configured model). CI is a short, high-value run where
+    # the free tier's repeated reads are the main failure mode.
+    LLM_CI_MODEL: str = ""
     LLM_TIMEOUT_S: int = 120
     # Transient upstream blips (429/5xx, 200-with-error-body) are retried with
     # backoff instead of killing the run: attempts × (20s, 40s, 80s, …).

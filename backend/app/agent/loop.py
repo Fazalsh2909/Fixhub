@@ -62,8 +62,12 @@ class AgentState:
     state_version: int = 0
 
 
-# Identical failure repeated this many times (without state change) is
-# blocked with a strategy-change instruction instead of executed again.
+# An identical *command* failure is never retried: the second attempt is
+# blocked with a strategy-change instruction. Repeating a failed command burns
+# the budget and was the observed CI failure mode (two identical `pip install`
+# failures). Other tools (e.g. a write gated before diagnosis) may be retried
+# once after new evidence, so they keep the larger limit.
+MAX_IDENTICAL_COMMAND_FAILURES = 1
 MAX_IDENTICAL_FAILURES = 2
 # Cap cached results / tracked signatures (bounded memory).
 MAX_TRACKED_SIGNATURES = 100
@@ -76,6 +80,19 @@ MAX_STALLED_TURNS = 3
 # A path may be read twice (head window + a second offset window). Further
 # reads of the same unchanged path return a digest instead of the body.
 MAX_READS_PER_PATH = 2
+# Once a CI task is DIAGNOSED, read-only exploration is over: at most two
+# reads are allowed before the loop demands an edit or a reproduction. This is
+# what turns "15 calls, 0 edits" into an edit by call ~5.
+MAX_POST_DIAGNOSIS_READS = 2
+_READ_ONLY_TOOLS = frozenset(
+    {"read_file", "list_directory", "search_code", "git_status", "git_diff"}
+)
+# Commands that only look around. After diagnosis they count against the same
+# read budget as read_file: exploration is over, reproduction/edits are not.
+_EXPLORATORY_COMMAND = re.compile(
+    r"^\s*(?:ls|dir|find|tree|pwd|git\s+(?:status|diff|log|show|branch))\b",
+    re.IGNORECASE,
+)
 # Budget fractions: at CONVERGE the loop tells the model to stop exploring;
 # at CRITICAL it repeats the directive with the remaining work spelled out.
 # The hard cap still applies - these only change behaviour earlier.
@@ -195,12 +212,17 @@ def run_agent(
         except Exception:
             ctx.skill_instructions = ""
     tracker = _phase.InvestigationTracker(skill=ctx.skill or _skill.name)
-    if (
-        ctx.trigger_type == "ci"
-        and (ctx.ci.workflow_content or "").strip()
-        and (ctx.ci.workflow_file or "").strip()
-    ):
-        tracker.seed_ci_workflow_context(ctx.ci.workflow_file)
+    if ctx.trigger_type == "ci":
+        if (ctx.ci.workflow_content or "").strip() and (
+            ctx.ci.workflow_file or ""
+        ).strip():
+            tracker.seed_ci_workflow_context(ctx.ci.workflow_file)
+        # The webhook/worker already fetched the real failing log. Treat it as
+        # supplied evidence so the gate does not force a workflow re-read.
+        if _ctxmod.has_failure_signal(ctx.ci.failure_logs):
+            tracker.seed_ci_failure(
+                _ctxmod.failure_signal(ctx.ci.failure_logs) or "failure-log-supplied"
+            )
     workspace = ctx.workspace_root or workspace
     repository = ctx.repository or repository
     state = AgentState(
@@ -230,6 +252,7 @@ def run_agent(
     cmd_seen: set[str] = set()
     read_budget: dict[str, dict] = {}  # path -> {count, version, digest}
     stalled_turns = 0
+    post_diag_reads = 0
     converged = 0
     diagnosis = _diagnosis_brief(ctx)
     started = time.monotonic()
@@ -580,6 +603,53 @@ def run_agent(
                         {"role": "tool", "tool_call_id": tc.id, "content": note}
                     )
                     continue
+            # Post-diagnosis read budget (CI): once the failure is understood,
+            # more reading is not progress. Two read-only calls, then the loop
+            # demands an edit or a command that reproduces the failure.
+            is_read_call = (
+                tc.name in _READ_ONLY_TOOLS
+                or bool(read_path)
+                or (
+                    tc.name == "run_command"
+                    and bool(
+                        _EXPLORATORY_COMMAND.match(str(args.get("command", "")))
+                    )
+                )
+            )
+            if (
+                tracker.skill == "fix-ci-cd"
+                and tracker.phase == _phase.DIAGNOSED
+                and is_read_call
+                and post_diag_reads >= MAX_POST_DIAGNOSIS_READS
+            ):
+                msg = (
+                    f"READ BUDGET EXHAUSTED: {post_diag_reads} read-only calls since "
+                    "diagnosis. You already have the evidence. Your next action MUST "
+                    "be an edit_file/write_file that fixes the cause, or a command "
+                    "that reproduces the failure. Do not read another file."
+                )
+                _emit(
+                    {
+                        "tool": tc.name,
+                        "args": _summarise_args(args),
+                        "ok": False,
+                        "blocked": True,
+                        "read_budget": True,
+                        "step": tool_calls,
+                    }
+                )
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": msg}
+                )
+                state.last_failure = msg
+                seen[sig] = {
+                    "fails": 1,
+                    "version": state.state_version,
+                    "step": tool_calls,
+                    "result": msg,
+                    "ok": False,
+                }
+                continue
             rec = seen.get(sig)
             if rec is not None and rec["version"] != state.state_version:
                 rec = None  # workspace state changed: history no longer applies
@@ -604,7 +674,11 @@ def run_agent(
                         {"role": "tool", "tool_call_id": tc.id, "content": note}
                     )
                     continue
-                if rec["fails"] >= MAX_IDENTICAL_FAILURES:
+                if rec["fails"] >= (
+                    MAX_IDENTICAL_COMMAND_FAILURES
+                    if tc.name == "run_command"
+                    else MAX_IDENTICAL_FAILURES
+                ):
                     # Third identical failure: block and force a strategy change.
                     msg = (
                         "Previous action failed and repeating it is not allowed. "
@@ -627,10 +701,20 @@ def run_agent(
                     state.last_failure = msg
                     continue
             result = _compact_tool_result(tc.name, _execute(workspace, tc.name, args))
-            ok = not result.startswith("ERROR")
-            meta = (
-                _parse_command_result(result) if tc.name == "run_command" and ok else {}
+            meta = _parse_command_result(result) if tc.name == "run_command" else {}
+            # exit_code is authoritative (null = timeout). A non-zero command
+            # is a failed command, not a successful action: it must never count
+            # as progress or investigation evidence.
+            failed_command = bool(meta) and (
+                meta.get("timed_out") is True
+                or (
+                    meta.get("exit_code") is not None
+                    and meta.get("exit_code") != 0
+                )
             )
+            ok = not result.startswith("ERROR") and not failed_command
+            was_diagnosed = tracker.phase == _phase.DIAGNOSED
+            failure_directive = ""
             if ok:
                 # Only a workspace mutation invalidates cached reads. Bumping
                 # on every success (as this used to) meant any intervening
@@ -653,6 +737,8 @@ def run_agent(
                 # Phase 4.5: pass args so depth (distinct paths, workflow reads)
                 # is tracked, not just call counts.
                 tracker.record(tc.name, True, args)
+                if was_diagnosed and is_read_call:
+                    post_diag_reads += 1
                 if tc.name in ("write_file", "edit_file"):
                     tracker.mark_implementing()
                 if tc.name in ("run_command", "git_diff") and state.changed_files:
@@ -693,6 +779,14 @@ def run_agent(
                     read_budget[read_path] = rrec
             else:
                 state.last_failure = result[:500]
+                if failed_command:
+                    # Reproduction is real diagnostic evidence, but a failed
+                    # command is never progress toward a fix.
+                    tracker.mark_reproduced()
+                    if sig not in cmd_seen:
+                        cmd_seen.add(sig)
+                        turn_progress = True
+                    failure_directive = _command_failure_directive(meta, result)
             seen[sig] = {
                 "fails": (rec["fails"] + 1) if rec and not ok else (0 if ok else 1),
                 "version": state.state_version,
@@ -715,6 +809,21 @@ def run_agent(
             state.recent_signatures.append(sig)
             del state.recent_signatures[:-50]
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            if failure_directive:
+                messages.append({"role": "user", "content": failure_directive})
+                _emit(
+                    {
+                        "tool": "command_failed",
+                        "args": {
+                            "command": str(args.get("command", ""))[:300],
+                            "exit_code": meta.get("exit_code"),
+                            "timed_out": bool(meta.get("timed_out")),
+                        },
+                        "ok": False,
+                        "failed_command": True,
+                        "step": tool_calls,
+                    }
+                )
             # Final hardening: revalidate after every tool execution. A slow
             # tool (or a reap during execution) must not continue the batch
             # or reach the next LLM request on a dead lease.
@@ -1130,6 +1239,53 @@ def _signature(name: str, args: dict) -> str:
     if name == "run_command":
         canon.setdefault("cwd", ".")
     return name + ":" + json.dumps(canon, sort_keys=True)
+
+
+def _first_error_line(text: str) -> str:
+    """First actionable error line from a command result (bounded)."""
+    probes = (
+        "error",
+        "failed",
+        "traceback",
+        "exception",
+        "would reformat",
+        "not found",
+        "no matching distribution",
+        "denied",
+    )
+    fallback = ""
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith(
+            (
+                "exit_code:",
+                "stdout:",
+                "stderr:",
+                "cwd:",
+                "duration_ms:",
+                "timed_out:",
+            )
+        ):
+            continue
+        if not fallback:
+            fallback = line
+        if any(probe in line.lower() for probe in probes):
+            return line[:300]
+    return fallback[:300]
+
+
+def _command_failure_directive(meta: dict, result: str) -> str:
+    """Hard directive after a non-zero command: change strategy, do not retry."""
+    code = meta.get("exit_code")
+    status = "timed out" if meta.get("timed_out") else f"exit {code}"
+    detail = _first_error_line(result)
+    return (
+        f"COMMAND FAILED ({status})"
+        + (f": {detail}" if detail else "")
+        + ". This is failure evidence, not progress toward a fix. The next "
+        "action MUST be an edit_file/write_file that fixes the cause, or a "
+        "different command that isolates it. Do NOT repeat this command."
+    )
 
 
 def _parse_command_result(text: str) -> dict:

@@ -79,6 +79,7 @@ _SIGNAL_PATTERNS = (
     ),
     re.compile(r"^\s*(?:error\[E\d+\]|error)\s*:\s*(.+)$", re.IGNORECASE),
     re.compile(r"^\s*npm ERR!\s+(.+)$"),
+    re.compile(r"^\s*Would reformat:\s*(.+)$"),
 )
 
 
@@ -117,6 +118,63 @@ def failure_signal(logs: str, limit: int = 400) -> str:
     return _bounded(" | ".join(picked), limit)
 
 
+# Broad probes: evidence that an excerpt contains a real failure payload, even
+# when it does not match the precise `failure_signal` patterns (ruff/mypy/npm).
+# Deliberately permissive; used to decide whether real logs still need fetching.
+_FAILURE_PROBES = (
+    "traceback (most recent call last)",
+    "failed",
+    "error",
+    "exception",
+    "assertionerror",
+    "would reformat",
+    "npm err!",
+    "exit code",
+    "no matching distribution",
+    "could not find a version",
+    "command not found",
+    "permission denied",
+)
+
+
+def has_failure_signal(text: str) -> bool:
+    """True when a log/excerpt carries an actual failure payload.
+
+    Metadata-only excerpts ("JOB backend conclusion=failure" + step names) and
+    the webhook's one-line summary ("check backend failed") must NOT count:
+    the worker uses this to decide whether to fetch the real log.
+    `failure_signal()` alone is too strict for ruff/mypy/npm output, so broad
+    probes and explicit non-zero exit lines are accepted too.
+    """
+    value = str(text or "")
+    if not value.strip():
+        return False
+    if failure_signal(value):
+        return True
+    for raw in value.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # "check backend failed", "workflow CI failed on main" and
+        # "JOB x conclusion=failure" are summaries, not failure evidence.
+        if re.match(
+            r"^(?:job|check|workflow)\b.*\bfail(?:ed|ure)\b",
+            line,
+            re.IGNORECASE,
+        ):
+            continue
+        low = line.lower()
+        if any(probe in low for probe in _FAILURE_PROBES):
+            return True
+        if re.search(
+            r"\bexit(?:ed)?(?: with)?(?: code| status)?[: ]+[1-9]\d*\b",
+            line,
+            re.IGNORECASE,
+        ):
+            return True
+    return False
+
+
 def build_task_message(ctx: TaskContext) -> str:
     """First user message: bounded trigger evidence (no prior state)."""
     head = (
@@ -125,18 +183,47 @@ def build_task_message(ctx: TaskContext) -> str:
     )
     if ctx.trigger_type == "ci":
         ci = ctx.ci
+        signal = failure_signal(ci.failure_logs)
+        has_signal = has_failure_signal(ci.failure_logs)
+        if signal:
+            next_action = (
+                "NEXT ACTION: the failure evidence is already above. Do NOT read "
+                "the workflow file. Open the file named in the signal and fix the "
+                "cause with edit_file; reproduce with one command only if the "
+                "signal is ambiguous."
+            )
+        elif has_signal:
+            next_action = (
+                "NEXT ACTION: a failure log is supplied above. Do NOT read the "
+                "workflow file. Identify the failing file from the log and fix it."
+            )
+        else:
+            next_action = (
+                "NEXT ACTION: no failure log was captured. Reproduce the failing "
+                "step with ONE command derived from the workflow content, then fix "
+                "the cause. Do not explore the repository."
+            )
         block = "\n".join(
             line for line in [
                 "CI FAILURE — determine the root cause of this failure. Do not broadly explore.",
                 "PRIMARY FAILURE SIGNAL: "
                 + (
-                    failure_signal(ci.failure_logs)
-                    or "(not captured — inspect the failing step below)"
+                    signal
+                    or (
+                        "(log supplied — see Failure below)"
+                        if has_signal
+                        else "(not captured — reproduce the failing command first)"
+                    )
                 ),
+                next_action,
                 "Start with the files named under Changed files / in the failure output.",
                 f"Provider: {ci.provider}",
                 f"Workflow: {ci.workflow_name}",
-                f"Workflow file: {ci.workflow_file or '(read it from the repo first)'}",
+                f"Workflow file: "
+                + (
+                    ci.workflow_file
+                    or "(not supplied — read it only if the failure signal points there)"
+                ),
                 f"Run ID: {ci.run_id}",
                 f"Commit: {ci.commit_sha}",
                 f"Branch: {ci.branch}",
@@ -145,7 +232,11 @@ def build_task_message(ctx: TaskContext) -> str:
                 f"Exit code: {ci.exit_code or 'unknown'}",
                 "",
                 "Failure:",
-                _bounded(ci.failure_logs or "(no log excerpt captured)", 3500, tail_ratio=0.65),
+                _bounded(
+                    ci.failure_logs or "(no log excerpt captured)",
+                    3500,
+                    tail_ratio=0.65,
+                ),
                 "",
                 f"Annotations: {_bounded(ci.annotations or 'none', 250)}",
                 f"Changed files: {_bounded(ci.changed_files or 'unknown', 250)}",

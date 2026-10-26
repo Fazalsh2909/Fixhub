@@ -201,6 +201,9 @@ class InvestigationTracker:
     commands: int = 0
     read_paths: set = field(default_factory=set)
     workflow_reads: int = 0
+    workflow_paths: set = field(default_factory=set)
+    failure_evidence: bool = False
+    reproduced_failure: bool = False
     transitions: list[str] = field(default_factory=list)
 
     def seed_ci_workflow_context(self, path: str) -> None:
@@ -219,6 +222,31 @@ class InvestigationTracker:
         self.reads = max(self.reads, 1)
         self.workflow_reads = max(self.workflow_reads, 1)
         self.read_paths.add(normalized)
+        self.workflow_paths.add(normalized)
+
+    def seed_ci_failure(self, signal: str) -> None:
+        """A real failure log/signal was supplied in TaskContext.
+
+        It is evidence about the *failure*, not about the code, so one code
+        read (or a reproduction) is still required before the first write.
+        """
+        if self.skill != "fix-ci-cd" or not signal:
+            return
+        self.failure_evidence = True
+
+    def mark_reproduced(self) -> None:
+        """A command reproduced a non-zero failure: real diagnostic evidence.
+
+        Counts as investigation (unlike a successful `ls`), and may advance
+        straight to DIAGNOSED without the workflow read.
+        """
+        if self.skill != "fix-ci-cd":
+            return
+        self.reproduced_failure = True
+        self.investigation_calls += 1
+        self.commands += 1
+        if self.phase == INVESTIGATING and self.evidence_met():
+            self._advance(DIAGNOSED)
 
     def record(self, tool: str, ok: bool, args: dict | None = None) -> None:
         if not ok:
@@ -232,6 +260,8 @@ class InvestigationTracker:
                     self.read_paths.add(path)
                 if _is_workflow_read(tool, args or {}):
                     self.workflow_reads += 1
+                    if path:
+                        self.workflow_paths.add(path)
             elif tool == "search_code":
                 self.searches += 1
             elif tool == "run_command":
@@ -249,11 +279,20 @@ class InvestigationTracker:
         return pieces
 
     def evidence_met(self) -> bool:
+        if self.skill == "fix-ci-cd" and self.reproduced_failure:
+            # A reproduced non-zero command is the strongest evidence.
+            return True
         if self.investigation_calls < MIN_INVESTIGATION_CALLS or self.reads < MIN_READS:
             return False
         if self.skill == "fix-ci-cd":
-            # Must have looked at the failing workflow (or implicated path)
-            # plus one more piece of evidence.
+            # A supplied failure log is evidence of the failure, not of the
+            # code: still require one code read (workflow content was already
+            # supplied and does not count as a code read).
+            code_reads = len(self.read_paths - self.workflow_paths)
+            if self.failure_evidence:
+                return code_reads >= 1 or self.searches >= 1
+            # No supplied signal: read the workflow (or implicated path) plus
+            # one more distinct piece of evidence.
             return self.workflow_reads >= 1 and self._depth() >= 2
         # fix-issues: depth across distinct files/searches/commands.
         return self._depth() >= 2
@@ -269,16 +308,30 @@ class InvestigationTracker:
         if need_reads:
             parts.append(f"{need_reads} more read_file of a relevant file")
         if not parts:
-            if self.skill == "fix-ci-cd" and self.workflow_reads < 1:
-                parts.append(
-                    "read the failing workflow file (.github/workflows/...) first"
-                )
+            if self.skill == "fix-ci-cd":
+                if self.failure_evidence and not (
+                    self.read_paths - self.workflow_paths
+                ):
+                    parts.append(
+                        "read the code file named in the failure signal "
+                        "(the workflow content is already supplied)"
+                    )
+                elif self.workflow_reads < 1:
+                    parts.append(
+                        "reproduce the failing command, or read the failing "
+                        "workflow file (.github/workflows/...)"
+                    )
+                else:
+                    parts.append(
+                        "broader evidence: read another relevant file, search "
+                        "code, or run a diagnostic"
+                    )
             else:
                 parts.append(
                     "broader evidence: read another relevant file, search code, or run a diagnostic"
                 )
         hint = (
-            " for skill 'fix-ci-cd' prefer reading the failing workflow file first"
+            " for skill 'fix-ci-cd' use the supplied failure signal first"
             if self.skill == "fix-ci-cd"
             else ""
         )

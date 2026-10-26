@@ -36,8 +36,14 @@ def verify_signature(secret: str, body: bytes, signature: str) -> bool:
     return hmac.compare_digest("sha256=" + expected, signature)
 
 
-def _event(db: Session, task_id: int, type_: str, data: dict) -> None:
-    db.add(TaskEvent(task_id=task_id, type=type_, data_json=json.dumps(data)[:4000]))
+def _event(
+    db: Session, task_id: int, type_: str, data: dict, *, limit: int = 4000
+) -> None:
+    # CI_CONTEXT_LOADED carries the workflow YAML (up to 6000 chars); the
+    # default 4000-char cap used to cut the JSON mid-object, so json.loads()
+    # failed and the agent lost every workflow field. Callers that persist
+    # larger payloads pass a limit that fits them.
+    db.add(TaskEvent(task_id=task_id, type=type_, data_json=json.dumps(data)[:limit]))
 
 
 def _ci_log_excerpt(*, repo_name: str, run_id: str, check_name: str) -> str:
@@ -65,7 +71,14 @@ def _ci_log_excerpt(*, repo_name: str, run_id: str, check_name: str) -> str:
         if not installation_id:
             return ""
         token = _app_auth.installation_token(installation_id)
-        out = _gh.failing_logs_excerpt(token=token, full_name=repo_name, run_id=run_id)
+        out = _gh.failed_log_tail(
+            token=token,
+            full_name=repo_name,
+            run_id=run_id,
+            job_name=check_name or "",
+        )
+        if not out:
+            return ""
         if check_name and check_name not in out:
             out = f"check {check_name} failed\n{out}"
         return out[:6000]
@@ -167,20 +180,54 @@ def build_ci_context(*, event_type: str, payload: dict, repo_name: str) -> dict:
         elif event_type == "check_run":
             run = payload.get("check_run", {})
             suite = run.get("check_suite") or {}
+            run_id = _run_id_from_url(run.get("html_url", ""))
             ctx.update(
                 {
-                    "run_id": _run_id_from_url(run.get("html_url", "")),
+                    "run_id": run_id,
                     "commit_sha": run.get("head_sha", ""),
-                    "branch": suite.get("head_branch", ""),
+                    "branch": run.get("head_branch") or suite.get("head_branch", ""),
                     "job": run.get("name", ""),
                     "url": run.get("html_url", ""),
                 }
             )
+            # A check_run names only the job. Fetch the parent workflow run so
+            # the agent gets the workflow file/content and run-level sha/branch
+            # instead of being told to "read the workflow first".
+            if token and run_id:
+                try:
+                    from app.github import client as _ghc
+
+                    wr = _ghc.get_workflow_run(
+                        token=token, full_name=repo_name, run_id=run_id
+                    )
+                    ctx["workflow_name"] = wr.get("name", "")
+                    ctx["workflow_file"] = wr.get("path", "")
+                    ctx["commit_sha"] = ctx["commit_sha"] or wr.get("head_sha", "")
+                    ctx["branch"] = ctx["branch"] or wr.get("head_branch", "")
+                    if ctx["workflow_file"]:
+                        ctx["workflow_content"] = _ghc.get_workflow_content(
+                            token=token,
+                            full_name=repo_name,
+                            path=ctx["workflow_file"],
+                            ref=ctx["commit_sha"],
+                        )[:6000]
+                except Exception:
+                    pass
             output = run.get("output") or {}
             title = str(output.get("title") or "")
             summary = str(output.get("summary") or "")[:1500]
             if title or summary:
                 ctx["step"] = (title + (" — " + summary if summary else ""))[:2000]
+            if token and run_id and not ctx["step"]:
+                try:
+                    steps = _gh_steps(token, repo_name, run_id)
+                    if steps:
+                        ctx["job"] = steps[0]["job"] or ctx["job"]
+                        ctx["step"] = "; ".join(
+                            f"{s['step']} ({s['conclusion']})" for s in steps[:4]
+                        )
+                except Exception:
+                    pass
             if token and run.get("id") is not None:
                 try:
                     from app.github import client as _ghc
@@ -644,11 +691,6 @@ def _handle_workflow_run(db: Session, payload: dict) -> dict:
     if dup is not None:
         return {"ok": True, "task_id": dup.id, "duplicate": "dedupe_key"}
     base_excerpt = f"workflow {workflow} failed on {branch}"
-    logs = _ci_log_excerpt(
-        repo_name=repo_name,
-        run_id=str(run.get("id", "")),
-        check_name=workflow,
-    )
     task = Task(
         repository=repo_name,
         repository_id=repo.id,
@@ -658,9 +700,9 @@ def _handle_workflow_run(db: Session, payload: dict) -> dict:
         ci_sha=sha,
         ci_workflow=workflow,
         ci_url=run.get("html_url", ""),
-        ci_excerpt=(
-            f"{base_excerpt}\n--- failing logs ---\n{logs}" if logs else base_excerpt
-        ),
+        # Fast webhook: one-line summary only. The worker fetches the real
+        # failing-log tail (network + log download) before the agent starts.
+        ci_excerpt=base_excerpt,
         status="QUEUED",
     )
     task, duplicate = _insert_task(db, task, dedupe_key=key)
@@ -679,6 +721,7 @@ def _handle_workflow_run(db: Session, payload: dict) -> dict:
         build_ci_context(
             event_type="workflow_run", payload=payload, repo_name=repo_name
         ),
+        limit=20000,
     )
     db.commit()
     queue = _start_task(db, task.id)
@@ -727,23 +770,20 @@ def _handle_check_run(db: Session, payload: dict) -> dict:
     if dup is not None:
         return {"ok": True, "task_id": dup.id, "duplicate": "dedupe_key"}
     job = str(run.get("name") or "")
+    run_id = _run_id_from_url(run.get("html_url", ""))
     base_excerpt = f"check {job} failed"
-    logs = _ci_log_excerpt(
-        repo_name=repo_name,
-        run_id=_run_id_from_url(run.get("html_url", "")),
-        check_name=job,
-    )
     task = Task(
         repository=repo_name,
         repository_id=repo.id,
         owner_id=owner_id,
         trigger_type="ci",
+        ci_run_id=run_id,
         ci_sha=sha,
         ci_job=job,
         ci_url=run.get("html_url", ""),
-        ci_excerpt=(
-            f"{base_excerpt}\n--- failing logs ---\n{logs}" if logs else base_excerpt
-        ),
+        # Fast webhook: one-line summary only. The worker fetches the real
+        # failing-log tail before the agent starts.
+        ci_excerpt=base_excerpt,
         status="QUEUED",
     )
     task, duplicate = _insert_task(db, task, dedupe_key=key)
@@ -760,6 +800,7 @@ def _handle_check_run(db: Session, payload: dict) -> dict:
         task.id,
         "CI_CONTEXT_LOADED",
         build_ci_context(event_type="check_run", payload=payload, repo_name=repo_name),
+        limit=20000,
     )
     db.commit()
     queue = _start_task(db, task.id)

@@ -30,10 +30,15 @@ FAILURE DISCIPLINE:
   or implementation strategy.
 
 WORKFLOW:
-- For CI failures: use workflow contents and failure output already supplied
-  in the task context first. Re-read the workflow only if its contents are
-  missing. Start at the failed step and inspect only implicated files/symbols;
-  do not repeat reads or broad searches. Use pinned tool versions when needed.
+- For CI failures: the task context already contains the failure signal and,
+  when available, the workflow contents. If a failure signal is present, your
+  FIRST action is an edit_file that fixes the named cause (or one command that
+  reproduces it) — never a workflow read. Re-read the workflow only when its
+  contents are missing and the signal points there. Use pinned tool versions
+  when needed.
+- After you have diagnosed the failure, you get at most two read-only calls.
+  Then the runtime rejects more reads: make the fix with edit_file/write_file.
+  Two reads without an edit is a failed strategy, not progress.
 - Before changing code, investigate sufficiently to understand the architecture.
 - Environment setup is already done (ruff, mypy, pytest preinstalled): verify
   with `<tool> --version` and get to work. Spend at most a handful of steps on

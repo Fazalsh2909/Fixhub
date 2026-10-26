@@ -89,6 +89,7 @@ For forks of OSS repos outside your installations, the IDE manual owner/repo + i
 | `BYNARA_BASE_URL` / `BYNARA_API_KEY` / `BYNARA_MODEL` | `https://router.bynara.id/v1` / empty / `nemotron-3.5-lightning-free` | Active when `LLM_PROVIDER=bynara`. |
 | `XKIRO_BASE_URL` / `XKIRO_API_KEY` / `XKIRO_MODEL` | `https://api.xkiro.com/v1` / empty / `qwen/qwen3-coder-plus:free` | Active when `LLM_PROVIDER=xkiro`. |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | bynara defaults / empty | Legacy trio: when `LLM_API_KEY` is set it wins over `LLM_PROVIDER`. |
+| `LLM_CI_MODEL` | empty | Optional stronger model for CI repair tasks only (empty = inherit the task owner's model). |
 | `LLM_TIMEOUT_S` | `120` | Per chat-completion HTTP timeout. |
 | `LLM_RETRY_ATTEMPTS` / `LLM_RETRY_BASE_S` | `4` / `20.0` | Backoff for transient 429/5xx/transport blips and 200-with-error envelopes. |
 | `LLM_MAX_ITERATIONS` | `40` | Agent loop cap. |

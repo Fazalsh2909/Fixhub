@@ -721,6 +721,21 @@ class _LLMScope:
             )
             cm.__enter__()
             self._exit = cm
+        elif self.model:
+            # CI model override on the environment credential path: keep the
+            # env provider/key but scope a stronger model to this task only.
+            try:
+                from app.config import active_llm
+
+                base_url, api_key, _env_model = active_llm()
+                if api_key:
+                    cm = _llm_client.use_runtime_credential(
+                        base_url, api_key, self.model
+                    )
+                    cm.__enter__()
+                    self._exit = cm
+            except Exception:
+                self._exit = None
         return self
 
     def __exit__(self, *exc_info) -> bool:
@@ -741,13 +756,19 @@ def _resolve_llm_scope(db, task: Task):
     """
     from app.llm import credentials as _creds
 
+    _ci_model = (
+        (settings.LLM_CI_MODEL or "").strip()
+        if (task.trigger_type or "") == "ci"
+        else ""
+    )
+
     if task.owner_id is None:
         if settings.ENV.strip().lower() == "prod":
             return {
                 "error": "no owning user for this task; refusing environment LLM credential",
                 "reason": "no_owner_in_prod",
             }
-        return _LLMScope(provider="environment", model="")
+        return _LLMScope(provider="environment", model=_ci_model)
     try:
         provider = _creds.default_provider_for_user(db, user_id=task.owner_id)
         if not provider:
@@ -778,7 +799,12 @@ def _resolve_llm_scope(db, task: Task):
         _sandbox.register_secret(secret)  # defense-in-depth redaction
     except Exception:
         pass
-    return _LLMScope(provider=provider, model=model, base_url=base, secret=secret)
+    return _LLMScope(
+        provider=provider,
+        model=_ci_model or model,
+        base_url=base,
+        secret=secret,
+    )
 
 
 def _record_llm_usage(
@@ -1293,23 +1319,42 @@ def run_task_inline(
         # --- CI failure evidence (the trigger is the ground truth) ---
         ci_info = ""
         if task.trigger_type == "ci":
-            # The webhook already attaches a bounded failing-log excerpt when
-            # available. Fetch a second copy only for older/partial tasks that
-            # do not contain one; duplicating the same log nearly doubles the
-            # fixed context on every provider request.
-            excerpt = (task.ci_excerpt or "")[:2500]
-            ci_info = (
-                f"workflow={task.ci_workflow} job={task.ci_job} sha={task.ci_sha} "
-                f"run={task.ci_url}\nexcerpt:\n{excerpt}"
-            )
-            if "--- failing logs ---" not in (task.ci_excerpt or "").lower():
-                ci_info += _enrich_ci_logs(
+            from app.agent import context as _ctxmod
+
+            excerpt = task.ci_excerpt or ""
+            has_signal = _ctxmod.has_failure_signal(excerpt)
+            # Webhook tasks carry only a one-line summary now (and older tasks
+            # may carry metadata-only "logs"). Fetch the real failing-log tail
+            # worker-side so the agent starts with the exact error instead of
+            # re-reading the workflow to guess. Deterministic, bounded.
+            if not has_signal:
+                tail = _enrich_ci_logs(
                     repository=task.repository,
                     installation_id=installation_id,
                     run_id=task.ci_run_id,
                     job_name=task.ci_job or task.ci_workflow,
                     check_url=task.ci_url,
-                )[:4000]
+                )
+                if tail:
+                    excerpt = f"{excerpt}\n{tail}" if excerpt else tail.lstrip("\n")
+                    task.ci_excerpt = excerpt
+                    has_signal = _ctxmod.has_failure_signal(excerpt)
+                    db.commit()
+            ci_info = (
+                f"workflow={task.ci_workflow} job={task.ci_job} sha={task.ci_sha} "
+                f"run={task.ci_url}\nexcerpt:\n{_ctxmod.clip_logs(excerpt, 6000)}"
+            )
+            _event(
+                db,
+                task.id,
+                "CI_EVIDENCE",
+                {
+                    "has_logs": has_signal,
+                    "has_workflow": bool(task.ci_workflow),
+                    "signal": _ctxmod.failure_signal(excerpt)[:300],
+                },
+            )
+            db.commit()
 
         # --- agent (tool events persisted live so progress is visible
         # immediately and survives a mid-run crash) ---
