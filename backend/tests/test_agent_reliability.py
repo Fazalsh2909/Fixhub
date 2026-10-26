@@ -188,8 +188,8 @@ def test_i_service_loads_ci_context_event(db, tmp_path):
 def test_prompt_states_env_setup_discipline():
     from app.agent import prompt as _prompt
 
-    for needle in ("already done (ruff, mypy, pytest preinstalled)",
-                   "pinned tool versions", "validation gates re-check"):
+    for needle in ("ruff, mypy, and pytest are available",
+                   "pinned tool versions", "validation gates before publishing"):
         assert needle in _prompt.SYSTEM_PROMPT
 
 

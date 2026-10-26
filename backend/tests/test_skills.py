@@ -78,7 +78,8 @@ def test_registry_ci_selects_fix_ci_cd():
     s = _skills.resolve_skill("ci")
     assert s.name == "fix-ci-cd"
     prompt = _skills.skill_prompt(s)
-    assert "MAKE CI APPEAR GREEN" in prompt or "APPEAR GREEN" in prompt
+    assert "not to make the run report success" in prompt
+    assert "continue-on-error" in prompt
 
 
 def test_registry_unknown_raises():

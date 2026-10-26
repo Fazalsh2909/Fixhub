@@ -299,7 +299,7 @@ def test_task_message_keeps_full_workflow_and_signal():
         ),
     )
     msg = _ctx.build_task_message(ctx)
-    assert "PRIMARY FAILURE SIGNAL" in msg
+    assert "Failure signal:" in msg
     assert "FAILED tests/test_x.py::test_y" in msg
     # The tail of the workflow must survive (it used to be cut at 1000 chars).
     assert "backend:" in msg

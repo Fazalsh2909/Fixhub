@@ -355,15 +355,14 @@ class InvestigationTracker:
         self.phase = nxt
 
 
-_GATED_ERROR_PREFIX = "ERROR: BLOCKED — investigation incomplete"
 _PROHIBITED_PREFIX = "ERROR: PROHIBITED"
 
 
 def gated_write_error(skill: str, missing: str) -> str:
     return (
-        f"{_GATED_ERROR_PREFIX} for skill '{skill}'. Need: {missing}. "
-        "Do: read/list/search relevant files first (reproduction via run_command "
-        "preferred when practical), then retry the write/edit."
+        f"Edit not applied: the investigation gate for '{skill}' needs: {missing}. "
+        "Reading or searching the relevant files (or reproducing the failure) "
+        "satisfies it; then retry the edit."
     )
 
 

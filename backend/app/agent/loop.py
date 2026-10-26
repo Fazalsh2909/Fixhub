@@ -389,11 +389,11 @@ def run_agent(
                     {
                         "role": "user",
                         "content": (
-                            f"BUDGET CRITICAL: {int(_frac * 100)}% of this task's "
-                            "budget is spent. Stop all exploration. Make the smallest "
-                            "fix you are confident in now with edit_file/write_file, "
-                            "then run one focused check. If you cannot fix it, say "
-                            "exactly what blocks you - do not read another file."
+                            f"Budget: {int(_frac * 100)}% of this task is spent. "
+                            "The smallest fix you are confident in, followed by "
+                            "one focused check, is the best use of what remains. "
+                            "If the task cannot be completed, reporting what "
+                            "blocks it is useful."
                         ),
                     }
                 )
@@ -411,11 +411,10 @@ def run_agent(
                     {
                         "role": "user",
                         "content": (
-                            f"BUDGET: {int(_frac * 100)}% of this task's budget is "
-                            "spent. You already have the evidence in this "
-                            "conversation. Converge: stop reading and make the fix "
-                            "with edit_file/write_file, or state the single missing "
-                            "fact you need in one command."
+                            f"Budget: {int(_frac * 100)}% of this task is spent. "
+                            "The conversation already contains the evidence. A "
+                            "fix, or one command that reproduces the failure, is "
+                            "more useful now than further reading."
                         ),
                     }
                 )
@@ -442,11 +441,9 @@ def run_agent(
                     {
                         "role": "user",
                         "content": (
-                            "You have not modified any file yet. The task requires changing "
-                            "the repository (add/fix code or tests) and verifying with a "
-                            "command. Continue working with tool calls now — do not "
-                            "summarize until changes exist, or explain with evidence why "
-                            "no change is needed."
+                            "No file has changed yet. If this task needs a "
+                            "repository change, continue with tool calls; if no "
+                            "change is needed, explain why with evidence."
                         ),
                     }
                 )
@@ -619,10 +616,11 @@ def run_agent(
                     and rrec["count"] >= MAX_READS_PER_PATH
                 ):
                     note = (
-                        f"ALREADY READ: {read_path} (read {rrec['count']}x, workspace "
-                        f"unchanged since). Cached digest: {rrec['digest']}. Do not "
-                        "read it again — use the content you already have, edit a "
-                        "file, or run a diagnostic."
+                        f"Read skipped: {read_path} was already read "
+                        f"{rrec['count']}x and the workspace is unchanged since "
+                        f"(digest {rrec['digest']}). The earlier content is still "
+                        "in the conversation; the file has no new information to "
+                        "return."
                     )
                     _emit(
                         {
@@ -659,10 +657,11 @@ def run_agent(
                 and post_diag_reads >= MAX_POST_DIAGNOSIS_READS
             ):
                 msg = (
-                    f"READ BUDGET EXHAUSTED: {post_diag_reads} read-only calls since "
-                    "diagnosis. You already have the evidence. Your next action MUST "
-                    "be an edit_file/write_file that fixes the cause, or a command "
-                    "that reproduces the failure. Do not read another file."
+                    f"Read skipped: the post-diagnosis read budget "
+                    f"({post_diag_reads} calls) is used and the workspace is "
+                    "unchanged. The failure evidence is already in the "
+                    "conversation; an edit or a command that reproduces the "
+                    "failure would produce new information."
                 )
                 _emit(
                     {
@@ -721,10 +720,10 @@ def run_agent(
                 ):
                     # Third identical failure: block and force a strategy change.
                     msg = (
-                        "Previous action failed and repeating it is not allowed. "
-                        "Choose a different diagnostic or implementation strategy: "
-                        "inspect the directory structure, try another path, or run a "
-                        "different command. Do not issue this exact call again."
+                        "This exact call already failed and was not repeated. "
+                        "The previous result is still in the conversation. A "
+                        "different diagnostic, path, or edit would produce new "
+                        "information."
                     )
                     _emit(
                         {
@@ -973,11 +972,10 @@ def run_agent(
                     {
                         "role": "user",
                         "content": (
-                            "STOP INVESTIGATING. This turn produced no new evidence: "
-                            "you repeated information already in this conversation. "
-                            "Your next message MUST contain an edit_file/write_file "
-                            "that fixes the failure, or a single command that "
-                            "reproduces it. Do not read the same file again."
+                            "This turn added no new evidence; it repeated "
+                            "information already in the conversation. Making the "
+                            "fix, or running one command that reproduces the "
+                            "failure, would move the task forward."
                         ),
                     }
                 )
@@ -1390,47 +1388,47 @@ def _first_error_line(text: str) -> str:
 
 
 def _command_failure_directive(meta: dict, result: str) -> str:
-    """Hard directive after a non-zero command: change strategy, do not retry."""
+    """Neutral observation after a non-zero command: the retry is blocked."""
     code = meta.get("exit_code")
     status = "timed out" if meta.get("timed_out") else f"exit {code}"
     detail = _first_error_line(result)
     return (
-        f"COMMAND FAILED ({status})"
+        f"Command failed ({status})"
         + (f": {detail}" if detail else "")
-        + ". This is failure evidence, not progress toward a fix. The next "
-        "action MUST be an edit_file/write_file that fixes the cause, or a "
-        "different command that isolates it. Do NOT repeat this command."
+        + ". The output above is evidence; the identical command will not be "
+        "repeated. A different diagnostic, or an edit that addresses the cause, "
+        "would produce new information."
     )
 
 
 def _edit_failure_directive(result: str, args: dict, *, not_found: int = 0) -> str:
-    """Hard directive after a rejected edit: recover the exact text, then retry."""
+    """Neutral observation after a rejected edit, with recovery guidance."""
     path = str((args or {}).get("path", ""))[:200]
     detail = " ".join(str(result or "").split())[:300]
     if "oldString not found" in result:
         if not_found >= MAX_TARGET_NOT_FOUND:
             return (
-                f"EDIT FAILED: that exact text is not present in {path} "
-                f"({not_found} attempts). The file was NOT changed. Stop "
+                f"Edit rejected: that exact text is not present in {path} "
+                f"({not_found} attempts). The file is unchanged. Stop "
                 "retrying it. Search the file for the code you intend to "
                 "change, or re-read the region, and edit text that actually "
                 "exists. If you expected this text from the CI workflow, the "
                 "workspace revision may differ from the failing run."
             )
         return (
-            f"EDIT FAILED: oldString not found in {path}. The file was NOT "
-            "changed. Re-read the exact section (one repair read is allowed) "
+            f"Edit rejected: oldString not found in {path}. The file is "
+            "unchanged. Re-read the exact section (one repair read is allowed) "
             "and retry with the exact text, including indentation. Do not guess "
             "or repeat the same oldString."
         )
     if "matches multiple locations" in result:
         return (
-            f"EDIT FAILED: oldString matches multiple locations in {path}. The "
-            "file was NOT changed. Add more surrounding context so the match is "
-            "unique, then retry."
+            f"Edit rejected: oldString matches multiple locations in {path}. "
+            "The file is unchanged. Add more surrounding context so the match "
+            "is unique, then retry."
         )
     return (
-        f"EDIT FAILED for {path}: {detail}. The file was NOT changed. Fix the "
+        f"Edit rejected for {path}: {detail}. The file is unchanged. Fix the "
         "cause and retry; do not repeat the same edit."
     )
 

@@ -7,7 +7,7 @@ agent read for 15 calls and never edited.
 
 These tests pin the four fixes:
 1. metadata-only excerpts are not failure evidence;
-2. check_run task messages carry the workflow and demand action;
+2. check_run task messages carry the workflow and the failure signal;
 3. a non-zero command is a failure and cannot be repeated;
 4. after diagnosis a CI run gets two reads, then must edit.
 """
@@ -43,7 +43,7 @@ def test_metadata_only_excerpt_is_not_failure_evidence():
     assert _ctx.has_failure_signal("Would reformat: apps/api/app/main.py")
 
 
-def test_ci_task_message_demands_action_when_signal_is_supplied():
+def test_ci_task_message_supplies_evidence_without_nagging():
     ctx = _ctx.TaskContext(
         repository="acme/r",
         trigger_type="ci",
@@ -59,9 +59,11 @@ def test_ci_task_message_demands_action_when_signal_is_supplied():
         ),
     )
     msg = _ctx.build_task_message(ctx)
-    assert "Do NOT read the workflow file" in msg
-    assert "read it from the repo first" not in msg
+    assert "Failure signal:" in msg
     assert "Could not find a version" in msg
+    assert "Workflow content:" in msg
+    # Evidence is supplied; the prompt does not forbid inspecting it.
+    assert "Do NOT read the workflow file" not in msg
 
 
 def test_ci_task_message_without_logs_asks_for_reproduction():
@@ -71,8 +73,8 @@ def test_ci_task_message_without_logs_asks_for_reproduction():
         ci=_ctx.CIContext(job="backend", workflow_content="name: CI\n"),
     )
     msg = _ctx.build_task_message(ctx)
-    assert "reproduce the failing command first" in msg
-    assert "read it from the repo first" not in msg
+    assert "reproduce the failing step" in msg
+    assert "not captured" in msg
 
 
 def test_failing_logs_excerpt_returns_real_log_text(monkeypatch):

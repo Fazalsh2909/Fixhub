@@ -186,44 +186,23 @@ def build_task_message(ctx: TaskContext) -> str:
         signal = failure_signal(ci.failure_logs)
         has_signal = has_failure_signal(ci.failure_logs)
         if signal:
-            next_action = (
-                "NEXT ACTION: the failure evidence is already above. Do NOT read "
-                "the workflow file. Open the file named in the signal and fix the "
-                "cause with edit_file; reproduce with one command only if the "
-                "signal is ambiguous."
-            )
+            signal_value = signal
         elif has_signal:
-            next_action = (
-                "NEXT ACTION: a failure log is supplied above. Do NOT read the "
-                "workflow file. Identify the failing file from the log and fix it."
-            )
+            signal_value = "(log supplied — see Failure below)"
         else:
-            next_action = (
-                "NEXT ACTION: no failure log was captured. Reproduce the failing "
-                "step with ONE command derived from the workflow content, then fix "
-                "the cause. Do not explore the repository."
+            signal_value = (
+                "(not captured — reproduce the failing step with one command "
+                "derived from the workflow content)"
             )
         block = "\n".join(
             line for line in [
-                "CI FAILURE — determine the root cause of this failure. Do not broadly explore.",
-                "PRIMARY FAILURE SIGNAL: "
-                + (
-                    signal
-                    or (
-                        "(log supplied — see Failure below)"
-                        if has_signal
-                        else "(not captured — reproduce the failing command first)"
-                    )
-                ),
-                next_action,
-                "Start with the files named under Changed files / in the failure output.",
+                "CI FAILURE",
+                f"Failure signal: {signal_value}",
+                "Determine the root cause from this evidence and repair it.",
+                "Start with the files named in the failure output or under Changed files.",
                 f"Provider: {ci.provider}",
                 f"Workflow: {ci.workflow_name}",
-                f"Workflow file: "
-                + (
-                    ci.workflow_file
-                    or "(not supplied — read it only if the failure signal points there)"
-                ),
+                "Workflow file: " + (ci.workflow_file or "(not supplied)"),
                 f"Run ID: {ci.run_id}",
                 f"Commit: {ci.commit_sha}",
                 f"Branch: {ci.branch}",
