@@ -82,6 +82,9 @@ _SCHEMA_PATCHES = {
         ("claimed_at", "TIMESTAMP"),
         ("lease_expires_at", "TIMESTAMP"),
         ("queue_job_id", "VARCHAR(128) NOT NULL DEFAULT ''"),
+        # Phase 6: one task per external event (CI dedupe). The unique index is
+        # created below; a bare column is safe because existing rows are NULL.
+        ("dedupe_key", "VARCHAR(512)"),
     ],
     "repositories": [
         ("owner_id", "INTEGER REFERENCES users(id)"),
@@ -126,6 +129,21 @@ def ensure_columns() -> None:
                             f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {ddl}"
                         )
                     )
+
+    # Indexes are not expressible as column patches. Keep pre-existing dev
+    # databases aligned with the Alembic migration (production never gets here).
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                _text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_tasks_dedupe_key "
+                    "ON tasks (dedupe_key)"
+                )
+            )
+    except Exception:
+        # Duplicate legacy values would block the index; production is handled
+        # by Alembic, and dev can rebuild the SQLite file.
+        pass
 
 
 def get_db():

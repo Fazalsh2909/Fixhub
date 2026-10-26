@@ -104,7 +104,14 @@ export default function App() {
   const [installed, setInstalled] = useState<InstallationGroup[]>([]);
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [taskId, setTaskId] = useState<number | null>(null);
-  const [queue, setQueue] = useState<{ ok: boolean; count?: number; error?: string }>({ ok: false });
+  const [queue, setQueue] = useState<{
+    ok: boolean;
+    count?: number;
+    workers?: number;
+    db_queued?: number;
+    db_queued_stale?: number;
+    error?: string;
+  }>({ ok: false });
   const [center, setCenter] = useState<CenterTab>("code");
   const [diffKey, setDiffKey] = useState(0);
   const [connFull, setConnFull] = useState("");
@@ -124,6 +131,18 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
 
   const task = tasks.find((t) => t.id === taskId) || null;
+
+  // A reachable Redis is not a working queue: with zero live RQ workers every
+  // new task sits in QUEUED forever. workers === -1 means introspection failed
+  // (unknown), so only an explicit 0 is treated as offline.
+  const workerOnline = queue.ok && queue.workers !== 0;
+  const queueDetail = !queue.ok
+    ? "Queue unreachable — check Redis and the worker service"
+    : queue.workers === 0
+      ? "Queue reachable but no worker is consuming jobs — tasks stay QUEUED"
+      : `Worker connected${queue.count != null ? ` · ${queue.count} queued` : ""}${
+          queue.db_queued_stale ? ` · ${queue.db_queued_stale} stale` : ""
+        }`;
 
   // Human label for a task's origin: issue-triggered tasks show their GitHub
   // issue number, everything else shows trigger + task id (never "ISSUE" for CI).
@@ -201,8 +220,15 @@ export default function App() {
     try {
       const created = await api.fromIssue(repo, num);
       setTaskId(created.task_id);
-      await api.runTask(created.task_id);
-      setMsg(`Task #${created.task_id} queued — watch the agent panel`);
+      if (created.duplicate) {
+        setMsg(`Task #${created.task_id} already exists — opened it`);
+      } else if (created.queued === false) {
+        setMsg(
+          `Task #${created.task_id} created but not started: ${created.error ?? "queue unavailable"}`,
+        );
+      } else {
+        setMsg(`Task #${created.task_id} started — watch the agent panel`);
+      }
       loadAll();
     } catch (e) { setMsg(e instanceof Error ? e.message : "fix failed"); }
     setFixing(null);
@@ -275,9 +301,9 @@ export default function App() {
         </div>
         <div className="header-context">
           <span className="repo-context">{task ? (task.branch ? <><GitBranch size={14} /> {task.branch}</> : `Task #${task.id}`) : "No task selected"}</span>
-          <span className="header-status" role="status" aria-live="polite" title={queue.ok ? `Worker connected${queue.count != null ? ` · ${queue.count} queued` : ""}` : "Worker offline — runs queue locally"}>
-            <span className={`worker-dot ${queue.ok ? "online" : ""}`} />
-            <span>{queue.ok ? "Agent online" : "Worker offline"}</span>
+          <span className="header-status" role="status" aria-live="polite" title={queueDetail}>
+            <span className={`worker-dot ${workerOnline ? "online" : ""}`} />
+            <span>{workerOnline ? "Agent online" : "Worker offline"}</span>
           </span>
         </div>
         <div className="header-actions">
@@ -400,7 +426,7 @@ export default function App() {
             <>
               <SectionLabel>Connection</SectionLabel>              <Card className="settings-card">
                 <div className="kv-row"><span>Backend</span><span className="muted">{window.location.origin}</span></div>
-                <div className="kv-row"><span>Worker</span><span className={queue.ok ? "kv-ok" : "kv-bad"}>{queue.ok ? `connected${queue.count != null ? ` · ${queue.count} queued` : ""}` : "offline"}</span></div>
+                <div className="kv-row"><span>Worker</span><span className={workerOnline ? "kv-ok" : "kv-bad"}>{workerOnline ? `connected${queue.count != null ? ` · ${queue.count} queued` : ""}${queue.db_queued_stale ? ` · ${queue.db_queued_stale} stale` : ""}` : queue.ok ? "redis up, no worker" : "offline"}</span></div>
                 <div className="kv-row"><span>Tasks</span><span className="muted">{tasks.length}</span></div>
                 <div className="kv-row"><span>Repositories</span><span className="muted">{installed.reduce((n, g) => n + g.repos.length, 0)}</span></div>
               </Card>

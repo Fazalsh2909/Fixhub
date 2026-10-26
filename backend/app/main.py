@@ -58,6 +58,7 @@ def _create_tables() -> None:
     _sweep_stale_running_tasks()
     _start_ci_watcher()
     _start_recovery_sweep()
+    _start_queued_reconciler()
 
 
 def _enforce_production_guards() -> None:
@@ -170,6 +171,9 @@ _recovery_started = False
 
 
 _watcher_started = False
+
+# Phase 6: retries orphaned QUEUED tasks (Redis restart, crash, webhook timeout).
+_queued_reconciler_started = False
 
 
 # Phase 4: set on shutdown so daemon ticks stop scheduling new passes.
@@ -316,6 +320,51 @@ def _start_recovery_sweep() -> None:
                 pass
 
     threading.Thread(target=_tick, daemon=True, name="recovery-sweep").start()
+
+
+def _reconcile_queued_tasks() -> None:
+    """One reconciler tick. Never raises."""
+    try:
+        import logging
+
+        from app.tasks import reconciler as _reconciler
+
+        out = _reconciler.requeue_orphaned()
+        if not out.get("ok", True):
+            logging.getLogger("fixhub.reconciler").warning(
+                "queued reconciler unavailable: %s", out.get("error", "unknown")
+            )
+        elif out.get("requeued") or out.get("failed"):
+            logging.getLogger("fixhub.reconciler").info(
+                "queued reconciler requeued=%s skipped=%s failed=%s",
+                out.get("requeued"),
+                out.get("skipped"),
+                out.get("failed"),
+            )
+    except Exception:
+        pass
+
+
+def _start_queued_reconciler() -> None:
+    """Re-enqueue orphaned QUEUED tasks every 60s (startup tick included)."""
+    global _queued_reconciler_started
+    if _queued_reconciler_started:
+        return
+    _queued_reconciler_started = True
+
+    import threading
+    import time as _time
+
+    _reconcile_queued_tasks()
+
+    def _tick() -> None:
+        while True:
+            _time.sleep(60)
+            if _shutdown is not None and _shutdown.is_set():
+                return
+            _reconcile_queued_tasks()
+
+    threading.Thread(target=_tick, daemon=True, name="queued-reconciler").start()
 
 
 @app.get("/health")
@@ -720,6 +769,23 @@ def create_task_from_issue(
     row = require_owned_repository_by_name(full_name, user, db)
     if not row.installation_id:
         raise HTTPException(status_code=400, detail=f"{full_name} is not connected")
+    from app.github.webhook import _active_issue_task, _start_task
+
+    dup = _active_issue_task(db, repo_name=full_name, number=number)
+    if dup is not None:
+        out = {
+            "task_id": dup.id,
+            "queued": dup.status in ("QUEUED", "RUNNING", "AWAITING_CI"),
+            "duplicate": "active_task",
+        }
+        if dup.status == "QUEUED":
+            # Make the Fix button immediate even when the original enqueue was
+            # lost (Redis restart/crash); the reconciler also covers this.
+            started = _start_task(db, dup.id)
+            out["queued"] = bool(started.get("enqueued"))
+            if not out["queued"]:
+                out["error"] = str(started.get("error") or "queue unavailable")[:300]
+        return out
     try:
         token = _app_auth.installation_token(row.installation_id)
         issue = _gh.get_issue(token=token, full_name=full_name, number=number)
@@ -751,7 +817,11 @@ def create_task_from_issue(
         )
     )
     db.commit()
-    return {"task_id": task.id}
+    queue = _start_task(db, task.id)
+    out = {"task_id": task.id, "queued": bool(queue.get("enqueued"))}
+    if not queue.get("enqueued"):
+        out["error"] = str(queue.get("error") or "queue unavailable")[:300]
+    return out
 
 
 @app.get("/api/tasks")
@@ -838,6 +908,56 @@ def queue_health(user: User = Depends(require_admin)) -> dict:
     from app.tasks import queue as _queue
 
     return _queue.queue_health()
+
+
+@app.post("/api/tasks/cancel-unconnected")
+def cancel_unconnected_tasks(
+    request: Request,
+    user: User = Depends(require_admin),
+    db: Session = Depends(_db),
+) -> dict:
+    """Cancel QUEUED tasks whose repository is not connected in FixHub.
+
+    Cleanup for rows created before the connected-repo guard, when an
+    account-wide GitHub App installation was mistaken for opt-in consent. Only
+    QUEUED rows are touched; running work is never killed by this endpoint.
+    """
+    import json as _json
+
+    from app.db.models import TaskEvent
+
+    require_csrf(request)
+    connected = {
+        name
+        for (name,) in (
+            db.query(Repository.github_full_name)
+            .filter(Repository.installation_id != "")
+            .all()
+        )
+    }
+    rows = (
+        db.query(Task)
+        .filter(Task.status == "QUEUED", Task.cancel_requested == 0)
+        .order_by(Task.id.asc())
+        .all()
+    )
+    ids: list[int] = []
+    for t in rows:
+        if t.repository in connected:
+            continue
+        t.status = "CANCELLED"
+        t.cancel_requested = 1
+        t.error = "repository not connected in FixHub; task cancelled"[:1000]
+        db.add(
+            TaskEvent(
+                task_id=t.id,
+                type="CANCELLED",
+                data_json=_json.dumps({"reason": "repository_not_connected"})[:4000],
+            )
+        )
+        ids.append(t.id)
+    db.commit()
+    return {"cancelled": len(ids), "task_ids": ids}
 
 
 @app.post("/api/tasks/{task_id}/cleanup")

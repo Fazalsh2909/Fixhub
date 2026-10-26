@@ -359,7 +359,7 @@ def test_pg_duplicate_delivery_single_task(pgdb, monkeypatch):
 
     from fastapi.testclient import TestClient
 
-    from app.db.models import GitHubConnection, Task
+    from app.db.models import GitHubConnection, Repository, Task
     from app.main import app
 
     from app.config import settings as _settings
@@ -367,6 +367,11 @@ def test_pg_duplicate_delivery_single_task(pgdb, monkeypatch):
     monkeypatch.setattr(_settings, "GITHUB_WEBHOOK_SECRET", "test-secret")
     u = _user(pgdb, "pgw@example.com")
     pgdb.add(GitHubConnection(user_id=u.id, installation_id="4242"))
+    pgdb.add(
+        Repository(
+            github_full_name="acme/pgw", installation_id="4242", owner_id=u.id
+        )
+    )
     pgdb.commit()
 
     payload = {
@@ -409,7 +414,7 @@ def test_pg_same_issue_twice_one_task(pgdb, monkeypatch):
 
     from fastapi.testclient import TestClient
 
-    from app.db.models import GitHubConnection, Task
+    from app.db.models import GitHubConnection, Repository, Task
     from app.main import app
 
     from app.config import settings as _settings
@@ -417,6 +422,11 @@ def test_pg_same_issue_twice_one_task(pgdb, monkeypatch):
     monkeypatch.setattr(_settings, "GITHUB_WEBHOOK_SECRET", "test-secret")
     u = _user(pgdb, "pgw2@example.com")
     pgdb.add(GitHubConnection(user_id=u.id, installation_id="4343"))
+    pgdb.add(
+        Repository(
+            github_full_name="acme/pgw2", installation_id="4343", owner_id=u.id
+        )
+    )
     pgdb.commit()
     c = TestClient(app)
     for i, delivery in enumerate(("pg-d-2a", "pg-d-2b")):

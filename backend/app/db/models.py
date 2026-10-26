@@ -66,6 +66,10 @@ class Task(Base):
     ci_job: Mapped[str] = mapped_column(String(255), default="")
     ci_url: Mapped[str] = mapped_column(String(512), default="")
     ci_excerpt: Mapped[str] = mapped_column(Text, default="")
+    # Phase 6: one task per external event. CI uses `ci:<owner/repo>:<sha>`;
+    # issue tasks stay NULL (deduped by the active-task check instead). The
+    # unique index is the arbiter against concurrent webhook deliveries.
+    dedupe_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # Phase 4: QUEUED birth + atomic worker claim (QUEUED -> RUNNING).
     # Lifecycle: QUEUED -> RUNNING -> COMPLETED|FAILED|BLOCKED|NEEDS_REVIEW|CANCELLED|AWAITING_CI;
     # AWAITING_CI -> COMPLETED | RUNNING (repair) | FAILED.
@@ -106,6 +110,7 @@ class Task(Base):
         Index("ix_tasks_status_updated", "status", "updated_at"),
         Index("ix_tasks_owner_status", "owner_id", "status"),
         Index("ix_tasks_repo_status", "repository", "status"),
+        Index("ix_tasks_dedupe_key", "dedupe_key", unique=True),
     )
 
 

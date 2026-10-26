@@ -28,18 +28,22 @@ flowchart TB
 ### Webhook (`backend/app/github/webhook.py`)
 
 - Verifies `X-Hub-Signature-256` (`sha256=` HMAC with `GITHUB_WEBHOOK_SECRET`), rejects missing delivery IDs, records `webhook_deliveries` to ignore redeliveries.
+- **Connected repositories only**: a task is created only when `repositories.installation_id` is set via `POST /api/repositories/connect`. GitHub App installations are account-wide, so an App webhook for an unconnected repo is ignored (`repository_not_connected`) and repo rows are never auto-created.
 - `issues`: only `opened`/`reopened` create tasks. Optional `fixhub-fix` label is read but not required.
-- `workflow_run`: only `completed` + `failure` creates tasks. `check_run`: only `completed` + `failure`.
-- Duplicate CI deliveries for an already-`RUNNING` same repo+sha+job reuse the active task (`duplicate: active_task`).
+- `workflow_run`: only `completed` runs whose conclusion is a break (`failure`/`timed_out`/`startup_failure`) create tasks. `check_run` is opt-in (`CI_TRIGGER_EVENTS`) because it fires per job; when enabled, only GitHub Actions checks are accepted by default (`CI_ACTIONS_CHECKS_ONLY`).
+- Trigger policy: `CI_WORKFLOW_ALLOWLIST`, `CI_BRANCH_POLICY` (`all`/`default_only`/`allowlist`), and `CI_IGNORE_BRANCH_PREFIXES` (default `fixhub-fixes/`, repaired by the CI watcher on the existing task).
+- One CI task per commit: `tasks.dedupe_key = ci:<owner/repo>:<head_sha>` plus a unique index. Concurrent or replayed deliveries return the existing task (`duplicate: dedupe_key`). Issue tasks keep `dedupe_key = NULL` and use the active-task check.
 - Builds structured CI context (`build_ci_context`: provider, workflow file/content, run ID, SHA, branch, job, step, annotations, changed files, URL) and persists `TASK_CREATED` + `CI_CONTEXT_LOADED` events.
-- Auto-enqueues via `_maybe_enqueue` when `AUTO_RUN_ON_WEBHOOK=1`; otherwise records `QUEUE_FAILED` and leaves the task for manual `/run`.
+- Every created task is enqueued immediately (`_start_task`). A failed enqueue writes `QUEUE_FAILED` + `task.error` instead of leaving a silent `QUEUED` row; the QUEUED reconciler retries once infrastructure recovers.
 
 ### Queue and worker (`backend/app/tasks/queue.py`, `worker.py`)
 
-- `enqueue_task(task_id)` and `enqueue_repair(task_id)` return `{enqueued, job_id?, error?}` and never raise. Missing/unreachable Redis returns `enqueued: False` so callers fall back to inline runs.
+- `enqueue_task(task_id)` and `enqueue_repair(task_id)` return `{enqueued, job_id?, error?}` and never raise. Missing/unreachable Redis returns `enqueued: False` so the caller records the failure.
+- Concurrency caps count only live execution (`RUNNING`, `AWAITING_CI`). `QUEUED` is backlog and must never block new work. A cap-limited creation records `QUEUE_WAITING` (not a failure) and is retried by the reconciler.
 - `run_task_job` / `run_repair_job` are the RQ entrypoints and must stay importable.
 - `job_failed` marks a still-`RUNNING` task `FAILED` with `job_crash` so jobs never wedge the queue.
-- `queue_health()` powers `GET /api/queue/health` and the frontend worker pill.
+- The QUEUED reconciler (`backend/app/tasks/reconciler.py`, 60s tick) re-enqueues orphaned `QUEUED` tasks for connected repos. Deterministic job IDs plus the DB claim CAS make it idempotent; terminal jobs are deleted first so RQ's dedupe cannot block the retry.
+- `queue_health()` powers `GET /api/queue/health` and the frontend worker pill (`count`, `workers`, `db_queued`, `db_queued_stale`).
 
 ### Task orchestration (`backend/app/tasks/service.py`)
 

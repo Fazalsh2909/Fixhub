@@ -188,9 +188,27 @@ class Settings(BaseSettings):
     # Phase 4.5 rotation: previous master key, accepted for decryption only
     # while stored credentials migrate. Never used for new encryptions.
     FIXHUB_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS: str = ""
-    # 1 = webhook auto-enqueues an agent run on issue/CI trigger.
-    # 0 = webhook only creates the Task; run via POST /api/tasks/{id}/run.
+    # Deprecated: kept only so existing .env files keep loading. Ignored at
+    # runtime — every created task is enqueued immediately (`_start_task`).
     AUTO_RUN_ON_WEBHOOK: int = 1
+    # ---- GitHub trigger policy -------------------------------------------
+    # Which webhook events may create a CI task. `workflow_run` fires once per
+    # completed workflow; `check_run` fires once per JOB (duplicates
+    # workflow_run), so it is opt-in.
+    CI_TRIGGER_EVENTS: str = "workflow_run"
+    # With check_run enabled, accept only GitHub Actions checks so third-party
+    # checks (Vercel, CodeQL, Dependabot, ...) never start agent runs.
+    CI_ACTIONS_CHECKS_ONLY: int = 1
+    # Optional comma-separated workflow names or paths (empty = all).
+    CI_WORKFLOW_ALLOWLIST: str = ""
+    # all | default_only | allowlist (CI_BRANCH_ALLOWLIST, comma-separated).
+    CI_BRANCH_POLICY: str = "all"
+    CI_BRANCH_ALLOWLIST: str = ""
+    # Branch prefixes that never create tasks. FixHub's own repair branches are
+    # handled by the CI watcher on the existing task, never as new work.
+    CI_IGNORE_BRANCH_PREFIXES: str = "fixhub-fixes/"
+    # Conclusions that count as a broken CI/CD pipeline.
+    CI_FAILURE_CONCLUSIONS: str = "failure,timed_out,startup_failure"
     # 1 = agent run commits+pushes+PRs immediately (legacy behaviour).
     # 0 = agent run stops at NEEDS_REVIEW; publish via POST /api/tasks/{id}/approve.
     AUTO_PUBLISH: int = 1

@@ -149,7 +149,10 @@ def test_ci_task_context_bounds_logs_and_keeps_workflow_visible():
         skill_instructions="CI discipline " * 500,
     )
     message = build_task_message(ctx)
-    assert len(message) <= 5500
+    # Bound = head + workflow 1000 + failure logs 3500 (c05ec8a) + three
+    # 250-char fields + skill 1000, plus labels/markers. The old 5500 ceiling
+    # predated the failure-log budget increase and could never pass.
+    assert len(message) <= 6500
     assert "Workflow content:" in message
     assert "UNIQUE_FAILURE_TAIL" in message
     assert "src/failing_module.py" in message

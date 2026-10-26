@@ -12,8 +12,8 @@ This README documents the **current implementation as frozen**. No deployed demo
 
 ## What FixHub does (demonstrated behavior)
 
-- Listens for `issues.opened/reopened` and failed `workflow_run` / `check_run` events on `POST /webhooks/github` (`backend/app/github/webhook.py`). Verifies `sha256=` HMAC, dedupes by delivery ID, creates a `Task` with status `RUNNING`.
-- Enqueues the run on RQ/Redis (`backend/app/tasks/queue.py`). When `AUTO_RUN_ON_WEBHOOK=0`, it only creates the task; run it via `POST /api/tasks/{id}/run`. `?sync=true` runs inline for tests and local dev without Redis.
+- Listens for `issues.opened/reopened` and broken `workflow_run` events on `POST /webhooks/github` (`backend/app/github/webhook.py`). Verifies `sha256=` HMAC, dedupes by delivery ID, and only acts on repositories explicitly connected in FixHub (`repositories.installation_id`). `check_run` is opt-in because it duplicates `workflow_run` per job.
+- Creates one task per failing commit (`tasks.dedupe_key = ci:<repo>:<sha>`, unique index) and one active task per issue. Every created task is enqueued immediately; a failed enqueue is recorded as `QUEUE_FAILED` on the task and retried by the 60s QUEUED reconciler. `?sync=true` on `/api/tasks/{id}/run` remains for tests and local dev without Redis.
 - Runs one attempt per task with no hidden retries (`backend/app/tasks/service.py:run_task_inline`). Fresh clone to `WORKSPACE_ROOT/task-{id}` → skill-selected agent loop → local gates → review → FixHub-owned git publish → PR.
 - The agent loop (`backend/app/agent/loop.py`) is bounded: 40 iterations, 900s runtime, 8 rewrites per path, duplicate/failure policy per tool call, user-cancel polling. Tools (8 total, `backend/app/agent/tools.py`): `list_directory`, `read_file`, `search_code`, `write_file`, `edit_file`, `run_command`, `git_status`, `git_diff`. All paths are repository-relative and jailed (`backend/app/agent/paths.py`); sensitive files (`.env`, `*.pem`, `*.key`, secrets/tokens/credentials) are blocked.
 - Commands run sandboxed (`backend/app/sandbox/sandbox.py`): fixed cwd inside the workspace, wall timeout, output cap, env scrub (`LLM_API_KEY`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`), secret redaction registry, destructive-pattern denylist, process-tree kill on timeout.
@@ -145,7 +145,8 @@ See `backend/.env.example` and `backend/app/config.py`. Key notes:
 - Budgets: `LLM_MAX_ITERATIONS=40`, `LLM_MAX_RUNTIME_S=900`, `JOB_TIMEOUT_S=1200`, `COMMAND_TIMEOUT_S=180`, `LLM_MAX_REWRITES_PER_PATH=8`, `LLM_HISTORY_GROUPS=12`.
 - `WORKSPACE_ROOT=/tmp/fixhub-workspaces` in Docker, `./workspaces` locally. `WORKSPACE_KEEP=0` removes task dirs after terminal states; `1` keeps for debugging.
 - `REDIS_URL=redis://redis:6379/0` in Docker, `redis://localhost:6379/0` locally. `QUEUE_NAME=fixhub`.
-- `AUTO_RUN_ON_WEBHOOK=1` auto-enqueues on webhooks; `AUTO_PUBLISH=1` publishes immediately, `0` stops at `NEEDS_REVIEW` for IDE approval.
+- `AUTO_PUBLISH=1` publishes immediately, `0` stops at `NEEDS_REVIEW` for IDE approval. `AUTO_RUN_ON_WEBHOOK` is deprecated and ignored: created tasks always enqueue.
+- CI trigger policy: `CI_TRIGGER_EVENTS=workflow_run` (add `,check_run` only if needed), `CI_ACTIONS_CHECKS_ONLY=1`, optional `CI_WORKFLOW_ALLOWLIST`, `CI_BRANCH_POLICY=all|default_only|allowlist`, and `CI_IGNORE_BRANCH_PREFIXES=fixhub-fixes/`.
 - Never commit `backend/.env`, `*.pem`, `*.key`, or `*.db` (all gitignored, see `.gitignore`).
 
 ## Project layout

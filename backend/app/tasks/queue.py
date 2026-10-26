@@ -48,7 +48,9 @@ def _concurrency_blocked(db, task) -> str:
     """
     from app.db.models import Task as _Task
 
-    live = ["QUEUED", "RUNNING", "AWAITING_CI"]
+    # QUEUED is backlog, not execution: counting it here let a stalled queue
+    # block every future enqueue (the exact "nothing ever starts" deadlock).
+    live = ["RUNNING", "AWAITING_CI"]
     if settings.MAX_RUNNING_TASKS_GLOBAL > 0:
         n = db.query(_Task).filter(_Task.status.in_(live)).count()
         if n >= settings.MAX_RUNNING_TASKS_GLOBAL:
@@ -268,16 +270,57 @@ def enqueue_task(
 
 
 def queue_health() -> dict[str, Any]:
-    """Health for GET /api/queue/health. Never raises."""
+    """Health for GET /api/queue/health. Never raises.
+
+    `workers` is the number of live RQ workers attached to this queue (0 = the
+    API can enqueue but nothing will ever run). `db_queued` is the number of
+    tasks waiting in QUEUED; `db_queued_stale` those older than the reconciler
+    grace window (should trend to 0 once the reconciler is running).
+    """
     q = get_queue()
     if q is None:
         return {"ok": False, "error": "redis unavailable", "queue": settings.QUEUE_NAME}
     try:
+        workers = -1
+        try:
+            from rq import Worker
+
+            workers = int(Worker.count(queue=q))
+        except Exception:
+            workers = -1
+        db_queued, stale = _db_queued_counts()
         return {
             "ok": True,
             "queue": settings.QUEUE_NAME,
             "count": len(q),
+            "workers": workers,
+            "db_queued": db_queued,
+            "db_queued_stale": stale,
             "redis_url": settings.REDIS_URL.split("@")[-1],
         }
     except Exception as exc:
         return {"ok": False, "error": str(exc)[:300], "queue": settings.QUEUE_NAME}
+
+
+def _db_queued_counts(stale_after_s: int = 60) -> tuple[int, int]:
+    """(QUEUED tasks, QUEUED older than the reconciler grace window)."""
+    try:
+        from datetime import timedelta
+
+        from app.db.database import SessionLocal, utcnow
+        from app.db.models import Task
+
+        s = SessionLocal()
+        try:
+            total = s.query(Task).filter(Task.status == "QUEUED").count()
+            cutoff = utcnow() - timedelta(seconds=stale_after_s)
+            stale = (
+                s.query(Task)
+                .filter(Task.status == "QUEUED", Task.created_at < cutoff)
+                .count()
+            )
+            return int(total), int(stale)
+        finally:
+            s.close()
+    except Exception:
+        return 0, 0

@@ -103,6 +103,11 @@ def test_cannot_claim_anothers_installation(db):
 def test_webhook_installation_creates_owned_task(db):
     ua = make_user(db, email="ge@example.com")
     db.add(GitHubConnection(user_id=ua.id, installation_id="4242"))
+    db.add(
+        Repository(
+            github_full_name="acme/hooked", installation_id="4242", owner_id=ua.id
+        )
+    )
     db.commit()
     c = TestClient(app)
     payload = {
@@ -140,7 +145,7 @@ def test_webhook_unknown_installation_creates_no_task(db):
     }
     r = _post_webhook(c, payload, "d-own-2")
     assert r.status_code == 200, r.text
-    assert r.json().get("ignored") == "unconnected_installation"
+    assert r.json().get("ignored") == "repository_not_connected"
     assert db.query(Task).filter(Task.issue_number == 12).count() == 0
 
 
@@ -161,7 +166,7 @@ def test_webhook_ci_unknown_installation_creates_no_task(db):
     }
     r = _post_webhook(c, payload, "d-own-3", event="workflow_run")
     assert r.status_code == 200, r.text
-    assert r.json().get("ignored") == "unconnected_installation"
+    assert r.json().get("ignored") == "repository_not_connected"
     assert db.query(Task).filter(Task.ci_run_id == "4243").count() == 0
 
 

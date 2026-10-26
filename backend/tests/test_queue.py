@@ -145,15 +145,23 @@ def _post_issue(c, delivery="q-1", number=21, installation_id=777):
     )
 
 
-def _queue_owner(db, email="q@example.com", installation_id=777):
+def _queue_owner(db, email="q@example.com", installation_id=777, repo="acme/queue"):
+    from app.db.models import Repository
+
     u = make_user(db, email=email)
     db.add(GitHubConnection(user_id=u.id, installation_id=str(installation_id)))
+    db.add(
+        Repository(
+            github_full_name=repo,
+            installation_id=str(installation_id),
+            owner_id=u.id,
+        )
+    )
     db.commit()
     return u
 
 
 def test_webhook_auto_enqueues(db, monkeypatch):
-    monkeypatch.setattr(_settings, "AUTO_RUN_ON_WEBHOOK", 1)
     monkeypatch.setattr(
         _queue, "enqueue_task", lambda task_id, **kw: {"enqueued": True, "job_id": "j1"}
     )
@@ -170,20 +178,168 @@ def test_webhook_auto_enqueues(db, monkeypatch):
     assert "QUEUED" in types
 
 
-def test_webhook_disabled_skips_enqueue(db, monkeypatch):
+def test_webhook_ignores_deprecated_auto_run_flag(db, monkeypatch):
+    """AUTO_RUN_ON_WEBHOOK=0 used to silently park tasks; creation always starts."""
     monkeypatch.setattr(_settings, "AUTO_RUN_ON_WEBHOOK", 0)
     called = {"n": 0}
 
     def fake_enqueue(task_id, **kw):
         called["n"] += 1
-        return {"enqueued": True}
+        return {"enqueued": True, "job_id": "j-off"}
 
     monkeypatch.setattr(_queue, "enqueue_task", fake_enqueue)
     _queue_owner(db, email="q2@example.com", installation_id=778)
     c = TestClient(app)
     r = _post_issue(c, delivery="q-off", number=32, installation_id=778)
     assert r.status_code == 200, r.text
+    assert r.json()["queued"] is True
+    assert called["n"] == 1
+
+
+def test_enqueue_failure_is_visible_on_task(db, monkeypatch):
+    monkeypatch.setattr(
+        _queue,
+        "enqueue_task",
+        lambda task_id, **kw: {"enqueued": False, "error": "redis unavailable"},
+    )
+    _queue_owner(db, email="q5@example.com", installation_id=779)
+    c = TestClient(app)
+    r = _post_issue(c, delivery="q-fail", number=33, installation_id=779)
     assert r.json()["queued"] is False
+    t = db.query(Task).filter(Task.issue_number == 33).first()
+    assert t is not None and "not started" in t.error
+    types = [
+        e.type for e in db.query(TaskEvent).filter(TaskEvent.task_id == t.id).all()
+    ]
+    assert "QUEUE_FAILED" in types
+
+
+def test_reconciler_requeues_orphaned_queued_task(db, monkeypatch):
+    from datetime import timedelta
+
+    from app.db.database import utcnow
+    from app.db.models import Repository
+    from app.tasks import reconciler as _rec
+
+    u = make_user(db, email="q6@example.com")
+    db.add(
+        Repository(
+            github_full_name="acme/queue", installation_id="780", owner_id=u.id
+        )
+    )
+    t = Task(
+        repository="acme/queue",
+        trigger_type="issue",
+        issue_number=50,
+        issue_title="t",
+        issue_body="b",
+        owner_id=u.id,
+        status="QUEUED",
+        created_at=utcnow() - timedelta(seconds=120),
+    )
+    db.add(t)
+    db.commit()
+
+    class _FakeQ:
+        def fetch_job(self, job_id):
+            return None
+
+    monkeypatch.setattr(_queue, "get_queue", lambda: _FakeQ())
+    monkeypatch.setattr(
+        _queue, "enqueue_task", lambda task_id, **kw: {"enqueued": True, "job_id": "j"}
+    )
+    out = _rec.requeue_orphaned()
+    assert out["requeued"] == 1
+    db.expire_all()
+    row = db.query(Task).filter(Task.id == t.id).first()
+    assert row.queue_job_id == "j"
+    assert (
+        db.query(TaskEvent)
+        .filter(TaskEvent.task_id == t.id, TaskEvent.type == "QUEUE_RETRIED")
+        .count()
+        == 1
+    )
+
+
+def test_reconciler_skips_unconnected_repo(db, monkeypatch):
+    from datetime import timedelta
+
+    from app.db.database import utcnow
+    from app.tasks import reconciler as _rec
+
+    t = Task(
+        repository="acme/never-connected",
+        trigger_type="ci",
+        ci_sha="orphan",
+        status="QUEUED",
+        created_at=utcnow() - timedelta(seconds=120),
+    )
+    db.add(t)
+    db.commit()
+    called = {"n": 0}
+
+    class _FakeQ:
+        def fetch_job(self, job_id):
+            return None
+
+    def fake_enqueue(task_id, **kw):
+        called["n"] += 1
+        return {"enqueued": True, "job_id": "j"}
+
+    monkeypatch.setattr(_queue, "get_queue", lambda: _FakeQ())
+    monkeypatch.setattr(_queue, "enqueue_task", fake_enqueue)
+    out = _rec.requeue_orphaned()
+    assert out["requeued"] == 0
+    assert called["n"] == 0
+    db.expire_all()
+    row = db.query(Task).filter(Task.id == t.id).first()
+    assert row.status == "QUEUED"
+
+
+def test_reconciler_skips_live_job(db, monkeypatch):
+    from datetime import timedelta
+
+    from app.db.database import utcnow
+    from app.db.models import Repository
+    from app.tasks import reconciler as _rec
+
+    u = make_user(db, email="q7@example.com")
+    db.add(
+        Repository(
+            github_full_name="acme/queue", installation_id="781", owner_id=u.id
+        )
+    )
+    t = Task(
+        repository="acme/queue",
+        trigger_type="issue",
+        issue_number=51,
+        issue_title="t",
+        issue_body="b",
+        owner_id=u.id,
+        status="QUEUED",
+        created_at=utcnow() - timedelta(seconds=120),
+    )
+    db.add(t)
+    db.commit()
+
+    class _LiveJob:
+        def get_status(self, refresh=False):
+            return "started"
+
+    class _FakeQ:
+        def fetch_job(self, job_id):
+            return _LiveJob()
+
+    called = {"n": 0}
+
+    def fake_enqueue(task_id, **kw):
+        called["n"] += 1
+        return {"enqueued": True, "job_id": "j"}
+
+    monkeypatch.setattr(_queue, "get_queue", lambda: _FakeQ())
+    monkeypatch.setattr(_queue, "enqueue_task", fake_enqueue)
+    out = _rec.requeue_orphaned()
+    assert out["requeued"] == 0
     assert called["n"] == 0
 
 
@@ -245,3 +401,59 @@ def test_run_endpoint_sync_falls_back_inline(db, monkeypatch):
     r = c.post(f"/api/tasks/{t.id}/run?sync=true", cookies=cookies)
     assert r.status_code == 200, r.text
     assert r.json()["sync"] is True
+
+
+def test_cancel_unconnected_only_touches_unconnected_queued(db):
+    """Legacy cleanup: cancel QUEUED rows for repos never connected in FixHub."""
+    from app.db.models import Repository
+
+    u = make_user(db, email="cleanup@example.com")
+    u.is_admin = 1
+    db.add(
+        Repository(
+            github_full_name="acme/connected", installation_id="900", owner_id=u.id
+        )
+    )
+    connected = Task(
+        repository="acme/connected",
+        trigger_type="ci",
+        ci_sha="c1",
+        status="QUEUED",
+        owner_id=u.id,
+    )
+    orphan = Task(
+        repository="acme/legacy",
+        trigger_type="ci",
+        ci_sha="l1",
+        status="QUEUED",
+        owner_id=u.id,
+    )
+    running_orphan = Task(
+        repository="acme/legacy",
+        trigger_type="ci",
+        ci_sha="l2",
+        status="RUNNING",
+        owner_id=u.id,
+    )
+    db.add_all([connected, orphan, running_orphan])
+    db.commit()
+
+    c = TestClient(app)
+    r = c.post("/api/tasks/cancel-unconnected", cookies=session_cookies(db, u))
+    assert r.status_code == 200, r.text
+    assert r.json()["cancelled"] == 1
+    assert r.json()["task_ids"] == [orphan.id]
+    db.expire_all()
+    assert db.query(Task).filter(Task.id == connected.id).first().status == "QUEUED"
+    assert db.query(Task).filter(Task.id == orphan.id).first().status == "CANCELLED"
+    # Running work is never killed by the cleanup endpoint.
+    assert (
+        db.query(Task).filter(Task.id == running_orphan.id).first().status == "RUNNING"
+    )
+
+
+def test_cancel_unconnected_requires_admin(db):
+    u = make_user(db, email="plain-cleanup@example.com")
+    c = TestClient(app)
+    r = c.post("/api/tasks/cancel-unconnected", cookies=session_cookies(db, u))
+    assert r.status_code == 403

@@ -1,7 +1,12 @@
 """GitHub webhook: signature verify + dedupe + issue/CI trigger -> Task.
 
-Events: issues.opened/reopened (+ optional `fixhub-fix` label gate),
-workflow_run.completed/failed, check_run.completed/failure.
+Events: issues.opened/reopened (+ optional `fixhub-fix` label gate) and
+workflow_run.completed failures. `check_run` is opt-in (CI_TRIGGER_EVENTS)
+because it fires per job and duplicates workflow_run.
+
+Only repositories explicitly connected in FixHub (`repositories.installation_id`
+set via POST /api/repositories/connect) may create tasks. Every created task is
+enqueued immediately; one CI task per (repository, head_sha).
 """
 
 from __future__ import annotations
@@ -9,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 
 from fastapi import APIRouter, Header, Request
 from sqlalchemy.orm import Session
@@ -18,6 +24,7 @@ from app.db.database import SessionLocal
 from app.db.models import Repository, Task, TaskEvent, WebhookDelivery
 
 router = APIRouter()
+log = logging.getLogger("fixhub.webhook")
 
 
 def verify_signature(secret: str, body: bytes, signature: str) -> bool:
@@ -228,52 +235,173 @@ def _pr_files_for_run(payload: dict, token: str, repo_name: str) -> list[str]:
         return []
 
 
-def _maybe_enqueue(db: Session, task_id: int) -> dict:
-    """Auto-enqueue when AUTO_RUN_ON_WEBHOOK=1. Never raises; records QUEUED/QUEUE_FAILED."""
-    if not settings.AUTO_RUN_ON_WEBHOOK:
-        return {"enqueued": False, "reason": "disabled"}
-    try:
-        from app.tasks import queue as _queue
-    except Exception:
-        return {"enqueued": False, "reason": "queue module unavailable"}
-    try:
-        out = _queue.enqueue_task(task_id)
-    except Exception as exc:
-        out = {"enqueued": False, "error": str(exc)[:200]}
-    try:
-        if out.get("enqueued"):
-            _event(db, task_id, "QUEUED", {"job": out.get("job_id", "")})
-        else:
-            _event(
-                db,
-                task_id,
-                "QUEUE_FAILED",
-                {"error": out.get("error", "unavailable")[:300]},
-            )
-        db.commit()
-    except Exception:
-        pass
+def _csv(value: str) -> list[str]:
+    return [part.strip() for part in (value or "").split(",") if part.strip()]
+
+
+def _ignored(event: str, reason: str, **fields) -> dict:
+    """Structured no-op response (visible in GitHub's Recent Deliveries body)."""
+    log.info(
+        "webhook ignored event=%s reason=%s %s",
+        event,
+        reason,
+        " ".join(f"{k}={v!r}" for k, v in fields.items()),
+    )
+    out = {"ok": True, "ignored": reason}
+    out.update({k: v for k, v in fields.items() if v not in (None, "")})
     return out
 
 
-def _active_ci_task(db: Session, *, repo_name: str, sha: str, job: str) -> Task | None:
-    """An already-live CI task for the same repo+sha+job.
+def _start_task(db: Session, task_id: int) -> dict:
+    """Enqueue immediately and make a failure visible on the task.
 
-    Covers QUEUED (not yet claimed), RUNNING, and AWAITING_CI (repair window):
-    creating another task for the same failure would just burn a second full
-    agent run for the same fix.
+    Triggered tasks always start. A cap/usage-limited task is backlog, not a
+    failure: it records `QUEUE_WAITING` and the reconciler retries when capacity
+    frees. Anything else (Redis down, worker missing) records `QUEUE_FAILED`
+    plus `task.error` instead of silently sitting in QUEUED. Never raises.
+    """
+    try:
+        from app.tasks import queue as _queue
+    except Exception:
+        out: dict = {"enqueued": False, "error": "queue module unavailable"}
+    else:
+        try:
+            out = _queue.enqueue_task(task_id)
+        except Exception as exc:  # defensive: enqueue_task promises never to raise
+            out = {"enqueued": False, "error": str(exc)[:200]}
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if out.get("enqueued"):
+            if task is not None:
+                task.queue_job_id = str(out.get("job_id") or "")[:128]
+                task.error = ""
+            _event(
+                db,
+                task_id,
+                "QUEUED",
+                {"job": out.get("job_id", ""), "duplicate": bool(out.get("duplicate"))},
+            )
+        else:
+            err = str(out.get("error") or "queue unavailable")[:1000]
+            if out.get("limited"):
+                if task is not None:
+                    task.error = ""
+                _event(db, task_id, "QUEUE_WAITING", {"reason": err[:300]})
+            else:
+                if task is not None:
+                    task.error = f"not started: {err}"[:1000]
+                _event(db, task_id, "QUEUE_FAILED", {"error": err[:300]})
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    return out
+
+
+def _ci_failure(run: dict) -> str:
+    """The run's failure conclusion, or "" when this run is not a break."""
+    allowed = {c.lower() for c in _csv(settings.CI_FAILURE_CONCLUSIONS)}
+    conclusion = str(run.get("conclusion") or "").lower()
+    return conclusion if conclusion in allowed else ""
+
+
+def _event_enabled(event_type: str) -> bool:
+    return event_type.lower() in {e.lower() for e in _csv(settings.CI_TRIGGER_EVENTS)}
+
+
+def _branch_ignored(branch: str) -> bool:
+    """FixHub-owned branches never create new tasks (the watcher repairs them)."""
+    name = (branch or "").strip()
+    if not name:
+        return False
+    prefixes = [p.rstrip("/") for p in _csv(settings.CI_IGNORE_BRANCH_PREFIXES)]
+    return any(name == p or name.startswith(p + "/") for p in prefixes)
+
+
+def _branch_allowed(branch: str, default_branch: str) -> bool:
+    policy = (settings.CI_BRANCH_POLICY or "all").strip().lower()
+    if policy == "default_only":
+        return bool(branch) and branch == (default_branch or "main")
+    if policy == "allowlist":
+        return branch in set(_csv(settings.CI_BRANCH_ALLOWLIST))
+    return True
+
+
+def _workflow_allowed(name: str, path: str) -> bool:
+    """Optional workflow allowlist (empty = every workflow)."""
+    allowed = {a.lower() for a in _csv(settings.CI_WORKFLOW_ALLOWLIST)}
+    if not allowed:
+        return True
+    candidates = {
+        (name or "").lower(),
+        (path or "").lower(),
+        (path or "").rsplit("/", 1)[-1].lower(),
+    }
+    candidates |= {c.rsplit(".", 1)[0] for c in candidates if c}
+    return bool(candidates & allowed)
+
+
+def _check_run_allowed(run: dict) -> tuple[bool, str]:
+    """Gate `check_run` delivery: opt-in event + GitHub Actions checks only."""
+    if not _event_enabled("check_run"):
+        return False, "check_run_disabled"
+    if not settings.CI_ACTIONS_CHECKS_ONLY:
+        return True, ""
+    app = run.get("app") or {}
+    slug = str(app.get("slug") or "").lower()
+    if slug != "github-actions":
+        return False, "non_actions_check"
+    return True, ""
+
+
+def _dedupe_key(repo_name: str, sha: str) -> str:
+    return f"ci:{repo_name.strip().lower()}:{sha.strip()}"[:512]
+
+
+def _insert_task(db: Session, task: Task, *, dedupe_key: str = "") -> tuple[Task, str]:
+    """Insert a task; a racing twin returns the winner instead of a 500."""
+    from sqlalchemy.exc import IntegrityError
+
+    if dedupe_key:
+        existing = db.query(Task).filter(Task.dedupe_key == dedupe_key).first()
+        if existing is not None:
+            return existing, "dedupe_key"
+        task.dedupe_key = dedupe_key
+    db.add(task)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if dedupe_key:
+            existing = db.query(Task).filter(Task.dedupe_key == dedupe_key).first()
+            if existing is not None:
+                return existing, "dedupe_key"
+        raise
+    db.refresh(task)
+    return task, ""
+
+
+def _active_ci_task(db: Session, *, repo_name: str, sha: str) -> Task | None:
+    """An already-live CI task for the same repo+sha (legacy-row guard).
+
+    New rows are deduped by `dedupe_key`; this also catches tasks created
+    before the dedupe migration, whose key is NULL.
     """
     if not sha:
         return None
-    q = db.query(Task).filter(
-        Task.repository == repo_name,
-        Task.trigger_type == "ci",
-        Task.status.in_(["QUEUED", "RUNNING", "AWAITING_CI"]),
-        Task.ci_sha == sha,
+    return (
+        db.query(Task)
+        .filter(
+            Task.repository == repo_name,
+            Task.trigger_type == "ci",
+            Task.status.in_(["QUEUED", "RUNNING", "AWAITING_CI", "NEEDS_REVIEW"]),
+            Task.ci_sha == sha,
+        )
+        .order_by(Task.id.desc())
+        .first()
     )
-    if job:
-        q = q.filter((Task.ci_job == job) | (Task.ci_workflow == job))
-    return q.order_by(Task.id.desc()).first()
 
 
 def _active_issue_task(
@@ -295,16 +423,51 @@ def _active_issue_task(
     )
 
 
-def _get_or_create_repo(
-    db: Session, full_name: str, default_branch: str = "main"
-) -> Repository:
-    repo = db.query(Repository).filter(Repository.github_full_name == full_name).first()
-    if not repo:
-        repo = Repository(github_full_name=full_name, default_branch=default_branch)
-        db.add(repo)
+def _connected_repo(
+    db: Session, *, repo_name: str, installation_id: str = ""
+) -> tuple[Repository | None, str]:
+    """The explicitly connected repository row, or ("", rejection reason).
+
+    A GitHub App installation is account-wide: the App delivers webhooks for
+    every repository it can see. Only `POST /api/repositories/connect` marks a
+    repo as connected (`repositories.installation_id`). Unknown repos are
+    never auto-created, and a payload installation that contradicts the stored
+    one is rejected (stale/foreign delivery).
+    """
+    row = (
+        db.query(Repository)
+        .filter(Repository.github_full_name == repo_name)
+        .first()
+    )
+    if row is None:
+        return None, "repository_not_connected"
+    stored = str(row.installation_id or "").strip()
+    if not stored:
+        return None, "repository_not_connected"
+    payload_inst = str(installation_id or "").strip()
+    if payload_inst and payload_inst != stored:
+        return None, "installation_mismatch"
+    return row, ""
+
+
+def _trigger_repo(
+    db: Session, *, repo_name: str, installation_id: str
+) -> tuple[Repository | None, int | None, str]:
+    """Resolve the connected repo + owning user, or a rejection reason."""
+    repo, reason = _connected_repo(
+        db, repo_name=repo_name, installation_id=installation_id
+    )
+    if repo is None:
+        return None, None, reason
+    owner_id = repo.owner_id or _resolve_owner_id(
+        db, installation_id=installation_id, repo_name=repo_name
+    )
+    if owner_id is None:
+        return None, None, "unconnected_installation"
+    if repo.owner_id is None:
+        repo.owner_id = owner_id
         db.commit()
-        db.refresh(repo)
-    return repo
+    return repo, owner_id, ""
 
 
 def _resolve_owner_id(
@@ -391,7 +554,7 @@ async def github_webhook(
 def _handle_issue(db: Session, payload: dict) -> dict:
     action = payload.get("action")
     if action not in ("opened", "reopened"):
-        return {"ok": True, "ignored": f"issues.{action}"}
+        return _ignored("issues", f"issues.{action}")
     labels = [l.get("name", "") for l in (payload.get("issue", {}).get("labels") or [])]
     # Optional label gate: if the repo uses `fixhub-fix`, only those issues trigger.
     # We do NOT require it — plain opened/reopened triggers by default.
@@ -401,21 +564,18 @@ def _handle_issue(db: Session, payload: dict) -> dict:
         return {"ok": False, "error": "missing repository"}
     issue = payload.get("issue", {})
     installation_id = str((payload.get("installation") or {}).get("id", ""))
-    owner_id = _resolve_owner_id(
-        db, installation_id=installation_id, repo_name=repo_name
+    repo, owner_id, reason = _trigger_repo(
+        db, repo_name=repo_name, installation_id=installation_id
     )
-    if owner_id is None:
-        # Unconnected installation: fail safe, no orphaned task.
-        return {"ok": True, "ignored": "unconnected_installation"}
-    repo = _get_or_create_repo(db, repo_name)
-    if repo.owner_id is None:
-        repo.owner_id = owner_id
-        db.commit()
+    if repo is None:
+        # Connected repos only: an account-wide App install is not consent.
+        return _ignored("issues", reason, repository=repo_name)
     dup = _active_issue_task(db, repo_name=repo_name, number=issue.get("number"))
     if dup is not None:
         return {"ok": True, "task_id": dup.id, "duplicate": "active_task"}
     task = Task(
         repository=repo_name,
+        repository_id=repo.id,
         owner_id=owner_id,
         trigger_type="issue",
         issue_number=issue.get("number"),
@@ -431,56 +591,87 @@ def _handle_issue(db: Session, payload: dict) -> dict:
         db, task.id, "TASK_CREATED", {"trigger": "issue", "issue": task.issue_number}
     )
     db.commit()
-    queue = _maybe_enqueue(db, task.id)
-    return {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}
+    queue = _start_task(db, task.id)
+    out = {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}
+    if not queue.get("enqueued"):
+        out["error"] = str(queue.get("error") or "queue unavailable")[:300]
+    return out
 
 
 def _handle_workflow_run(db: Session, payload: dict) -> dict:
     action = payload.get("action")
     run = payload.get("workflow_run", {})
-    if action != "completed" or run.get("conclusion") != "failure":
-        return {"ok": True, "ignored": f"workflow_run.{action}/{run.get('conclusion')}"}
+    if action != "completed":
+        return _ignored("workflow_run", f"workflow_run.{action}")
+    if not _event_enabled("workflow_run"):
+        return _ignored("workflow_run", "event_not_enabled")
+    conclusion = _ci_failure(run)
+    if not conclusion:
+        return _ignored(
+            "workflow_run", f"workflow_run.{run.get('conclusion') or 'unknown'}"
+        )
     repo_name = payload.get("repository", {}).get("full_name", "")
     if not repo_name:
         return {"ok": False, "error": "missing repository"}
     installation_id = str((payload.get("installation") or {}).get("id", ""))
-    owner_id = _resolve_owner_id(
-        db, installation_id=installation_id, repo_name=repo_name
+    repo, owner_id, reason = _trigger_repo(
+        db, repo_name=repo_name, installation_id=installation_id
     )
-    if owner_id is None:
-        return {"ok": True, "ignored": "unconnected_installation"}
-    repo = _get_or_create_repo(db, repo_name)
-    if repo.owner_id is None:
-        repo.owner_id = owner_id
-        db.commit()
-    dup = _active_ci_task(
-        db, repo_name=repo_name, sha=run.get("head_sha", ""), job=run.get("name", "")
-    )
+    if repo is None:
+        return _ignored("workflow_run", reason, repository=repo_name)
+    branch = str(run.get("head_branch") or "")
+    if _branch_ignored(branch):
+        return _ignored(
+            "workflow_run", "fixhub_branch", repository=repo_name, branch=branch
+        )
+    if not _branch_allowed(branch, repo.default_branch):
+        return _ignored(
+            "workflow_run", "branch_not_allowed", repository=repo_name, branch=branch
+        )
+    workflow = str(run.get("name") or "")
+    if not _workflow_allowed(workflow, str(run.get("path") or "")):
+        return _ignored(
+            "workflow_run", "workflow_not_allowed", repository=repo_name,
+            workflow=workflow,
+        )
+    sha = str(run.get("head_sha") or "")
+    if not sha:
+        return _ignored("workflow_run", "missing_sha", repository=repo_name)
+    key = _dedupe_key(repo_name, sha)
+    dup = db.query(Task).filter(Task.dedupe_key == key).first()
+    if dup is None:
+        dup = _active_ci_task(db, repo_name=repo_name, sha=sha)
     if dup is not None:
-        return {"ok": True, "task_id": dup.id, "duplicate": "active_task"}
-    base_excerpt = f"workflow {run.get('name')} failed on {run.get('head_branch')}"
+        return {"ok": True, "task_id": dup.id, "duplicate": "dedupe_key"}
+    base_excerpt = f"workflow {workflow} failed on {branch}"
     logs = _ci_log_excerpt(
         repo_name=repo_name,
         run_id=str(run.get("id", "")),
-        check_name=run.get("name", ""),
+        check_name=workflow,
     )
     task = Task(
         repository=repo_name,
+        repository_id=repo.id,
         owner_id=owner_id,
         trigger_type="ci",
         ci_run_id=str(run.get("id", "")),
-        ci_sha=run.get("head_sha", ""),
-        ci_workflow=run.get("name", ""),
+        ci_sha=sha,
+        ci_workflow=workflow,
         ci_url=run.get("html_url", ""),
         ci_excerpt=(
             f"{base_excerpt}\n--- failing logs ---\n{logs}" if logs else base_excerpt
         ),
         status="QUEUED",
     )
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-    _event(db, task.id, "TASK_CREATED", {"trigger": "ci", "run": task.ci_run_id})
+    task, duplicate = _insert_task(db, task, dedupe_key=key)
+    if duplicate:
+        return {"ok": True, "task_id": task.id, "duplicate": duplicate}
+    _event(
+        db,
+        task.id,
+        "TASK_CREATED",
+        {"trigger": "ci", "run": task.ci_run_id, "conclusion": conclusion},
+    )
     _event(
         db,
         task.id,
@@ -490,56 +681,80 @@ def _handle_workflow_run(db: Session, payload: dict) -> dict:
         ),
     )
     db.commit()
-    queue = _maybe_enqueue(db, task.id)
-    return {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}
+    queue = _start_task(db, task.id)
+    out = {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}
+    if not queue.get("enqueued"):
+        out["error"] = str(queue.get("error") or "queue unavailable")[:300]
+    return out
 
 
 def _handle_check_run(db: Session, payload: dict) -> dict:
     if payload.get("action") != "completed":
-        return {"ok": True, "ignored": "check_run.not_completed"}
+        return _ignored("check_run", "check_run.not_completed")
     run = payload.get("check_run", {})
-    if run.get("conclusion") != "failure":
-        return {"ok": True, "ignored": "check_run.not_failure"}
+    conclusion = _ci_failure(run)
+    if not conclusion:
+        return _ignored("check_run", "check_run.not_failure")
+    allowed, reason = _check_run_allowed(run)
+    if not allowed:
+        return _ignored("check_run", reason)
     repo_name = payload.get("repository", {}).get("full_name", "")
     if not repo_name:
         return {"ok": False, "error": "missing repository"}
     installation_id = str((payload.get("installation") or {}).get("id", ""))
-    owner_id = _resolve_owner_id(
-        db, installation_id=installation_id, repo_name=repo_name
+    repo, owner_id, reason = _trigger_repo(
+        db, repo_name=repo_name, installation_id=installation_id
     )
-    if owner_id is None:
-        return {"ok": True, "ignored": "unconnected_installation"}
-    repo = _get_or_create_repo(db, repo_name)
-    if repo.owner_id is None:
-        repo.owner_id = owner_id
-        db.commit()
-    dup = _active_ci_task(
-        db, repo_name=repo_name, sha=run.get("head_sha", ""), job=run.get("name", "")
-    )
+    if repo is None:
+        return _ignored("check_run", reason, repository=repo_name)
+    suite = run.get("check_suite") or {}
+    branch = str(run.get("head_branch") or suite.get("head_branch") or "")
+    if _branch_ignored(branch):
+        return _ignored(
+            "check_run", "fixhub_branch", repository=repo_name, branch=branch
+        )
+    if not _branch_allowed(branch, repo.default_branch):
+        return _ignored(
+            "check_run", "branch_not_allowed", repository=repo_name, branch=branch
+        )
+    sha = str(run.get("head_sha") or "")
+    if not sha:
+        return _ignored("check_run", "missing_sha", repository=repo_name)
+    key = _dedupe_key(repo_name, sha)
+    dup = db.query(Task).filter(Task.dedupe_key == key).first()
+    if dup is None:
+        dup = _active_ci_task(db, repo_name=repo_name, sha=sha)
     if dup is not None:
-        return {"ok": True, "task_id": dup.id, "duplicate": "active_task"}
-    base_excerpt = f"check {run.get('name')} failed"
+        return {"ok": True, "task_id": dup.id, "duplicate": "dedupe_key"}
+    job = str(run.get("name") or "")
+    base_excerpt = f"check {job} failed"
     logs = _ci_log_excerpt(
         repo_name=repo_name,
         run_id=_run_id_from_url(run.get("html_url", "")),
-        check_name=run.get("name", ""),
+        check_name=job,
     )
     task = Task(
         repository=repo_name,
+        repository_id=repo.id,
         owner_id=owner_id,
         trigger_type="ci",
-        ci_sha=run.get("head_sha", ""),
-        ci_job=run.get("name", ""),
+        ci_sha=sha,
+        ci_job=job,
         ci_url=run.get("html_url", ""),
         ci_excerpt=(
             f"{base_excerpt}\n--- failing logs ---\n{logs}" if logs else base_excerpt
         ),
         status="QUEUED",
     )
-    db.add(task)
-    db.commit()
-    db.refresh(task)
-    _event(db, task.id, "TASK_CREATED", {"trigger": "ci-check"})
+    task, duplicate = _insert_task(db, task, dedupe_key=key)
+    if duplicate:
+        return {"ok": True, "task_id": task.id, "duplicate": duplicate}
+    _event(
+        db,
+        task.id,
+        "TASK_CREATED",
+        {"trigger": "ci-check", "conclusion": conclusion},
+    )
     _event(
         db,
         task.id,
@@ -547,5 +762,8 @@ def _handle_check_run(db: Session, payload: dict) -> dict:
         build_ci_context(event_type="check_run", payload=payload, repo_name=repo_name),
     )
     db.commit()
-    queue = _maybe_enqueue(db, task.id)
-    return {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}
+    queue = _start_task(db, task.id)
+    out = {"ok": True, "task_id": task.id, "queued": bool(queue.get("enqueued"))}
+    if not queue.get("enqueued"):
+        out["error"] = str(queue.get("error") or "queue unavailable")[:300]
+    return out

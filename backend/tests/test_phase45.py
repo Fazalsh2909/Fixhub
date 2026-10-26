@@ -264,7 +264,9 @@ def test_legacy_null_never_adopted_by_webhook(db):
             },
         },
     )
-    assert out.get("ignored") == "unconnected_installation"
+    # Phase 6: unknown/never-connected repos are rejected before ownership
+    # resolution, so the reason is repository_not_connected (not an owner miss).
+    assert out.get("ignored") == "repository_not_connected"
     assert db.query(Task).filter(Task.issue_number == 2).count() == 0
 
 
