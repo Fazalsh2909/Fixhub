@@ -11,6 +11,9 @@ These tests pin the four fixes:
 3. a non-zero command is a failure and cannot be repeated;
 4. after diagnosis a CI run gets two reads, then must edit.
 """
+import inspect
+import subprocess
+
 import pytest
 
 from app.agent import context as _ctx
@@ -352,3 +355,119 @@ def test_ci_failed_edit_grants_a_repair_read_and_retries(monkeypatch, tmp_path):
     edits = [e for e in out.events if e.get("tool") == "edit_file"]
     assert edits and edits[-1].get("ok") is True
     assert edits[-1].get("step") == 8
+
+def test_ci_failed_edit_cap_stops_thrashing(monkeypatch, tmp_path):
+    """Six rejected edits end the run with a legible reason.
+
+    Production trace 40361749612 spent 8 attempts on a target that did not
+    exist in the workspace tree; the stall breaker never fired because every
+    rejected edit counted as a strategy change.
+    """
+    executed = []
+
+    def executor(ws, name, args):
+        executed.append(name)
+        if name == "read_file":
+            return "x = 1\n"
+        return "ERROR: oldString not found. Closest lines in the file:\n1: name: CI"
+
+    script = [
+        AssistantMessage("", [ToolCall("0", "read_file", {"path": "app/main.py"})])
+    ]
+    script += [
+        AssistantMessage(
+            "",
+            [
+                ToolCall(
+                    str(i + 1),
+                    "edit_file",
+                    {
+                        "path": ".github/workflows/ci.yml",
+                        # Vary the lengths so each rejected edit is a distinct
+                        # call: the identical-failure guard (which hashes
+                        # content by length) must not mask the thrash cap.
+                        "old": f"target-{i}" + "x" * i,
+                        "new": f"replacement-{i}" + "y" * i,
+                    },
+                )
+            ],
+        )
+        for i in range(10)
+    ]
+    _script(monkeypatch, script)
+    monkeypatch.setattr(_loop, "_execute", executor)
+    out = _loop.run_agent(
+        workspace=str(tmp_path),
+        trigger_type="ci",
+        repository="acme/r",
+        ctx=_ci_ctx(tmp_path),
+    )
+
+    assert out.finished is False
+    assert "edits were rejected" in out.summary
+    assert any(e.get("tool") == "edit_cap" for e in out.events)
+    assert executed.count("edit_file") == _loop.MAX_FAILED_EDIT_ATTEMPTS
+
+
+def _git(cwd, *args):
+    return subprocess.run(
+        ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True
+    )
+
+
+def _repo_with_two_revisions(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "ci.yml").write_text("name: CI\n# default branch\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "default")
+    default_branch = _git(repo, "branch", "--show-current").stdout.strip()
+    default_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "-q", "-b", "failing-branch")
+    (repo / "ci.yml").write_text("name: CI\n# failing revision\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "failing")
+    failing_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "-q", default_branch)
+    return repo, default_sha, failing_sha
+
+
+def test_ci_workspace_pins_the_failing_revision(tmp_path):
+    """The workspace must sit on the failing commit, not the default branch.
+
+    Production trace 40361749612: the guest was provisioned from the default
+    branch, so `.github/workflows/ci.yml` did not contain the step named in
+    the CI evidence and every edit was rejected.
+    """
+    from app.tasks import service as _svc
+
+    repo, default_sha, failing_sha = _repo_with_two_revisions(tmp_path)
+    assert _svc._pin_ci_workspace(str(repo), failing_sha)["ok"] is True
+    assert _svc._pin_ci_workspace(str(repo), failing_sha)["actual"] == failing_sha
+    body = (repo / "ci.yml").read_text(encoding="utf-8")
+    assert "failing revision" in body
+    assert "default branch" not in body
+
+
+def test_ci_workspace_blocks_an_unreachable_sha(tmp_path):
+    """An unreachable failing SHA is a blocked task, never a default-branch
+    fallback that silently changes the evidence."""
+    from app.tasks import service as _svc
+
+    repo, default_sha, _ = _repo_with_two_revisions(tmp_path)
+    pin = _svc._pin_ci_workspace(str(repo), "0" * 40)
+    assert pin["ok"] is False
+    assert pin["reason"] == "ci_sha_unreachable"
+    assert _svc._ws.head_sha(str(repo)) == default_sha
+
+
+def test_ci_checkout_precedes_guest_provision():
+    """Ordering guard: provision() streams the host tree into the guest, so
+    the CI checkout must happen first (or the guest gets the wrong tree)."""
+    from app.tasks import service as _svc
+
+    src = inspect.getsource(_svc.run_task_inline)
+    assert src.index("_pin_ci_workspace(") < src.index("_fc.provision(")

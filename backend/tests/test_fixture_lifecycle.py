@@ -51,9 +51,10 @@ def test_fixture_full_lifecycle(db, tmp_path, monkeypatch):
 
     monkeypatch.setattr(_settings, "WORKSPACE_ROOT", str(tmp_path / "workspaces"))
     remote = _fixture_remote(tmp_path)
+    head_sha = _git(remote, "rev-parse", "HEAD").stdout.strip()
 
     db.add(Task(repository="acme/mini", trigger_type="ci", ci_job="backend",
-                ci_workflow="ci", ci_sha="abc", ci_url="http://ci/1",
+                ci_workflow="ci", ci_sha=head_sha, ci_url="http://ci/1",
                 ci_excerpt="backend failed", status="RUNNING"))
     db.commit()
     task = db.query(Task).order_by(Task.id.desc()).first()
@@ -79,7 +80,7 @@ def test_fixture_full_lifecycle(db, tmp_path, monkeypatch):
 
     out = _svc.run_task_inline(task.id, source=remote)
     assert out["status"] == "COMPLETED", out
-    assert out["branch"] == f"fixhub-fixes/ci-abc-task-{task.id}"
+    assert out["branch"] == f"fixhub-fixes/ci-{head_sha[:7]}-task-{task.id}"
 
     db.expire_all()
     t = db.query(Task).filter(Task.id == task.id).first()

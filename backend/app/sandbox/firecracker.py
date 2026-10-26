@@ -585,19 +585,31 @@ def provision(task_id: int, workspace: str, *, owner_worker: str = "") -> _VM:
     "crashed and reclaimable" without trusting its own memory.
     """
     task_id = int(task_id)
+    reused: "_VM | None" = None
     with _REG_LOCK:
         existing = _REG.get(task_id)
         if existing is not None and existing.ready:
-            _touch_owner(task_id)
-            return existing
-        # CID collision guard: two live VMs must never share a CID.
-        cid = _cid_for(task_id)
-        for other_id, other in _REG.items():
-            if other_id != task_id and other.ready and other.cid == cid:
-                raise _host.SandboxBlockedError(
-                    f"vsock CID collision: task {task_id} and task {other_id} "
-                    f"both map to CID {cid}; refusing boot"
-                )
+            reused = existing
+        else:
+            # CID collision guard: two live VMs must never share a CID.
+            cid = _cid_for(task_id)
+            for other_id, other in _REG.items():
+                if other_id != task_id and other.ready and other.cid == cid:
+                    raise _host.SandboxBlockedError(
+                        f"vsock CID collision: task {task_id} and task {other_id} "
+                        f"both map to CID {cid}; refusing boot"
+                    )
+    if reused is not None:
+        _touch_owner(task_id)
+        # A reused VM still holds the tree it booted with. Re-sync the host
+        # workspace (a repair round re-clones the task branch, and a CI
+        # checkout may have moved HEAD) so the guest never serves stale
+        # evidence. Transfer failure is fail-closed, like the first sync.
+        try:
+            sync_repo_to_guest(task_id=task_id, workspace=workspace)
+        except Exception as exc:
+            raise _host.SandboxBlockedError(f"repo transfer to guest failed: {exc}")
+        return reused
     # 1. Host prerequisites (fail closed).
     if os.name == "nt":
         raise _host.SandboxBlockedError(

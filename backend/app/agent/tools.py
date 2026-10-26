@@ -231,12 +231,23 @@ def _apply_edit(body: str, old: str, new: str) -> tuple[str | None, str]:
     """
     if not old:
         return None, "ERROR: oldString must not be empty"
+    if old == new:
+        return None, (
+            "ERROR: no-op edit: oldString and newString are identical, so the "
+            "file would not change. Supply the actual replacement text."
+        )
     if old in body:
         if body.count(old) > 1:
             return None, (
                 "ERROR: oldString matches multiple locations; provide more context"
             )
-        return body.replace(old, new, 1), ""
+        result = body.replace(old, new, 1)
+        if result == body:
+            return None, (
+                "ERROR: no-op edit: the replacement leaves the file unchanged. "
+                "Supply the actual replacement text."
+            )
+        return result, ""
 
     crlf = "\r\n" in body
     body_norm = body.replace("\r\n", "\n")
@@ -298,6 +309,14 @@ def _apply_edit(body: str, old: str, new: str) -> tuple[str | None, str]:
     else:
         del body_lines[start : start + n]
     result = "\n".join(body_lines)
+    if result == body_norm:
+        # Whitespace-tolerant matching found the block, but the replacement
+        # reproduces the file byte-for-byte. That is not a change; reporting
+        # success would let the loop claim progress without touching the bug.
+        return None, (
+            "ERROR: no-op edit: the replacement leaves the file unchanged. "
+            "Supply the actual replacement text."
+        )
     if crlf:
         result = result.replace("\n", "\r\n")
     return result, ""

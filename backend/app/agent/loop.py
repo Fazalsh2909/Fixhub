@@ -84,6 +84,13 @@ MAX_READS_PER_PATH = 2
 # reads are allowed before the loop demands an edit or a reproduction. This is
 # what turns "15 calls, 0 edits" into an edit by call ~5.
 MAX_POST_DIAGNOSIS_READS = 2
+# A rejected edit is recoverable, but a run that keeps proposing edits the
+# file cannot accept is thrashing, not progressing. The observed production
+# trace spent 8 attempts on a target that did not exist in its tree.
+MAX_FAILED_EDIT_ATTEMPTS = 6
+# After this many "oldString not found" results on one path, say plainly that
+# the text is absent and require fresh evidence instead of another guess.
+MAX_TARGET_NOT_FOUND = 2
 _READ_ONLY_TOOLS = frozenset(
     {"read_file", "list_directory", "search_code", "git_status", "git_diff"}
 )
@@ -240,6 +247,8 @@ def run_agent(
     events: list[dict] = []
     tool_calls = 0
     file_changing_calls = 0
+    failed_edit_attempts = 0
+    not_found_by_path: dict[str, int] = {}
     nudges = 0
     rewrites: dict[str, int] = {}
     seen: dict[str, dict] = {}  # signature -> {fails, version, step, result}
@@ -763,6 +772,9 @@ def run_agent(
                     p = str(args.get("path", ""))
                     if p and p not in state.changed_files:
                         state.changed_files.append(p)
+                    # A change the file accepted ends the thrash streak.
+                    failed_edit_attempts = 0
+                    not_found_by_path.pop(_norm_path(p), None)
                 if tc.name == "run_command":
                     state.commands_run += 1
                 # Phase 1 state machine bookkeeping (runtime, not prompt-only).
@@ -833,8 +845,13 @@ def run_agent(
                     # this turn; give the model one read to recover the exact
                     # text the edit tool just rejected.
                     failed_edit = True
+                    failed_edit_attempts += 1
                     turn_progress = True
                     p = _norm_path(str(args.get("path", "")))
+                    if "oldString not found" in result:
+                        not_found_by_path[p] = not_found_by_path.get(p, 0) + 1
+                    else:
+                        not_found_by_path.pop(p, None)
                     repair_read_path = (
                         p
                         if (
@@ -844,7 +861,9 @@ def run_agent(
                         else "*"
                     ) or "*"
                     repair_reads_left = max(repair_reads_left, 1)
-                    failure_directive = _edit_failure_directive(result, args)
+                    failure_directive = _edit_failure_directive(
+                        result, args, not_found=not_found_by_path.get(p, 0)
+                    )
             seen[sig] = {
                 "fails": (rec["fails"] + 1) if rec and not ok else (0 if ok else 1),
                 "version": state.state_version,
@@ -896,6 +915,30 @@ def run_agent(
                             "step": tool_calls,
                         }
                     )
+            if failed_edit and failed_edit_attempts >= MAX_FAILED_EDIT_ATTEMPTS:
+                _emit(
+                    {
+                        "tool": "edit_cap",
+                        "args": {
+                            "attempts": failed_edit_attempts,
+                            "last_path": str(args.get("path", ""))[:200],
+                        },
+                        "ok": False,
+                        "blocked": True,
+                        "step": tool_calls,
+                    }
+                )
+                return LoopResult(
+                    False,
+                    (
+                        f"blocked: {failed_edit_attempts} edits were rejected without "
+                        f"a successful change ({tool_calls} calls). Last error: "
+                        f"{result[:200]}"
+                    ),
+                    iterations,
+                    tool_calls,
+                    events,
+                )
             # Final hardening: revalidate after every tool execution. A slow
             # tool (or a reap during execution) must not continue the batch
             # or reach the next LLM request on a dead lease.
@@ -1360,11 +1403,20 @@ def _command_failure_directive(meta: dict, result: str) -> str:
     )
 
 
-def _edit_failure_directive(result: str, args: dict) -> str:
+def _edit_failure_directive(result: str, args: dict, *, not_found: int = 0) -> str:
     """Hard directive after a rejected edit: recover the exact text, then retry."""
     path = str((args or {}).get("path", ""))[:200]
     detail = " ".join(str(result or "").split())[:300]
     if "oldString not found" in result:
+        if not_found >= MAX_TARGET_NOT_FOUND:
+            return (
+                f"EDIT FAILED: that exact text is not present in {path} "
+                f"({not_found} attempts). The file was NOT changed. Stop "
+                "retrying it. Search the file for the code you intend to "
+                "change, or re-read the region, and edit text that actually "
+                "exists. If you expected this text from the CI workflow, the "
+                "workspace revision may differ from the failing run."
+            )
         return (
             f"EDIT FAILED: oldString not found in {path}. The file was NOT "
             "changed. Re-read the exact section (one repair read is allowed) "

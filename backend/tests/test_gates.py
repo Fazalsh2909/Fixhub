@@ -155,7 +155,6 @@ def _seams(monkeypatch, svc, summary="did stuff", loop_result=None, meaningful=T
     if meaningful:
         monkeypatch.setattr(svc._pub, "has_meaningful_changes", lambda path: True)
     monkeypatch.setattr(svc._pub, "changed_files", lambda path: ["a.py"])
-    monkeypatch.setattr(_ws, "head_sha", lambda path: "abc123")
     monkeypatch.setattr(svc, "_cleanup", lambda task_id: None)
     res = loop_result or LoopResult(True, summary, 2, 1, [])
     monkeypatch.setattr(svc._loop, "run_agent", lambda **k: res)
@@ -338,7 +337,14 @@ def test_ci_checks_out_failing_sha(db, tmp_path, monkeypatch):
     assert "CI_CHECKOUT" in types
 
 
-def test_ci_unreachable_sha_falls_back(db, tmp_path, monkeypatch):
+def test_ci_unreachable_sha_blocks(db, tmp_path, monkeypatch):
+    """An unreachable failing SHA blocks instead of silently using main.
+
+    The agent can only fix the revision it is shown. Falling back to the
+    default branch changes the evidence under it (production trace
+    40361749612 searched for a workflow step that existed only on the PR
+    branch), so an unreachable SHA is a blocked task.
+    """
     from app.tasks import service as _svc
     from app.verify import gates as _gatesmod
 
@@ -346,15 +352,27 @@ def test_ci_unreachable_sha_falls_back(db, tmp_path, monkeypatch):
     t = _ci_task(db, "0" * 40)
     _seams(monkeypatch, _svc, meaningful=False)
     monkeypatch.setattr(_gatesmod, "run_gates", lambda ws, files: (True, "clean"))
-    monkeypatch.setattr(_svc._loop, "run_agent",
-                        lambda **k: __import__("app.agent.loop", fromlist=["LoopResult"]).LoopResult(
-                            True, "nothing", 1, 0, []))
+    ran = {"agent": False}
+
+    def _must_not_run(**k):
+        ran["agent"] = True
+        raise AssertionError("agent must not run against the wrong revision")
+
+    monkeypatch.setattr(_svc._loop, "run_agent", _must_not_run)
     out = _svc.run_task_inline(t.id, source=remote, auto_publish=False)
-    # No changes -> COMPLETED, but must not BLOCK on the bad sha.
-    assert out["status"] == "COMPLETED", out
+    assert out["status"] == "BLOCKED", out
+    assert "ci_sha_unreachable" in out["error"]
+    assert ran["agent"] is False
     db.expire_all()
-    types = [e.type for e in db.query(TaskEvent).filter(TaskEvent.task_id == t.id).all()]
+    events = db.query(TaskEvent).filter(TaskEvent.task_id == t.id).all()
+    types = [e.type for e in events]
     assert "CI_CHECKOUT" in types
+    checkout = [
+        json.loads(e.data_json)
+        for e in events
+        if e.type == "CI_CHECKOUT"
+    ]
+    assert checkout and checkout[-1]["ok"] is False
 
 
 def test_superseded_when_green_upstream(db, tmp_path, monkeypatch):

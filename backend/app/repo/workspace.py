@@ -97,6 +97,25 @@ def checkout_ref(path: str, ref: str) -> bool:
     return proc.returncode == 0
 
 
+def fetch_ref(path: str, ref: str) -> bool:
+    """Fetch one commit/branch from origin, then leave it checked out.
+
+    A plain clone fetches branches, not every reachable commit. CI runs can
+    point at a PR head that the clone's refspec did not bring down, so the
+    checkout is retried after an explicit fetch. Returns fetch success.
+    """
+    if not ref or not os.path.isdir(path):
+        return False
+    proc = subprocess.run(
+        ["git", "fetch", "--quiet", "origin", ref],
+        cwd=path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return proc.returncode == 0
+
+
 def head_sha(path: str) -> str:
     proc = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, timeout=30

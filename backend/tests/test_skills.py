@@ -395,13 +395,14 @@ def test_service_ci_records_skill_selected(db, tmp_path, monkeypatch):
             ".github/workflows/ci.yml": "name: ci\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: python -m pytest tests/ -q\n",
         },
     )
+    head_sha = _git(remote, "rev-parse", "HEAD").stdout.strip()
     db.add(
         Task(
             repository="acme/ci-skill",
             trigger_type="ci",
             ci_job="t",
             ci_workflow="ci",
-            ci_sha="abc",
+            ci_sha=head_sha,
             ci_url="http://ci/1",
             ci_excerpt="FAILED tests/test_f.py::test_f - assert 1 == 2",
             status="RUNNING",

@@ -101,6 +101,34 @@ def test_edit_fuzzy_match_must_be_unique(ws):
     assert open(os.path.join(ws, "dup.yml")).read() == body
 
 
+def test_edit_rejects_identical_old_and_new(ws):
+    """A no-op edit is not a change and must not report success.
+
+    Production trace: the model "fixed" the workflow by passing the same text
+    as oldString and newString. The tool returned EDITED, the loop counted a
+    changed file, and the run kept going against an unchanged tree.
+    """
+    body = "name: CI\non: push\n"
+    assert "WROTE" in _t.write_file(ws, "ci.yml", body)
+    out = _t.edit_file(ws, "ci.yml", "name: CI", "name: CI")
+    assert "no-op" in out.lower()
+    assert open(os.path.join(ws, "ci.yml")).read() == body
+
+
+def test_edit_rejects_fuzzy_replacement_that_changes_nothing(ws):
+    """Whitespace-tolerant matching must not turn an identical replacement
+    into a fake success (old text flattened, new text equal to the file)."""
+    body = "jobs:\n  build:\n    steps:\n      - name: a\n        run: pytest\n"
+    assert "WROTE" in _t.write_file(ws, "ci.yml", body)
+    # Flattened old text (plus a trailing space) re-indents back to exactly the
+    # block already in the file, so the replacement changes nothing.
+    flattened = "- name: a \n run: pytest"
+    same_as_file = "- name: a\n run: pytest"
+    out = _t.edit_file(ws, "ci.yml", flattened, same_as_file)
+    assert "no-op" in out.lower()
+    assert open(os.path.join(ws, "ci.yml")).read() == body
+
+
 def test_run_command_jailed_and_denied(ws):
     ok = _t.run_command(ws, "echo hi")
     assert "exit_code: 0" in ok and "hi" in ok

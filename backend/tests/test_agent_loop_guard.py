@@ -309,3 +309,18 @@ def test_task_message_keeps_full_workflow_and_signal():
 @pytest.mark.parametrize("bad", ["", "   "])
 def test_failure_signal_empty(bad):
     assert _ctx.failure_signal(bad) == ""
+
+
+def test_edit_failure_names_an_absent_target_after_repeats():
+    """Repeated not-found results must say the text is absent, not invite
+    another guess at the same oldString."""
+    first = _loop._edit_failure_directive(
+        "ERROR: oldString not found", {"path": "ci.yml"}, not_found=1
+    )
+    repeated = _loop._edit_failure_directive(
+        "ERROR: oldString not found", {"path": "ci.yml"}, not_found=2
+    )
+    assert "Re-read the exact section" in first
+    assert "not present" in repeated
+    assert "workspace revision" in repeated
+    assert "Stop retrying" in repeated

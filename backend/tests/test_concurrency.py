@@ -115,9 +115,10 @@ def test_issue_and_ci_tasks_get_distinct_branches(db, tmp_path, monkeypatch, rem
 
     monkeypatch.setattr(_settings, "WORKSPACE_ROOT", str(tmp_path / "workspaces"))
     repo = _add_repo(db)
+    head_sha = _git(remote, "rev-parse", "HEAD").stdout.strip()
     ta = _add_task(db, repo, issue_number=123, issue_title="i", issue_body="b")
     tb = _add_task(db, repo, trigger_type="ci", ci_job="backend",
-                   ci_workflow="ci", ci_sha="abcdef123456", ci_url="http://ci/1",
+                   ci_workflow="ci", ci_sha=head_sha, ci_url="http://ci/1",
                    ci_excerpt="backend failed")
 
     import app.repo.workspace as _ws
@@ -128,7 +129,7 @@ def test_issue_and_ci_tasks_get_distinct_branches(db, tmp_path, monkeypatch, rem
     out_b = _svc.run_task_inline(tb.id, source=remote)
 
     assert out_a["branch"] == f"fixhub-fixes/issue-123-task-{ta.id}"
-    assert out_b["branch"] == f"fixhub-fixes/ci-abcdef1-task-{tb.id}"
+    assert out_b["branch"] == f"fixhub-fixes/ci-{head_sha[:7]}-task-{tb.id}"
     assert out_a["branch"] != out_b["branch"]
 
 

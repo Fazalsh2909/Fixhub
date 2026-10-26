@@ -7,6 +7,7 @@ No hidden retries: one attempt, explicit POST /api/tasks/{id}/run to retry.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 
@@ -34,6 +35,52 @@ def _is_file_change_event(ev: dict) -> bool:
         and bool(ev.get("ok"))
         and not ev.get("blocked")
     )
+
+
+def _sha_matches(actual: str, expected: str) -> bool:
+    """True when HEAD is the requested commit (full or abbreviated SHA)."""
+    a = (actual or "").strip().lower()
+    e = (expected or "").strip().lower()
+    if not a or not e:
+        return False
+    return a == e or (len(e) >= 7 and a.startswith(e))
+
+
+def _pin_ci_workspace(path: str, sha: str) -> dict:
+    """Pin a CI workspace to the failing commit and verify HEAD.
+
+    Must run before the guest is provisioned: provision() streams the host
+    tree into the VM, so pinning afterwards leaves the agent reading the
+    default branch. Returns {ok, sha, actual, reason}; never falls back to
+    the default branch on an unreachable SHA.
+    """
+    wanted = (sha or "").strip()
+    if not wanted or not os.path.isdir(path):
+        return {
+            "ok": False,
+            "sha": wanted,
+            "actual": "",
+            "reason": "ci_sha_unreachable",
+        }
+    pinned = _ws.checkout_ref(path, wanted) or (
+        _ws.fetch_ref(path, wanted) and _ws.checkout_ref(path, wanted)
+    )
+    actual = _ws.head_sha(path) if pinned else ""
+    if not pinned:
+        return {
+            "ok": False,
+            "sha": wanted,
+            "actual": actual,
+            "reason": "ci_sha_unreachable",
+        }
+    if not _sha_matches(actual, wanted):
+        return {
+            "ok": False,
+            "sha": wanted,
+            "actual": actual,
+            "reason": "context_mismatch",
+        }
+    return {"ok": True, "sha": wanted, "actual": actual, "reason": ""}
 
 
 def _set(db, task: Task, **fields) -> None:
@@ -1280,6 +1327,52 @@ def run_task_inline(
                 repair_branch = ""
             path = _ws.clone_repo(clone_src, task.id, branch=repair_branch)
             _set(db, task, workspace=path)
+            # CI tasks must be pinned to the exact failing commit BEFORE the
+            # guest is provisioned. provision() streams the host tree into the
+            # VM, so a checkout after it leaves the agent reading the default
+            # branch while the prompt describes a different revision (the
+            # production trace could not find its own workflow step). An
+            # unreachable SHA is a blocked task, never a silent fallback.
+            if task.trigger_type == "ci" and task.ci_sha and not repair:
+                pin = _pin_ci_workspace(path, task.ci_sha)
+                if not pin["ok"]:
+                    reason = (
+                        f"{pin['reason']}: {pin['sha']} "
+                        "(force-push/closed PR or wrong revision)"
+                    )
+                    _set(db, task, status="BLOCKED", error=reason)
+                    _event(
+                        db,
+                        task.id,
+                        "CI_CHECKOUT",
+                        {
+                            "sha": pin["sha"],
+                            "ok": False,
+                            "reason": pin["reason"],
+                            "actual": pin["actual"],
+                        },
+                    )
+                    _event(
+                        db,
+                        task.id,
+                        "CONTEXT_MISMATCH"
+                        if pin["reason"] == "context_mismatch"
+                        else "BLOCKED",
+                        {
+                            "reason": pin["reason"],
+                            "expected": pin["sha"],
+                            "actual": pin["actual"],
+                        },
+                    )
+                    db.commit()
+                    _cleanup(task.id)
+                    return {"status": "BLOCKED", "error": task.error}
+                _event(
+                    db,
+                    task.id,
+                    "CI_CHECKOUT",
+                    {"sha": pin["sha"], "verified": True, "actual": pin["actual"]},
+                )
             # Phase 5: provision the task microVM (fail closed to BLOCKED).
             # Host clone keeps the token; the guest receives a tokenless copy
             # via provision()->sync_repo_to_guest(). No secrets cross vsock.
@@ -1299,23 +1392,6 @@ def run_task_inline(
                 db.commit()
                 _cleanup(task.id)
                 return {"status": "BLOCKED", "error": task.error}
-            # CI tasks work from the exact failing commit, not the default
-            # branch: failures living only on a PR branch would otherwise be
-            # invisible to the agent.
-            if task.trigger_type == "ci" and task.ci_sha and not repair:
-                if _ws.checkout_ref(path, task.ci_sha):
-                    _event(db, task.id, "CI_CHECKOUT", {"sha": task.ci_sha})
-                else:
-                    _event(
-                        db,
-                        task.id,
-                        "CI_CHECKOUT",
-                        {
-                            "sha": task.ci_sha,
-                            "fallback": "default-branch",
-                            "reason": "sha unreachable (force-push/closed?)",
-                        },
-                    )
             db.commit()
         except Exception as exc:
             _set(
