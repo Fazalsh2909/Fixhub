@@ -51,6 +51,56 @@ def test_write_edit_roundtrip(ws):
     assert "not found" in _t.edit_file(ws, "sub/b.txt", "zzz", "y").lower()
 
 
+def test_edit_tolerates_lost_indentation(ws):
+    """A copied block with flattened indentation must still match.
+
+    Production regression: the model supplied a correct YAML deletion but
+    every line had one leading space instead of six, so the exact-string
+    edit failed with `oldString not found` and the run blocked.
+    """
+    ci = (
+        "jobs:\n"
+        "  backend:\n"
+        "    steps:\n"
+        "      - name: test\n"
+        "        run: |\n"
+        "          pytest -q\n"
+        "      - name: deliberate failure\n"
+        "        run: |\n"
+        '          echo "boom"\n'
+        "          exit 1\n"
+    )
+    assert "WROTE" in _t.write_file(ws, "ci.yml", ci)
+    flattened = (
+        "- name: deliberate failure\n"
+        " run: |\n"
+        ' echo "boom"\n'
+        " exit 1"
+    )
+    assert "EDITED" in _t.edit_file(ws, "ci.yml", flattened, "")
+    body = open(os.path.join(ws, "ci.yml")).read()
+    assert "deliberate failure" not in body
+    assert "pytest -q" in body
+
+
+def test_edit_reindents_replacement_to_file_block(ws):
+    ci = "jobs:\n  build:\n    steps:\n      - name: a\n        run: pytest\n"
+    assert "WROTE" in _t.write_file(ws, "ci.yml", ci)
+    flattened = "- name: a\n run: pytest"
+    replacement = "- name: b\n run: pytest -q"
+    assert "EDITED" in _t.edit_file(ws, "ci.yml", flattened, replacement)
+    body = open(os.path.join(ws, "ci.yml")).read()
+    assert "      - name: b\n        run: pytest -q" in body
+
+
+def test_edit_fuzzy_match_must_be_unique(ws):
+    body = "  - name: a\n    run: x\n  - name: a\n    run: x\n"
+    assert "WROTE" in _t.write_file(ws, "dup.yml", body)
+    out = _t.edit_file(ws, "dup.yml", "- name: a\n run: x", "- name: b\n run: y")
+    assert "multiple locations" in out.lower()
+    assert open(os.path.join(ws, "dup.yml")).read() == body
+
+
 def test_run_command_jailed_and_denied(ws):
     ok = _t.run_command(ws, "echo hi")
     assert "exit_code: 0" in ok and "hi" in ok

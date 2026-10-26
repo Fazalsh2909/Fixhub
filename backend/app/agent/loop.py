@@ -253,6 +253,8 @@ def run_agent(
     read_budget: dict[str, dict] = {}  # path -> {count, version, digest}
     stalled_turns = 0
     post_diag_reads = 0
+    repair_read_path = ""
+    repair_reads_left = 0
     converged = 0
     diagnosis = _diagnosis_brief(ctx)
     started = time.monotonic()
@@ -481,6 +483,16 @@ def run_agent(
             # Phase 1 runtime gating: prohibited camouflage always blocked;
             # write/edit before sufficient investigation blocked with evidence hint.
             if tc.name in ("write_file", "edit_file"):
+                # A blocked edit is a strategy change, not a read loop: it must
+                # not trip the stall breaker on this turn. A *repeat* of the
+                # same blocked edit is not progress, so it still stalls.
+                _blocked_sig = _signature(tc.name, args)
+                _prior_block = seen.get(_blocked_sig)
+                _block_is_new = (
+                    _prior_block is None
+                    or _prior_block.get("version") != state.state_version
+                    or _prior_block.get("ok")
+                )
                 _prohibited = _phase.prohibited_reason(tc.name, args)
                 if _prohibited:
                     _msg = _phase.prohibited_error(_prohibited)
@@ -498,8 +510,10 @@ def run_agent(
                         {"role": "tool", "tool_call_id": tc.id, "content": _msg}
                     )
                     state.last_failure = _msg[:500]
-                    seen[_signature(tc.name, args)] = {
-                        "fails": 1,
+                    if _block_is_new:
+                        turn_progress = True
+                    seen[_blocked_sig] = {
+                        "fails": (_prior_block or {}).get("fails", 0) + 1,
                         "version": state.state_version,
                         "step": tool_calls,
                         "result": _msg,
@@ -524,8 +538,10 @@ def run_agent(
                         {"role": "tool", "tool_call_id": tc.id, "content": _msg}
                     )
                     state.last_failure = _msg[:500]
-                    seen[_signature(tc.name, args)] = {
-                        "fails": 1,
+                    if _block_is_new:
+                        turn_progress = True
+                    seen[_blocked_sig] = {
+                        "fails": (_prior_block or {}).get("fails", 0) + 1,
                         "version": state.state_version,
                         "step": tool_calls,
                         "result": _msg,
@@ -576,7 +592,17 @@ def run_agent(
                 read_path = _norm_path(str(args.get("path", "")))
             elif tc.name == "run_command":
                 read_path = _norm_path(_read_target(str(args.get("command", ""))))
-            if read_path:
+            # A failed edit earns one repair read of the target (or any read
+            # when the path itself was wrong). Without it the model cannot
+            # recover the exact text the edit tool just rejected.
+            is_repair_read = (
+                repair_reads_left > 0
+                and (
+                    repair_read_path == "*"
+                    or (bool(read_path) and read_path == repair_read_path)
+                )
+            )
+            if read_path and not is_repair_read:
                 rrec = read_budget.get(read_path)
                 if (
                     rrec
@@ -620,6 +646,7 @@ def run_agent(
                 tracker.skill == "fix-ci-cd"
                 and tracker.phase == _phase.DIAGNOSED
                 and is_read_call
+                and not is_repair_read
                 and post_diag_reads >= MAX_POST_DIAGNOSIS_READS
             ):
                 msg = (
@@ -653,6 +680,10 @@ def run_agent(
             rec = seen.get(sig)
             if rec is not None and rec["version"] != state.state_version:
                 rec = None  # workspace state changed: history no longer applies
+            if rec is not None and rec["ok"] and is_repair_read:
+                # A repair read must return fresh content, not the cached copy
+                # that the failed edit was based on.
+                rec = None
             if rec is not None:
                 if rec["ok"]:
                     # Identical success, nothing changed since: reuse, don't re-execute.
@@ -715,6 +746,7 @@ def run_agent(
             ok = not result.startswith("ERROR") and not failed_command
             was_diagnosed = tracker.phase == _phase.DIAGNOSED
             failure_directive = ""
+            failed_edit = False
             if ok:
                 # Only a workspace mutation invalidates cached reads. Bumping
                 # on every success (as this used to) meant any intervening
@@ -737,10 +769,18 @@ def run_agent(
                 # Phase 4.5: pass args so depth (distinct paths, workflow reads)
                 # is tracked, not just call counts.
                 tracker.record(tc.name, True, args)
-                if was_diagnosed and is_read_call:
+                if was_diagnosed and is_read_call and not is_repair_read:
                     post_diag_reads += 1
+                if is_repair_read:
+                    repair_reads_left = max(0, repair_reads_left - 1)
+                    repair_read_path = ""
+                    # The repair read recovers the exact text the failed edit
+                    # rejected: that is new evidence, not a repeated read.
+                    turn_progress = True
                 if tc.name in ("write_file", "edit_file"):
                     tracker.mark_implementing()
+                    repair_read_path = ""
+                    repair_reads_left = 0
                 if tc.name in ("run_command", "git_diff") and state.changed_files:
                     tracker.mark_validating()
                 # Progress accounting: distinct evidence only. Status calls
@@ -787,6 +827,24 @@ def run_agent(
                         cmd_seen.add(sig)
                         turn_progress = True
                     failure_directive = _command_failure_directive(meta, result)
+                elif tc.name in ("write_file", "edit_file"):
+                    # A rejected/failed edit is a strategy change, not repeated
+                    # information. Do not let the stall breaker end the run on
+                    # this turn; give the model one read to recover the exact
+                    # text the edit tool just rejected.
+                    failed_edit = True
+                    turn_progress = True
+                    p = _norm_path(str(args.get("path", "")))
+                    repair_read_path = (
+                        p
+                        if (
+                            "oldString not found" in result
+                            or "matches multiple locations" in result
+                        )
+                        else "*"
+                    ) or "*"
+                    repair_reads_left = max(repair_reads_left, 1)
+                    failure_directive = _edit_failure_directive(result, args)
             seen[sig] = {
                 "fails": (rec["fails"] + 1) if rec and not ok else (0 if ok else 1),
                 "version": state.state_version,
@@ -811,19 +869,33 @@ def run_agent(
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
             if failure_directive:
                 messages.append({"role": "user", "content": failure_directive})
-                _emit(
-                    {
-                        "tool": "command_failed",
-                        "args": {
-                            "command": str(args.get("command", ""))[:300],
-                            "exit_code": meta.get("exit_code"),
-                            "timed_out": bool(meta.get("timed_out")),
-                        },
-                        "ok": False,
-                        "failed_command": True,
-                        "step": tool_calls,
-                    }
-                )
+                if failed_command:
+                    _emit(
+                        {
+                            "tool": "command_failed",
+                            "args": {
+                                "command": str(args.get("command", ""))[:300],
+                                "exit_code": meta.get("exit_code"),
+                                "timed_out": bool(meta.get("timed_out")),
+                            },
+                            "ok": False,
+                            "failed_command": True,
+                            "step": tool_calls,
+                        }
+                    )
+                elif failed_edit:
+                    _emit(
+                        {
+                            "tool": "edit_failed",
+                            "args": {
+                                "path": str(args.get("path", ""))[:200],
+                                "error": result[:300],
+                            },
+                            "ok": False,
+                            "failed_edit": True,
+                            "step": tool_calls,
+                        }
+                    )
             # Final hardening: revalidate after every tool execution. A slow
             # tool (or a reap during execution) must not continue the batch
             # or reach the next LLM request on a dead lease.
@@ -879,9 +951,9 @@ def run_agent(
                     False,
                     (
                         f"blocked: no progress after {stalled_turns} turns "
-                        f"({tool_calls} calls, {file_changing_calls} edits). The "
-                        "agent repeated information it already had instead of "
-                        "changing code."
+                        f"({tool_calls} calls, {len(state.changed_files)} files "
+                        f"changed, {file_changing_calls} edit attempts). The "
+                        "agent did not make a successful code change."
                     ),
                     iterations,
                     tool_calls,
@@ -1285,6 +1357,29 @@ def _command_failure_directive(meta: dict, result: str) -> str:
         + ". This is failure evidence, not progress toward a fix. The next "
         "action MUST be an edit_file/write_file that fixes the cause, or a "
         "different command that isolates it. Do NOT repeat this command."
+    )
+
+
+def _edit_failure_directive(result: str, args: dict) -> str:
+    """Hard directive after a rejected edit: recover the exact text, then retry."""
+    path = str((args or {}).get("path", ""))[:200]
+    detail = " ".join(str(result or "").split())[:300]
+    if "oldString not found" in result:
+        return (
+            f"EDIT FAILED: oldString not found in {path}. The file was NOT "
+            "changed. Re-read the exact section (one repair read is allowed) "
+            "and retry with the exact text, including indentation. Do not guess "
+            "or repeat the same oldString."
+        )
+    if "matches multiple locations" in result:
+        return (
+            f"EDIT FAILED: oldString matches multiple locations in {path}. The "
+            "file was NOT changed. Add more surrounding context so the match is "
+            "unique, then retry."
+        )
+    return (
+        f"EDIT FAILED for {path}: {detail}. The file was NOT changed. Fix the "
+        "cause and retry; do not repeat the same edit."
     )
 
 

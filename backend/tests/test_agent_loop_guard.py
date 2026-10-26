@@ -260,6 +260,20 @@ def test_clip_logs_keeps_the_failing_tail():
     assert "FAILED tests/test_pagination.py::test_page" in _ctx.failure_signal(clipped)
 
 
+def test_file_changed_event_requires_a_successful_write():
+    """A rejected/gated edit must not be reported as a file change."""
+    from app.tasks.service import _is_file_change_event
+
+    assert _is_file_change_event({"tool": "edit_file", "ok": True}) is True
+    assert _is_file_change_event({"tool": "write_file", "ok": True}) is True
+    assert _is_file_change_event({"tool": "edit_file", "ok": False}) is False
+    assert (
+        _is_file_change_event({"tool": "edit_file", "ok": True, "blocked": True})
+        is False
+    )
+    assert _is_file_change_event({"tool": "read_file", "ok": True}) is False
+
+
 def test_failure_signal_extracts_pytest_line():
     logs = (
         "some noise\n"

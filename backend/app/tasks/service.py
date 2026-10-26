@@ -23,6 +23,19 @@ def _event(db, task_id: int, type_: str, data: dict) -> None:
     db.add(TaskEvent(task_id=task_id, type=type_, data_json=json.dumps(data)[:4000]))
 
 
+def _is_file_change_event(ev: dict) -> bool:
+    """True only for a write/edit that actually changed the workspace.
+
+    Blocked (prohibited/gated) and rejected edits (e.g. "oldString not
+    found") return ``ok=False``; they must not be reported as file changes.
+    """
+    return (
+        ev.get("tool") in ("write_file", "edit_file")
+        and bool(ev.get("ok"))
+        and not ev.get("blocked")
+    )
+
+
 def _set(db, task: Task, **fields) -> None:
     for k, v in fields.items():
         setattr(task, k, v)
@@ -1368,7 +1381,11 @@ def run_task_inline(
         def _live(ev: dict) -> None:
             try:
                 _event(db, task.id, "TOOL_CALL", ev)
-                if ev.get("tool") in ("write_file", "edit_file"):
+                # FILE_CHANGED means the workspace actually changed. A rejected
+                # or gated edit did not write anything, so it must not claim it
+                # did (the production trace emitted FILE_CHANGED for a failed
+                # `oldString not found` edit).
+                if _is_file_change_event(ev):
                     _event(db, task.id, "FILE_CHANGED", ev)
                 if ev.get("tool") == "run_command":
                     _event(db, task.id, "COMMAND_RUN", ev)

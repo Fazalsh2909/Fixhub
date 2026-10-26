@@ -174,6 +174,135 @@ def write_file(workspace: str, path: str, content: str) -> str:
     return f"WROTE {path} ({len(content)} bytes)"
 
 
+def _leading_spaces(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _shift_indent(text: str, delta: int) -> str:
+    """Shift every non-blank line by ``delta`` spaces (preserve relative indent)."""
+    if delta == 0:
+        return text
+    out: list[str] = []
+    for line in text.split("\n"):
+        if not line.strip():
+            out.append(line)
+        elif delta > 0:
+            out.append(" " * delta + line)
+        else:
+            remove = min(len(line) - len(line.lstrip(" ")), -delta)
+            out.append(line[remove:])
+    return "\n".join(out)
+
+
+def _edit_not_found_error(body: str, old_lines: list[str]) -> str:
+    """Point at the closest lines so the model can copy exact indentation."""
+    import difflib
+
+    target = old_lines[0].strip()
+    lines = body.split("\n")
+    best_i, best_ratio = 0, 0.0
+    for i, line in enumerate(lines):
+        probe = line.strip()
+        if not probe:
+            continue
+        ratio = difflib.SequenceMatcher(None, target, probe).ratio()
+        if ratio > best_ratio:
+            best_i, best_ratio = i, ratio
+    if best_ratio < 0.4:
+        return "ERROR: oldString not found"
+    lo = max(0, best_i - 2)
+    hi = min(len(lines), best_i + 3)
+    snippet = "\n".join(f"{i + 1}: {lines[i]}" for i in range(lo, hi))
+    return (
+        "ERROR: oldString not found. Closest lines in the file (copy the exact "
+        f"text, including indentation):\n{snippet}"
+    )
+
+
+def _apply_edit(body: str, old: str, new: str) -> tuple[str | None, str]:
+    """Apply an exact edit, falling back to whitespace-insensitive line matching.
+
+    LLMs routinely lose YAML indentation when copying a block from a prompt
+    (the observed production failure: a correct edit rejected with
+    ``oldString not found`` because every line had one space instead of six).
+    The fallback matches a UNIQUE contiguous run of lines ignoring leading and
+    trailing whitespace, then re-indents the replacement to the file's block.
+    It never guesses when the match is ambiguous.
+    """
+    if not old:
+        return None, "ERROR: oldString must not be empty"
+    if old in body:
+        if body.count(old) > 1:
+            return None, (
+                "ERROR: oldString matches multiple locations; provide more context"
+            )
+        return body.replace(old, new, 1), ""
+
+    crlf = "\r\n" in body
+    body_norm = body.replace("\r\n", "\n")
+    old_norm = old.replace("\r\n", "\n")
+    new_norm = new.replace("\r\n", "\n")
+
+    old_lines = old_norm.split("\n")
+    while old_lines and not old_lines[0].strip():
+        old_lines.pop(0)
+    while old_lines and not old_lines[-1].strip():
+        old_lines.pop()
+    if not old_lines:
+        return None, "ERROR: oldString not found"
+
+    old_stripped = [line.strip() for line in old_lines]
+    body_lines = body_norm.split("\n")
+    n = len(old_stripped)
+    matches = [
+        i
+        for i in range(len(body_lines) - n + 1)
+        if all(body_lines[i + j].strip() == old_stripped[j] for j in range(n))
+    ]
+    if not matches:
+        return None, _edit_not_found_error(body_norm, old_lines)
+    if len(matches) > 1:
+        return None, (
+            "ERROR: oldString matches multiple locations; provide more context"
+        )
+
+    start = matches[0]
+    first_file_line = body_lines[start]
+    file_indent = first_file_line[
+        : len(first_file_line) - len(first_file_line.lstrip())
+    ]
+    if "\t" in file_indent:
+        # Tabs are semantic; do not guess a replacement indentation.
+        return None, _edit_not_found_error(body_norm, old_lines)
+    if new_norm.strip():
+        new_lines = new_norm.split("\n")
+        if len(new_lines) == n:
+            # Same shape: keep each replacement line at the indentation of the
+            # file line it replaces, preserving the model's relative indent.
+            # This repairs fully flattened blocks (all lines one space deep),
+            # where a single delta shift cannot recover nested YAML.
+            replacement = []
+            for old_line, file_line, new_line in zip(
+                old_lines, body_lines[start : start + n], new_lines
+            ):
+                if not new_line.strip():
+                    replacement.append(new_line)
+                    continue
+                rel = _leading_spaces(new_line) - _leading_spaces(old_line)
+                indent = max(0, _leading_spaces(file_line) + rel)
+                replacement.append(" " * indent + new_line.lstrip(" "))
+        else:
+            delta = len(file_indent) - _leading_spaces(old_lines[0])
+            replacement = _shift_indent(new_norm, delta).split("\n")
+        body_lines[start : start + n] = replacement
+    else:
+        del body_lines[start : start + n]
+    result = "\n".join(body_lines)
+    if crlf:
+        result = result.replace("\n", "\r\n")
+    return result, ""
+
+
 def edit_file(workspace: str, path: str, old: str, new: str) -> str:
     if _is_sensitive(path):
         return "ERROR: editing sensitive file is blocked"
@@ -190,12 +319,11 @@ def edit_file(workspace: str, path: str, old: str, new: str) -> str:
             return f"ERROR: blocked: {exc}"
         if body.startswith("ERROR"):
             return body
-        if old not in body:
-            return "ERROR: oldString not found"
-        if body.count(old) > 1:
-            return "ERROR: oldString matches multiple locations; provide more context"
+        new_body, err = _apply_edit(body, old, new)
+        if new_body is None:
+            return err
         try:
-            return fc.write_file(workspace, path, body.replace(old, new, 1))
+            return fc.write_file(workspace, path, new_body)
         except Exception as exc:
             return f"ERROR: blocked: {exc}"
     full = _resolve(workspace, path)
@@ -206,13 +334,11 @@ def edit_file(workspace: str, path: str, old: str, new: str) -> str:
             body = fh.read()
     except OSError as exc:
         return f"ERROR: {exc}"
-    if old not in body:
-        return "ERROR: oldString not found"
-    if body.count(old) > 1:
-        return "ERROR: oldString matches multiple locations; provide more context"
-    body = body.replace(old, new, 1)
+    new_body, err = _apply_edit(body, old, new)
+    if new_body is None:
+        return err
     with open(full, "w", encoding="utf-8") as fh:
-        fh.write(body)
+        fh.write(new_body)
     return f"EDITED {path}"
 
 

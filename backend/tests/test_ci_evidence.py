@@ -279,3 +279,94 @@ def test_ci_failed_command_is_not_progress_and_cannot_repeat(monkeypatch, tmp_pa
 @pytest.mark.parametrize("bad", ["", "   "])
 def test_has_failure_signal_empty(bad):
     assert _ctx.has_failure_signal(bad) is False
+
+
+def test_phase_agent_workflow_read_counts_with_supplied_signal():
+    """The agent choosing to read the workflow is real investigation.
+
+    Production regression: the supplied log was generic, so the first useful
+    evidence was the workflow read. Treating it as "already supplied" kept the
+    tracker in INVESTIGATING and blocked the edit.
+    """
+    tracker = phase.InvestigationTracker(skill="fix-ci-cd")
+    tracker.seed_ci_workflow_context(".github/workflows/ci.yml")
+    tracker.seed_ci_failure("##[error]Process completed with exit code 1.")
+    assert tracker.evidence_met() is False
+
+    tracker.record("read_file", True, {"path": ".github/workflows/ci.yml"})
+    assert tracker.workflow_read_by_agent is True
+    assert tracker.evidence_met() is True
+    assert tracker.phase == phase.DIAGNOSED
+
+
+def test_ci_failed_edit_grants_a_repair_read_and_retries(monkeypatch, tmp_path):
+    """A rejected edit must not end the run on the same turn.
+
+    Production trace: two blocked reads (stall 2), then a correct `edit_file`
+    whose oldString lost its YAML indentation. The edit failed, the turn was
+    counted as a stall, and the run blocked at 3 with the fix never applied.
+    """
+    executed = []
+
+    def executor(ws, name, args):
+        executed.append(name)
+        if name == "edit_file":
+            if args.get("old") == "flat":
+                return "ERROR: oldString not found"
+            return "EDITED app/main.py"
+        return "x = 1\n"
+
+    _script(
+        monkeypatch,
+        [
+            AssistantMessage("", [ToolCall("1", "read_file", {"path": "app/main.py"})]),
+            AssistantMessage("", [ToolCall("2", "read_file", {"path": "app/one.py"})]),
+            AssistantMessage("", [ToolCall("3", "read_file", {"path": "app/two.py"})]),
+            # Two blocked reads: stalled_turns reaches 2 (the nudge threshold).
+            AssistantMessage("", [ToolCall("4", "read_file", {"path": "app/three.py"})]),
+            AssistantMessage("", [ToolCall("5", "read_file", {"path": "app/four.py"})]),
+            AssistantMessage(
+                "",
+                [
+                    ToolCall(
+                        "6",
+                        "edit_file",
+                        {"path": "app/main.py", "old": "flat", "new": "x = 2\n"},
+                    )
+                ],
+            ),
+            AssistantMessage("", [ToolCall("7", "read_file", {"path": "app/main.py"})]),
+            AssistantMessage(
+                "",
+                [
+                    ToolCall(
+                        "8",
+                        "edit_file",
+                        {
+                            "path": "app/main.py",
+                            "old": "x = 1",
+                            "new": "x = 2",
+                        },
+                    )
+                ],
+            ),
+            AssistantMessage("fixed", []),
+        ],
+    )
+    monkeypatch.setattr(_loop, "_execute", executor)
+    out = _loop.run_agent(
+        workspace=str(tmp_path),
+        trigger_type="ci",
+        repository="acme/r",
+        ctx=_ci_ctx(tmp_path),
+    )
+
+    assert out.finished is True
+    assert "no progress" not in out.summary
+    assert any(e.get("tool") == "edit_failed" for e in out.events)
+    # The repair read ran even though the post-diagnosis budget was exhausted.
+    assert executed.count("read_file") == 4
+    assert executed[-2:] == ["read_file", "edit_file"]
+    edits = [e for e in out.events if e.get("tool") == "edit_file"]
+    assert edits and edits[-1].get("ok") is True
+    assert edits[-1].get("step") == 8
