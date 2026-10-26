@@ -516,6 +516,10 @@ def run_agent(
                         {"role": "tool", "tool_call_id": tc.id, "content": _msg}
                     )
                     state.last_failure = _msg[:500]
+                    # The gate just demanded evidence; a read budget must not
+                    # then refuse the read that satisfies it.
+                    repair_read_path = "*"
+                    repair_reads_left = max(repair_reads_left, 1)
                     if _block_is_new:
                         turn_progress = True
                     seen[_blocked_sig] = {
@@ -544,6 +548,11 @@ def run_agent(
                         {"role": "tool", "tool_call_id": tc.id, "content": _msg}
                     )
                     state.last_failure = _msg[:500]
+                    # Same as the prohibited branch: the gate asked for a
+                    # read, so grant one even if the per-path or
+                    # post-diagnosis budget is exhausted.
+                    repair_read_path = "*"
+                    repair_reads_left = max(repair_reads_left, 1)
                     if _block_is_new:
                         turn_progress = True
                     seen[_blocked_sig] = {

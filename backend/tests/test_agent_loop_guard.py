@@ -118,6 +118,61 @@ def test_read_budget_blocks_third_read(monkeypatch, tmp_path):
     assert any(e.get("read_budget") for e in out.events)
 
 
+@pytest.mark.parametrize(
+    "blocked",
+    [
+        ToolCall("3", "edit_file", {"path": "b.py", "old": "x", "new": "y"}),
+        ToolCall(
+            "3",
+            "write_file",
+            {
+                "path": ".github/workflows/ci.yml",
+                "content": "continue-on-error: true\n",
+            },
+        ),
+    ],
+    ids=["gated", "prohibited"],
+)
+def test_blocked_write_grants_the_read_it_asked_for(monkeypatch, tmp_path, blocked):
+    """A blocked write must not be followed by a read-budget refusal.
+
+    Production 40371361810: the gate demanded evidence, then the per-path
+    budget skipped the read that would have supplied it. Each blocked write
+    now grants one read that bypasses the cache and both read budgets.
+    """
+    executed = []
+
+    def executor(ws, name, args):
+        executed.append(name)
+        return "x = 1\n" if name == "read_file" else "exit_code: 0\nstdout: x = 1"
+
+    out, _ = _run(
+        monkeypatch,
+        tmp_path,
+        [
+            AssistantMessage("", [ToolCall("1", "read_file", {"path": "a.py"})]),
+            # Different offsets are distinct calls, so this one executes and
+            # exhausts the per-path budget without adding depth.
+            AssistantMessage(
+                "", [ToolCall("2", "read_file", {"path": "a.py", "offset": 201})]
+            ),
+            AssistantMessage("", [blocked]),
+            AssistantMessage("", [ToolCall("4", "read_file", {"path": "a.py"})]),
+            AssistantMessage("done", []),
+        ],
+        executor,
+    )
+
+    block_ev = next(e for e in out.events if e.get("step") == 3)
+    assert block_ev.get("blocked") is True
+    assert block_ev.get("gated") or block_ev.get("prohibited")
+    # a.py was read twice already; the repair read still runs.
+    assert executed == ["read_file", "read_file", "read_file"]
+    read_ev = next(e for e in out.events if e.get("step") == 4)
+    assert read_ev.get("ok") is True and not read_ev.get("blocked")
+    assert not read_ev.get("cached")
+
+
 def test_batch_duplicate_executes_once(monkeypatch, tmp_path):
     executed = []
 
