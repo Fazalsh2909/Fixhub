@@ -125,6 +125,37 @@ def test_tracker_ci_requires_workflow_read():
     assert t.phase == _phase.DIAGNOSED
 
 
+def test_tracker_ci_seeded_workflow_read_alone_is_still_gated():
+    """The supplied workflow is read #1; it must not cancel itself out.
+
+    Production 40371361810: the failure log named no code file, the seeded
+    workflow sat in both `read_paths` and `workflow_paths`, so `code_reads`
+    was 0 forever and every edit was blocked.
+    """
+    t = _phase.InvestigationTracker(skill="fix-ci-cd")
+    t.seed_ci_workflow_context(".github/workflows/ci.yml")
+    t.seed_ci_failure("##[error]Process completed with exit code 1.")
+
+    ok, missing = t.can_write()
+    assert ok is False
+    # The hint must be actionable when the signal names no code file.
+    assert "workflow file itself" in missing
+
+    # A genuine read of the workflow from disk is the second workflow read.
+    t.record("read_file", True, {"path": ".github/workflows/ci.yml"})
+    assert t.evidence_met() is True
+    assert t.phase == _phase.DIAGNOSED
+
+
+def test_tracker_ci_no_signal_accepts_two_workflow_reads():
+    """Without a captured log, inspecting the workflow twice is evidence."""
+    t = _phase.InvestigationTracker(skill="fix-ci-cd")
+    t.record("read_file", True, {"path": ".github/workflows/ci.yml"})
+    assert t.evidence_met() is False  # one read is still shallow
+    t.record("read_file", True, {"path": ".github/workflows/ci.yml"})
+    assert t.evidence_met() is True
+
+
 def test_tracker_failed_calls_do_not_count():
     t = _phase.InvestigationTracker(skill="fix-issues")
     t.record("read_file", False)

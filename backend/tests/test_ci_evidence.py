@@ -163,6 +163,114 @@ def _ci_ctx(tmp_path):
     )
 
 
+def test_ci_gate_accepts_a_workflow_read_when_the_signal_names_no_code(
+    monkeypatch, tmp_path
+):
+    """Replay production 40371361810 at the gate.
+
+    The failure log was only "Process completed with exit code 1", so it named
+    no code file. The seeded workflow read landed in both `read_paths` and
+    `workflow_paths`, `code_reads` stayed 0, and all four edits were blocked
+    before execution. Reading the workflow from disk is real evidence.
+    """
+    wf_dir = tmp_path / ".github" / "workflows"
+    wf_dir.mkdir(parents=True)
+    workflow = (
+        "name: CI\n"
+        "jobs:\n"
+        "  backend:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - name: Deliberate failure\n"
+        "        run: exit 1\n"
+    )
+    wf = wf_dir / "ci.yml"
+    wf.write_text(workflow, encoding="utf-8")
+    ctx = _ctx.TaskContext(
+        repository="acme/r",
+        workspace_root=str(tmp_path),
+        trigger_type="ci",
+        ci=_ctx.CIContext(
+            workflow_name="CI",
+            workflow_file=".github/workflows/ci.yml",
+            workflow_content=workflow,
+            job="backend",
+            failure_logs="##[error]Process completed with exit code 1.\n",
+        ),
+        skill="fix-ci-cd",
+    )
+    _script(
+        monkeypatch,
+        [
+            # Pre-diagnosis edit: gated, never executed.
+            AssistantMessage(
+                "",
+                [
+                    ToolCall(
+                        "1",
+                        "edit_file",
+                        {
+                            "path": ".github/workflows/ci.yml",
+                            "old": "- name: Deliberate failure\n  run: exit 1",
+                            "new": "- name: Deliberate failure\n  run: echo fixed",
+                        },
+                    )
+                ],
+            ),
+            # The evidence the gate asks for: the real workflow from disk.
+            AssistantMessage(
+                "",
+                [
+                    ToolCall(
+                        "2",
+                        "read_file",
+                        {"path": ".github/workflows/ci.yml"},
+                    )
+                ],
+            ),
+            # Same edit with the exact indentation: it must now execute.
+            AssistantMessage(
+                "",
+                [
+                    ToolCall(
+                        "3",
+                        "edit_file",
+                        {
+                            "path": ".github/workflows/ci.yml",
+                            "old": (
+                                "      - name: Deliberate failure\n"
+                                "        run: exit 1"
+                            ),
+                            "new": (
+                                "      - name: Deliberate failure\n"
+                                "        run: echo fixed"
+                            ),
+                        },
+                    )
+                ],
+            ),
+            AssistantMessage("fixed", []),
+        ],
+    )
+    out = _loop.run_agent(
+        workspace=str(tmp_path),
+        trigger_type="ci",
+        repository="acme/r",
+        ctx=ctx,
+    )
+
+    assert out.finished is True
+    assert "run: echo fixed" in wf.read_text(encoding="utf-8")
+    edits = [e for e in out.events if e.get("tool") == "edit_file"]
+    assert edits[0].get("gated") is True and edits[0].get("ok") is False
+    assert edits[-1].get("ok") is True and not edits[-1].get("blocked")
+    assert any(
+        e.get("tool") == "read_file" and e.get("step") == 2 and not e.get("blocked")
+        for e in out.events
+    )
+
+
 def test_ci_post_diagnosis_read_budget_forces_an_edit(monkeypatch, tmp_path):
     executed = []
 

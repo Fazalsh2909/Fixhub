@@ -290,10 +290,21 @@ class InvestigationTracker:
             # supplied and does not count as a code read).
             code_reads = len(self.read_paths - self.workflow_paths)
             if self.failure_evidence:
-                return code_reads >= 1 or self.searches >= 1
+                # `workflow_reads >= 2` means the model actually read the
+                # workflow from disk (the seeded context is read #1). Some
+                # failures name no code file ("process exited with code 1"),
+                # so without this a workflow-caused failure could never pass.
+                return (
+                    code_reads >= 1
+                    or self.searches >= 1
+                    or self.workflow_reads >= 2
+                )
             # No supplied signal: read the workflow (or implicated path) plus
-            # one more distinct piece of evidence.
-            return self.workflow_reads >= 1 and self._depth() >= 2
+            # one more distinct piece of evidence. Two genuine workflow reads
+            # also prove the model inspected the failure at its source.
+            return self.workflow_reads >= 2 or (
+                self.workflow_reads >= 1 and self._depth() >= 2
+            )
         # fix-issues: depth across distinct files/searches/commands.
         return self._depth() >= 2
 
@@ -307,35 +318,37 @@ class InvestigationTracker:
             )
         if need_reads:
             parts.append(f"{need_reads} more read_file of a relevant file")
-        if not parts:
-            if self.skill == "fix-ci-cd":
-                if self.failure_evidence and not (
-                    self.read_paths - self.workflow_paths
-                ):
-                    parts.append(
-                        "read the code file named in the failure signal "
-                        "(the workflow content is already supplied)"
-                    )
-                elif self.workflow_reads < 1:
-                    parts.append(
-                        "reproduce the failing command, or read the failing "
-                        "workflow file (.github/workflows/...)"
-                    )
-                else:
-                    parts.append(
-                        "broader evidence: read another relevant file, search "
-                        "code, or run a diagnostic"
-                    )
-            else:
+        if self.skill == "fix-ci-cd":
+            code_reads = len(self.read_paths - self.workflow_paths)
+            if (
+                self.failure_evidence
+                and not code_reads
+                and not self.searches
+                and self.workflow_reads < 2
+            ):
+                # Always state the specific way out of the gate, even when a
+                # call-count deficit is also listed.
                 parts.append(
-                    "broader evidence: read another relevant file, search code, or run a diagnostic"
+                    "read the code file named in the failure signal, or "
+                    "inspect the failing step in the workflow file itself "
+                    "(.github/workflows/...) — the workflow content is "
+                    "already supplied, so either action adds real evidence"
                 )
-        hint = (
-            " for skill 'fix-ci-cd' use the supplied failure signal first"
-            if self.skill == "fix-ci-cd"
-            else ""
-        )
-        return "; ".join(parts) + hint if parts else ""
+            elif self.workflow_reads < 1:
+                parts.append(
+                    "reproduce the failing command, or read the failing "
+                    "workflow file (.github/workflows/...)"
+                )
+            elif not parts:
+                parts.append(
+                    "broader evidence: read another relevant file, search "
+                    "code, or run a diagnostic"
+                )
+        elif not parts:
+            parts.append(
+                "broader evidence: read another relevant file, search code, or run a diagnostic"
+            )
+        return "; ".join(parts) if parts else ""
 
     def can_write(self) -> tuple[bool, str]:
         if self.phase in (DIAGNOSED, IMPLEMENTING, VALIDATING, READY):
