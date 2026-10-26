@@ -96,7 +96,10 @@ For forks of OSS repos outside your installations, the IDE manual owner/repo + i
 | `JOB_TIMEOUT_S` | `1200` | RQ job timeout. |
 | `COMMAND_TIMEOUT_S` | `180` | Default per-command sandbox timeout. |
 | `LLM_MAX_REWRITES_PER_PATH` | `8` | Rewrite convergence cap per file. |
-| `LLM_HISTORY_GROUPS` | `12` | Tool-exchange blocks resent per LLM call. |
+| `LLM_HISTORY_GROUPS` | `4` | Tool-exchange blocks resent per LLM call. |
+| `LLM_CONTEXT_MAX_CHARS` | `16000` | Serialized conversation budget per request. |
+| `LLM_CI_MAX_REQUESTS_PER_TASK` | `30` | CI task-wide provider-call cap (initial fix + gate repairs). |
+| `MAX_INPUT_TOKENS_PER_CI_TASK` | `300000` | CI input-token cap; `0` inherits `MAX_INPUT_TOKENS_PER_TASK`. |
 | `TOOL_OUTPUT_MAX_BYTES` | `20000` | Tool/sandbox output cap. |
 | `LLM_MAX_OUTPUT_BYTES` | `200000` | Agent summary cap. |
 | `WORKSPACE_ROOT` | `./workspaces` locally, `/tmp/fixhub-workspaces` in Docker | Per-task clone root (`task-{id}`). |

@@ -74,6 +74,39 @@ def test_ci_request_budget_caps_all_rounds_below_general_limit(db, monkeypatch):
     assert _svc._usage_limit_reason(db, t) == "max LLM requests per task reached (16)"
 
 
+def test_ci_input_token_cap_overrides_global_cap(db, monkeypatch):
+    """The global 100k cap fired before the first edit; CI gets its own cap."""
+    from app.config import settings as _s
+    from app.tasks import service as _svc
+
+    monkeypatch.setattr(_s, "MAX_LLM_REQUESTS_PER_TASK", 1000)
+    monkeypatch.setattr(_s, "MAX_INPUT_TOKENS_PER_TASK", 100_000)
+    monkeypatch.setattr(_s, "MAX_INPUT_TOKENS_PER_CI_TASK", 300_000)
+    u = make_user(db, email="ci-tok@example.com")
+    ci = _task(db, owner=u, repo="acme/ci-tok", trigger="ci")
+    issue = _task(db, owner=u, repo="acme/issue-tok", trigger="issue")
+    _usage(db, u, ci, requests=10, inp=150_000)
+    _usage(db, u, issue, requests=10, inp=150_000)
+    assert _svc._usage_limit_reason(db, ci) == ""
+    assert "input tokens" in _svc._usage_limit_reason(db, issue)
+
+
+def test_usage_fraction_reports_ci_request_budget(db, monkeypatch):
+    """Advisory fraction drives the converge nudge (0.65/0.85 thresholds)."""
+    from app.config import settings as _s
+    from app.tasks import service as _svc
+
+    monkeypatch.setattr(_s, "MAX_LLM_REQUESTS_PER_TASK", 1000)
+    monkeypatch.setattr(_s, "LLM_CI_MAX_REQUESTS_PER_TASK", 20)
+    monkeypatch.setattr(_s, "MAX_INPUT_TOKENS_PER_TASK", 0)
+    monkeypatch.setattr(_s, "MAX_INPUT_TOKENS_PER_CI_TASK", 0)
+    u = make_user(db, email="frac@example.com")
+    t = _task(db, owner=u, repo="acme/frac", trigger="ci")
+    assert _svc._usage_fraction(db, t) == 0.0
+    _usage(db, u, t, requests=13)
+    assert abs(_svc._usage_fraction(db, t) - 0.65) < 1e-9
+
+
 def test_null_usage_never_fabricated(db, monkeypatch):
     """Provider omitted token counts: token caps must NOT fire on nothing."""
     from app.config import settings as _s

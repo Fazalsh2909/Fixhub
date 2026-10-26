@@ -259,7 +259,9 @@ def _build_task_context(
             ):
                 setattr(ci, field, str(data.get(field, ""))[:6000])
         if not ci.failure_logs:
-            ci.failure_logs = ci_info[:6000]
+            # Keep the diagnostic tail: a head-only slice cut the failing
+            # lines (and therefore the PRIMARY FAILURE SIGNAL) out of the log.
+            ci.failure_logs = _ctxmod.clip_logs(ci_info)
         if not ci.commit_sha:
             ci.commit_sha = task.ci_sha or ""
         if not ci.job:
@@ -894,6 +896,24 @@ def _run_agent_tracked(db, task: Task, scope: _LLMScope, **kwargs):
             return ""
 
     kwargs.setdefault("request_guard", _request_guard)
+
+    def _budget_guard() -> float:
+        """Fraction of the binding budget already spent (advisory)."""
+        try:
+            from app.db.database import SessionLocal as _SessionLocal
+
+            s = _SessionLocal()
+            try:
+                row = s.query(Task).filter(Task.id == task.id).first()
+                if row is None:
+                    return 1.0
+                return _usage_fraction(s, row, buf)
+            finally:
+                s.close()
+        except Exception:
+            return 0.0
+
+    kwargs.setdefault("budget_guard", _budget_guard)
     try:
         result = _loop.run_agent(**kwargs)
     except Exception as exc:
@@ -1005,20 +1025,35 @@ def _daily_task_count(db, owner_id: int | None) -> int:
     )
 
 
-def _usage_limit_reason(db, task: Task, buf: list[dict] | None = None) -> str:
-    """Return "" (allowed) or a limit reason. Evaluated against the task's
-    OWNER (task.owner_id), never provider name alone."""
+def _binding_limits(task: Task) -> tuple[int, int, int]:
+    """Effective (max_requests, max_input_tokens, max_output_tokens) for a task.
+
+    CI tasks get their own request/token caps so a repair (initial fix plus
+    gate-repair rounds) is bounded as one budget, regardless of a larger
+    legacy global value in the deployment .env. 0 means "no limit" for the
+    token caps; request caps are always positive in production (validated at
+    startup).
+    """
     from app.config import settings as _settings
 
     max_req = int(_settings.MAX_LLM_REQUESTS_PER_TASK or 0)
-    if task.trigger_type == "ci":
-        # Bound the whole CI task across the initial fix AND every gate-repair
-        # round, regardless of a larger legacy MAX_LLM_REQUESTS_PER_TASK value
-        # in the deployment .env. This is checked before every provider call.
-        ci_max = int(getattr(_settings, "LLM_CI_MAX_REQUESTS_PER_TASK", 16) or 16)
-        max_req = min(max_req, ci_max) if max_req > 0 else ci_max
     cap_in = int(_settings.MAX_INPUT_TOKENS_PER_TASK or 0)
+    if task.trigger_type == "ci":
+        ci_max = int(getattr(_settings, "LLM_CI_MAX_REQUESTS_PER_TASK", 30) or 30)
+        max_req = min(max_req, ci_max) if max_req > 0 else ci_max
+        # CI override: a repair needs room for ~30 stateless requests. The old
+        # 100k global cap fired before the first edit in production.
+        ci_tok = int(getattr(_settings, "MAX_INPUT_TOKENS_PER_CI_TASK", 0) or 0)
+        if ci_tok > 0:
+            cap_in = ci_tok
     cap_out = int(_settings.MAX_OUTPUT_TOKENS_PER_TASK or 0)
+    return max_req, cap_in, cap_out
+
+
+def _usage_limit_reason(db, task: Task, buf: list[dict] | None = None) -> str:
+    """Return "" (allowed) or a limit reason. Evaluated against the task's
+    OWNER (task.owner_id), never provider name alone."""
+    max_req, cap_in, cap_out = _binding_limits(task)
     pending = len(buf or [])
     if max_req > 0 and _task_request_total(db, task.id) + pending >= max_req:
         return f"max LLM requests per task reached ({max_req})"
@@ -1043,6 +1078,30 @@ def _usage_limit_reason(db, task: Task, buf: list[dict] | None = None) -> str:
             if (committed_out or 0) + buf_out >= cap_out:
                 return f"max output tokens per task reached ({cap_out})"
     return ""
+
+
+def _usage_fraction(db, task: Task, buf: list[dict] | None = None) -> float:
+    """0..1 fraction of the binding task budget already consumed.
+
+    Advisory only: it drives the loop's converge nudge. The hard stop remains
+    ``_usage_limit_reason``. Returns 0 when no budget is configured.
+    """
+    max_req, cap_in, _ = _binding_limits(task)
+    frac = 0.0
+    if max_req > 0:
+        frac = max(
+            frac,
+            (_task_request_total(db, task.id) + len(buf or [])) / max_req,
+        )
+    if cap_in > 0:
+        committed_in, _ = _task_token_totals(db, task.id)
+        buf_in = sum(
+            int(r.get("input_tokens") or 0)
+            for r in (buf or [])
+            if r.get("input_tokens") is not None
+        )
+        frac = max(frac, ((committed_in or 0) + buf_in) / cap_in)
+    return max(0.0, min(1.0, frac))
 
 
 def _fail_usage_limit(db, task: Task, reason: str) -> dict:

@@ -67,6 +67,59 @@ class AgentState:
 MAX_IDENTICAL_FAILURES = 2
 # Cap cached results / tracked signatures (bounded memory).
 MAX_TRACKED_SIGNATURES = 100
+# A turn is "stalled" when it produced no new evidence: no edit, no new path,
+# no new search, no new command. Two stalled turns force a convergence
+# directive; three stop the run. Without this a model can alternate two
+# read-only tools forever while every call looks "new".
+STALL_NUDGE_AT = 2
+MAX_STALLED_TURNS = 3
+# A path may be read twice (head window + a second offset window). Further
+# reads of the same unchanged path return a digest instead of the body.
+MAX_READS_PER_PATH = 2
+# Budget fractions: at CONVERGE the loop tells the model to stop exploring;
+# at CRITICAL it repeats the directive with the remaining work spelled out.
+# The hard cap still applies - these only change behaviour earlier.
+CONVERGE_FRACTION = 0.65
+CRITICAL_FRACTION = 0.85
+
+# `cat/head/tail <path>` is a read of <path> wearing a command's clothes.
+_READ_ONLY_COMMAND = re.compile(
+    r"^\s*(?:cat|head|tail|less|more)\s+(?:-[A-Za-z0-9]+\s+)*([^\s|;&><]+)\s*$"
+)
+# Commands that change working-tree content (so cached reads go stale).
+_MUTATING_COMMAND = re.compile(
+    r"(?:^|[\s;&|])("
+    r"git\s+(?:checkout|switch|reset|clean|apply|stash|pull|clone|merge|rebase|restore)"
+    r"|rm|mv|cp|mkdir|touch|patch|sed\s+-i"
+    r")(?:\s|$)",
+    re.IGNORECASE,
+)
+
+
+def _read_target(command: str) -> str:
+    """Repository path read by a simple `cat/head/tail <path>` command, else ""."""
+    m = _READ_ONLY_COMMAND.match(str(command or ""))
+    return m.group(1).strip("\"'") if m else ""
+
+
+def _norm_path(path: str) -> str:
+    """Canonical repository-relative path for read-budget accounting."""
+    p = str(path or "").replace("\\", "/").strip()
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _mutates_workspace(command: str) -> bool:
+    """True when a shell command can change files the read cache depends on."""
+    return bool(_MUTATING_COMMAND.search(str(command or "")))
+
+
+def _read_digest(result: str) -> str:
+    """Short fingerprint of content already shown to the model."""
+    body = str(result or "")
+    head = " ".join(body[:240].split())
+    return f"{len(body)} chars; starts: {head}"
 
 
 def run_agent(
@@ -84,6 +137,7 @@ def run_agent(
     deadline_mono: float | None = None,
     lease_guard=None,
     request_guard=None,
+    budget_guard=None,
 ) -> LoopResult:
     """Run the deterministic observe -> reason -> act -> verify loop.
 
@@ -104,6 +158,10 @@ def run_agent(
     allowed or a non-empty limit reason when the per-user budget is spent.
     On a limit the loop stops with ``LoopResult.usage_limited=True`` without
     making the call.
+    `budget_guard` (optional callable -> float in 0..1) reports the fraction
+    of the task budget already consumed. It never stops the loop; at
+    CONVERGE_FRACTION it injects a converge directive so a slow model spends
+    its remaining calls writing instead of re-reading.
     """
     from app.agent import context as _ctxmod
 
@@ -163,6 +221,17 @@ def run_agent(
     nudges = 0
     rewrites: dict[str, int] = {}
     seen: dict[str, dict] = {}  # signature -> {fails, version, step, result}
+    # Progress accounting (see STALL_* constants). `path_seen`/`search_seen`/
+    # `dir_seen`/`cmd_seen` track distinct evidence, so a legitimate multi-file
+    # investigation never trips the stall breaker.
+    path_seen: set[str] = set()
+    search_seen: set[str] = set()
+    dir_seen: set[str] = set()
+    cmd_seen: set[str] = set()
+    read_budget: dict[str, dict] = {}  # path -> {count, version, digest}
+    stalled_turns = 0
+    converged = 0
+    diagnosis = _diagnosis_brief(ctx)
     started = time.monotonic()
     iterations = 0
 
@@ -272,7 +341,59 @@ def run_agent(
                 tool_calls,
                 events,
             )
-        outbound = _window(messages, events)
+        # Budget-aware convergence: a stateless provider re-charges the whole
+        # context on every call, so a model that keeps exploring runs out of
+        # budget with nothing written. Tell it to converge while it still can.
+        if budget_guard is not None:
+            try:
+                _frac = float(budget_guard())
+            except Exception:
+                _frac = 0.0
+            if _frac >= CRITICAL_FRACTION and converged < 2:
+                converged = 2
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"BUDGET CRITICAL: {int(_frac * 100)}% of this task's "
+                            "budget is spent. Stop all exploration. Make the smallest "
+                            "fix you are confident in now with edit_file/write_file, "
+                            "then run one focused check. If you cannot fix it, say "
+                            "exactly what blocks you - do not read another file."
+                        ),
+                    }
+                )
+                _emit(
+                    {
+                        "tool": "budget_converge",
+                        "args": {"fraction": round(_frac, 2), "level": "critical"},
+                        "ok": True,
+                        "step": tool_calls,
+                    }
+                )
+            elif _frac >= CONVERGE_FRACTION and converged < 1:
+                converged = 1
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"BUDGET: {int(_frac * 100)}% of this task's budget is "
+                            "spent. You already have the evidence in this "
+                            "conversation. Converge: stop reading and make the fix "
+                            "with edit_file/write_file, or state the single missing "
+                            "fact you need in one command."
+                        ),
+                    }
+                )
+                _emit(
+                    {
+                        "tool": "budget_converge",
+                        "args": {"fraction": round(_frac, 2), "level": "warn"},
+                        "ok": True,
+                        "step": tool_calls,
+                    }
+                )
+        outbound = _window(messages, events, diagnosis)
         assistant = _llm.chat_completion(outbound, tools=_tools.TOOL_SCHEMAS)
         if not assistant.tool_calls:
             # Guard against premature "done": a text-only finish with zero
@@ -318,6 +439,10 @@ def run_agent(
                 ],
             }
         )
+        # Two calls in one assistant message that resolve to the same action
+        # are one action: execute the first, redirect the rest.
+        batch_sigs: dict[str, int] = {}
+        turn_progress = False
         for tc in assistant.tool_calls:
             if _cancelled():
                 return LoopResult(
@@ -399,6 +524,62 @@ def run_agent(
                     )
                     return LoopResult(True, note, iterations, tool_calls, events)
             sig = _signature(tc.name, args)
+            # Same-batch duplicate: two calls in one message that resolve to
+            # the same action are one action.
+            if sig in batch_sigs:
+                note = (
+                    f"DUPLICATE: same action as call #{batch_sigs[sig]} in this "
+                    "message. It already ran; use that result instead of repeating it."
+                )
+                _emit(
+                    {
+                        "tool": tc.name,
+                        "args": _summarise_args(args),
+                        "ok": True,
+                        "duplicate": True,
+                        "step": tool_calls,
+                    }
+                )
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": note}
+                )
+                continue
+            batch_sigs[sig] = tool_calls
+            # Per-path read budget across tools: `read_file` and `cat` return
+            # the same information, so a path already read (unchanged) is not
+            # re-executed. This is what stops read/cat ping-pong.
+            read_path = ""
+            if tc.name == "read_file":
+                read_path = _norm_path(str(args.get("path", "")))
+            elif tc.name == "run_command":
+                read_path = _norm_path(_read_target(str(args.get("command", ""))))
+            if read_path:
+                rrec = read_budget.get(read_path)
+                if (
+                    rrec
+                    and rrec["version"] == state.state_version
+                    and rrec["count"] >= MAX_READS_PER_PATH
+                ):
+                    note = (
+                        f"ALREADY READ: {read_path} (read {rrec['count']}x, workspace "
+                        f"unchanged since). Cached digest: {rrec['digest']}. Do not "
+                        "read it again — use the content you already have, edit a "
+                        "file, or run a diagnostic."
+                    )
+                    _emit(
+                        {
+                            "tool": tc.name,
+                            "args": _summarise_args(args),
+                            "ok": True,
+                            "blocked": True,
+                            "read_budget": True,
+                            "step": tool_calls,
+                        }
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": note}
+                    )
+                    continue
             rec = seen.get(sig)
             if rec is not None and rec["version"] != state.state_version:
                 rec = None  # workspace state changed: history no longer applies
@@ -451,7 +632,16 @@ def run_agent(
                 _parse_command_result(result) if tc.name == "run_command" and ok else {}
             )
             if ok:
-                state.state_version += 1
+                # Only a workspace mutation invalidates cached reads. Bumping
+                # on every success (as this used to) meant any intervening
+                # call - even `git_status` - discarded the whole read cache,
+                # so alternating read_file/cat re-executed forever.
+                mutated = tc.name in ("write_file", "edit_file") or (
+                    tc.name == "run_command"
+                    and _mutates_workspace(str(args.get("command", "")))
+                )
+                if mutated:
+                    state.state_version += 1
                 state.last_successful_action = tc.name
                 if tc.name in ("write_file", "edit_file"):
                     p = str(args.get("path", ""))
@@ -467,11 +657,45 @@ def run_agent(
                     tracker.mark_implementing()
                 if tc.name in ("run_command", "git_diff") and state.changed_files:
                     tracker.mark_validating()
+                # Progress accounting: distinct evidence only. Status calls
+                # (git_status/git_diff) never count as progress.
+                if mutated:
+                    turn_progress = True
+                elif tc.name == "read_file":
+                    p = _norm_path(str(args.get("path", "")))
+                    if p and p not in path_seen:
+                        path_seen.add(p)
+                        turn_progress = True
+                elif tc.name == "list_directory":
+                    p = _norm_path(str(args.get("path", ".") or "."))
+                    if p not in dir_seen:
+                        dir_seen.add(p)
+                        turn_progress = True
+                elif tc.name == "search_code":
+                    pat = str(args.get("pattern", ""))
+                    if pat and pat not in search_seen:
+                        search_seen.add(pat)
+                        turn_progress = True
+                elif tc.name == "run_command":
+                    if sig not in cmd_seen:
+                        cmd_seen.add(sig)
+                        turn_progress = True
+                if read_path:
+                    rrec = read_budget.get(read_path)
+                    if not rrec or rrec["version"] != state.state_version:
+                        rrec = {
+                            "count": 0,
+                            "version": state.state_version,
+                            "digest": "",
+                        }
+                    rrec["count"] += 1
+                    rrec["digest"] = _read_digest(result)
+                    read_budget[read_path] = rrec
             else:
                 state.last_failure = result[:500]
             seen[sig] = {
                 "fails": (rec["fails"] + 1) if rec and not ok else (0 if ok else 1),
-                "version": state.state_version if ok else state.state_version,
+                "version": state.state_version,
                 "step": tool_calls,
                 "result": result,
                 "ok": ok,
@@ -512,6 +736,47 @@ def run_agent(
                     tool_calls,
                     events,
                     lease_lost=True,
+                )
+        # A turn that produced no new evidence is a stall. Two stalls force a
+        # convergence directive; three end the run with a legible reason
+        # instead of burning the remaining budget on the same reads.
+        if turn_progress:
+            stalled_turns = 0
+        else:
+            stalled_turns += 1
+            if stalled_turns == STALL_NUDGE_AT:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "STOP INVESTIGATING. This turn produced no new evidence: "
+                            "you repeated information already in this conversation. "
+                            "Your next message MUST contain an edit_file/write_file "
+                            "that fixes the failure, or a single command that "
+                            "reproduces it. Do not read the same file again."
+                        ),
+                    }
+                )
+                _emit(
+                    {
+                        "tool": "stall_nudge",
+                        "args": {"turns": stalled_turns},
+                        "ok": True,
+                        "step": tool_calls,
+                    }
+                )
+            if stalled_turns >= MAX_STALLED_TURNS:
+                return LoopResult(
+                    False,
+                    (
+                        f"blocked: no progress after {stalled_turns} turns "
+                        f"({tool_calls} calls, {file_changing_calls} edits). The "
+                        "agent repeated information it already had instead of "
+                        "changing code."
+                    ),
+                    iterations,
+                    tool_calls,
+                    events,
                 )
     return LoopResult(
         False, "agent stopped: max iterations exceeded", iterations, tool_calls, events
@@ -613,17 +878,50 @@ def _fit_history_span(span: list[dict], budget: int) -> list[dict] | None:
     return None
 
 
-def _state_brief(events: list[dict]) -> str:
+def _diagnosis_brief(ctx) -> str:
+    """One-line failure pointer that survives every compaction.
+
+    The task message is clipped when large and older exchanges are condensed,
+    so without this the model loses the error it is meant to fix and re-reads
+    the same file. Deterministic, bounded, never raises.
+    """
+    try:
+        if (getattr(ctx, "trigger_type", "") or "") != "ci":
+            return ""
+        from app.agent import context as _ctxmod
+
+        ci = getattr(ctx, "ci", None)
+        if ci is None:
+            return ""
+        parts: list[str] = []
+        if ci.job:
+            parts.append(f"job={str(ci.job)[:80]}")
+        if ci.step:
+            parts.append(f"step={str(ci.step)[:120]}")
+        signal = _ctxmod.failure_signal(ci.failure_logs)
+        if signal:
+            parts.append(f"error={signal}")
+        if ci.changed_files:
+            parts.append(f"files={str(ci.changed_files)[:160]}")
+        if not parts:
+            return ""
+        return _clip_middle("CI failure — " + "; ".join(parts), 500)
+    except Exception:
+        return ""
+
+
+def _state_brief(events: list[dict], brief: str = "") -> str:
     """Deterministic state brief from persisted tool events (no LLM call).
 
     Replaces the generic "tool X ran N times" recap when older exchanges are
     condensed out of the window: files read, files changed, commands with
     exit codes, and failure counts, so a resumed context knows the story
-    instead of just the statistics. Bounded; never raises.
+    instead of just the statistics. `brief` carries the trigger diagnosis
+    (job/step/error), which must survive compaction. Bounded; never raises.
     """
     try:
         if not events:
-            return "No tool calls yet."
+            return brief or "No tool calls yet."
         reads: list[str] = []
         changed: list[str] = []
         commands: list[str] = []
@@ -657,13 +955,15 @@ def _state_brief(events: list[dict]) -> str:
         if failed:
             parts.append(f"Failed calls: {failed}")
         if not parts:
-            return "No completed tool calls yet."
-        return _clip_middle(" | ".join(parts), 600)
+            return brief or "No completed tool calls yet."
+        return _clip_middle(
+            (brief + " | " if brief else "") + " | ".join(parts), 700
+        )
     except Exception:
-        return "Earlier exchanges condensed."
+        return brief or "Earlier exchanges condensed."
 
 
-def _window(messages: list[dict], events: list[dict]) -> list[dict]:
+def _window(messages: list[dict], events: list[dict], brief: str = "") -> list[dict]:
     """Token-conscious conversation window with a hard serialized-character budget.
 
     The provider counts prompt tokens again on every stateless request. We keep
@@ -726,7 +1026,7 @@ def _window(messages: list[dict], events: list[dict]) -> list[dict]:
     dropped = len(spans) - len(selected)
     out = head
     if dropped > 0:
-        brief = _state_brief(events)
+        brief = _state_brief(events, brief)
         out.append({
             "role": "user",
             "content": _clip_middle(

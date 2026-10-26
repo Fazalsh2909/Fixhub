@@ -6,6 +6,7 @@ tool resolves repository-relative paths against ``workspace_root`` internally.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 
@@ -66,6 +67,56 @@ def _bounded(text: str, limit: int, *, tail_ratio: float = 0.5) -> str:
     return value[:head] + marker + (value[-tail:] if tail else "")
 
 
+# Lines that carry an actionable failure. Ordered most-specific first so a
+# pytest FAILED line wins over a generic "error:" echo later in the log.
+_SIGNAL_PATTERNS = (
+    re.compile(r"^\s*FAILED\s+(\S+)\s*-\s*(.+)$"),
+    re.compile(r"^\s*E\s{3,}(.+)$"),
+    re.compile(r"^\s*(?:##\[error\]|::error::)\s*(.+)$"),
+    re.compile(
+        r"^\s*([\w./\\-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|rb|yml|yaml)):"
+        r"(\d+)(?::(\d+))?:\s*(.+)$"
+    ),
+    re.compile(r"^\s*(?:error\[E\d+\]|error)\s*:\s*(.+)$", re.IGNORECASE),
+    re.compile(r"^\s*npm ERR!\s+(.+)$"),
+)
+
+
+def clip_logs(text: str, limit: int = 6000) -> str:
+    """Bound a CI log excerpt while keeping the diagnostic tail.
+
+    Failures live at the end of a CI log. A head-only slice (the old
+    ``ci_info[:6000]``) dropped exactly the lines the agent needs, leaving it
+    to re-read the workflow and guess.
+    """
+    return _bounded(text, limit, tail_ratio=0.65)
+
+
+def failure_signal(logs: str, limit: int = 400) -> str:
+    """Extract the most specific failure lines from a CI log tail.
+
+    Gives the model a pointer ("FAILED tests/x.py::test_y - assert 3 == 4")
+    instead of a wall of log noise, so it can start at the failing symbol
+    rather than re-reading the workflow file.
+    """
+    picked: list[str] = []
+    seen: set[str] = set()
+    for raw in str(logs or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if any(pat.match(line) for pat in _SIGNAL_PATTERNS):
+            key = line[:200]
+            if key not in seen:
+                seen.add(key)
+                picked.append(key)
+        if len(picked) >= 3:
+            break
+    if not picked:
+        return ""
+    return _bounded(" | ".join(picked), limit)
+
+
 def build_task_message(ctx: TaskContext) -> str:
     """First user message: bounded trigger evidence (no prior state)."""
     head = (
@@ -77,6 +128,11 @@ def build_task_message(ctx: TaskContext) -> str:
         block = "\n".join(
             line for line in [
                 "CI FAILURE — determine the root cause of this failure. Do not broadly explore.",
+                "PRIMARY FAILURE SIGNAL: "
+                + (
+                    failure_signal(ci.failure_logs)
+                    or "(not captured — inspect the failing step below)"
+                ),
                 "Start with the files named under Changed files / in the failure output.",
                 f"Provider: {ci.provider}",
                 f"Workflow: {ci.workflow_name}",
@@ -96,13 +152,16 @@ def build_task_message(ctx: TaskContext) -> str:
                 f"Run URL: {ci.url}",
             ] if line
         )
+        # The webhook already fetched the real workflow (bounded to 6000); show
+        # it whole. A truncated YAML is worse than none: the model cannot trust
+        # it and re-reads the file, burning the task budget.
         wf = (
-            f"\nWorkflow content:\n{_bounded(ci.workflow_content, 1000, tail_ratio=0.5)}\n"
+            f"\nWorkflow content:\n{_bounded(ci.workflow_content, 6000, tail_ratio=0.25)}\n"
             if ci.workflow_content else ""
         )
         base = f"{head}\n{wf}\n{block}\n"
         if ctx.skill_instructions:
-            base += f"\nActive skill ({ctx.skill or 'fix-ci-cd'}):\n{_bounded(ctx.skill_instructions, 1000)}\n"
+            base += f"\nActive skill ({ctx.skill or 'fix-ci-cd'}):\n{_bounded(ctx.skill_instructions, 1800)}\n"
         return base
     issue = ctx.issue
     base = (

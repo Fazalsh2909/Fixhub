@@ -60,7 +60,10 @@ class Settings(BaseSettings):
     # CI fixes should converge quickly; validation gates provide a second check.
     LLM_CI_MAX_ITERATIONS: int = 100
     # Task-wide cap shared by the initial CI fix and any gate-repair rounds.
-    LLM_CI_MAX_REQUESTS_PER_TASK: int = 1000
+    # 30 (was 1000): a stateless provider re-charges the whole context on every
+    # call, and the old 16-request default was exhausted by investigation
+    # alone; 30 still fails fast on a looping model (stall breaker: 3 turns).
+    LLM_CI_MAX_REQUESTS_PER_TASK: int = 30
     # Thrash guard: stop rewriting the same file after this many writes/edits
     # and finish with what exists instead of burning the iteration budget.
     LLM_MAX_REWRITES_PER_PATH: int = 25
@@ -178,6 +181,10 @@ class Settings(BaseSettings):
     # Self-hosted development default; production deployments can lower this.
     MAX_TASKS_PER_USER_PER_DAY: int = 10000
     MAX_INPUT_TOKENS_PER_TASK: int = 0
+    # CI override (0 = inherit MAX_INPUT_TOKENS_PER_TASK). A CI repair needs
+    # room for ~30 stateless requests; the old 100k global cap fired before a
+    # single edit in production.
+    MAX_INPUT_TOKENS_PER_CI_TASK: int = 300_000
     MAX_OUTPUT_TOKENS_PER_TASK: int = 0
     # Phase 4.5 PG statement guard (0 = off). Applied to app connections only.
     POSTGRES_STATEMENT_TIMEOUT_MS: int = 30000
@@ -313,7 +320,9 @@ def validate_usage_limits(s=None) -> None:
     per_user = int(getattr(cfg, "MAX_RUNNING_PER_USER", 0))
     glob = int(getattr(cfg, "MAX_RUNNING_TASKS_GLOBAL", 0))
     tok_in = int(getattr(cfg, "MAX_INPUT_TOKENS_PER_TASK", 0) or 0)
+    tok_in_ci = int(getattr(cfg, "MAX_INPUT_TOKENS_PER_CI_TASK", 0) or 0)
     tok_out = int(getattr(cfg, "MAX_OUTPUT_TOKENS_PER_TASK", 0) or 0)
+    ci_req = int(getattr(cfg, "LLM_CI_MAX_REQUESTS_PER_TASK", 0) or 0)
     problems: list[str] = []
     iters = int(getattr(cfg, "LLM_MAX_ITERATIONS", 0))
     if req <= 0:
@@ -328,6 +337,14 @@ def validate_usage_limits(s=None) -> None:
         problems.append(f"MAX_TASKS_PER_USER_PER_DAY must be > 0 (got {daily})")
     if tok_in < 0:
         problems.append(f"MAX_INPUT_TOKENS_PER_TASK must be >= 0 (got {tok_in})")
+    if tok_in_ci < 0:
+        problems.append(
+            f"MAX_INPUT_TOKENS_PER_CI_TASK must be >= 0 (got {tok_in_ci})"
+        )
+    if ci_req < 0:
+        problems.append(
+            f"LLM_CI_MAX_REQUESTS_PER_TASK must be >= 0 (got {ci_req})"
+        )
     if tok_out < 0:
         problems.append(f"MAX_OUTPUT_TOKENS_PER_TASK must be >= 0 (got {tok_out})")
     if is_prod and (per_user <= 0 or glob <= 0):
