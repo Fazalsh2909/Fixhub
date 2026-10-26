@@ -202,10 +202,6 @@ class InvestigationTracker:
     read_paths: set = field(default_factory=set)
     workflow_reads: int = 0
     workflow_paths: set = field(default_factory=set)
-    # True only when the agent itself read the workflow file (not when the
-    # webhook supplied the same content). With a supplied failure log, that
-    # read is real investigation: the agent chose to inspect the failing job.
-    workflow_read_by_agent: bool = False
     failure_evidence: bool = False
     reproduced_failure: bool = False
     transitions: list[str] = field(default_factory=list)
@@ -264,7 +260,6 @@ class InvestigationTracker:
                     self.read_paths.add(path)
                 if _is_workflow_read(tool, args or {}):
                     self.workflow_reads += 1
-                    self.workflow_read_by_agent = True
                     if path:
                         self.workflow_paths.add(path)
             elif tool == "search_code":
@@ -295,14 +290,7 @@ class InvestigationTracker:
             # supplied and does not count as a code read).
             code_reads = len(self.read_paths - self.workflow_paths)
             if self.failure_evidence:
-                # An agent-initiated workflow read is real investigation (the
-                # supplied content alone is not): it chose to inspect the job
-                # that failed, which is enough to start fixing.
-                return (
-                    code_reads >= 1
-                    or self.searches >= 1
-                    or self.workflow_read_by_agent
-                )
+                return code_reads >= 1 or self.searches >= 1
             # No supplied signal: read the workflow (or implicated path) plus
             # one more distinct piece of evidence.
             return self.workflow_reads >= 1 and self._depth() >= 2
@@ -323,7 +311,7 @@ class InvestigationTracker:
             if self.skill == "fix-ci-cd":
                 if self.failure_evidence and not (
                     self.read_paths - self.workflow_paths
-                ) and not self.workflow_read_by_agent:
+                ):
                     parts.append(
                         "read the code file named in the failure signal "
                         "(the workflow content is already supplied)"

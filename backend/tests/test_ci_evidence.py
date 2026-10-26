@@ -281,24 +281,6 @@ def test_has_failure_signal_empty(bad):
     assert _ctx.has_failure_signal(bad) is False
 
 
-def test_phase_agent_workflow_read_counts_with_supplied_signal():
-    """The agent choosing to read the workflow is real investigation.
-
-    Production regression: the supplied log was generic, so the first useful
-    evidence was the workflow read. Treating it as "already supplied" kept the
-    tracker in INVESTIGATING and blocked the edit.
-    """
-    tracker = phase.InvestigationTracker(skill="fix-ci-cd")
-    tracker.seed_ci_workflow_context(".github/workflows/ci.yml")
-    tracker.seed_ci_failure("##[error]Process completed with exit code 1.")
-    assert tracker.evidence_met() is False
-
-    tracker.record("read_file", True, {"path": ".github/workflows/ci.yml"})
-    assert tracker.workflow_read_by_agent is True
-    assert tracker.evidence_met() is True
-    assert tracker.phase == phase.DIAGNOSED
-
-
 def test_ci_failed_edit_grants_a_repair_read_and_retries(monkeypatch, tmp_path):
     """A rejected edit must not end the run on the same turn.
 
