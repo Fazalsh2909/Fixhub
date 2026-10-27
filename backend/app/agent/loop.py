@@ -78,8 +78,8 @@ def run_agent(
     stops with ``LoopResult.cancelled=True``. `ctx` (optional TaskContext)
     becomes the authoritative run context; loose kwargs are kept for callers
     that build it inline. `deadline_mono` (optional monotonic timestamp, Phase
-    4.5) caps this invocation against a task-wide agent budget shared with
-    gate-fix rounds; the tighter of it and LLM_MAX_RUNTIME_S wins.
+    4.5) caps this invocation against a task-wide agent budget; the tighter
+    of it and LLM_MAX_RUNTIME_S wins.
     `lease_guard` (optional callable -> bool, final hardening) is verified
     before every LLM request and after every tool execution; on loss the loop
     stops with ``LoopResult.lease_lost=True`` so the worker performs no

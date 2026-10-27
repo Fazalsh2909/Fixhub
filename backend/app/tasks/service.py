@@ -753,7 +753,7 @@ class _LLMScope:
     """Phase 3 BYOK execution scope: holds one task's resolved credential.
 
     Enter to activate the runtime LLM client for agent execution; exit clears
-    it. Re-enterable (gate-fix rounds) without re-decrypting. When `secret`
+    it. Re-enterable without re-decrypting. When `secret`
     is None the scope is a no-op and the development/test environment client
     applies. Never logged, never persisted.
     """
@@ -1534,8 +1534,8 @@ def run_task_inline(
             db.commit()
             _cleanup(task.id)
             return {"status": "BLOCKED", "error": task.error}
-        # Phase 4.5: one cumulative agent budget shared by the initial run and
-        # gate-fix rounds (per-invocation LLM_MAX_RUNTIME_S still applies).
+        # Phase 4.5: one cumulative agent budget for the run
+        # (per-invocation LLM_MAX_RUNTIME_S still applies).
         # Coherence: per-run(900) <= budget(2100) < RQ kill(2400) < lease(3600).
         import time as _time
 
