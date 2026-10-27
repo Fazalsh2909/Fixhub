@@ -48,12 +48,14 @@ class _Runner:
         unit_present: bool = True,
         active_after: int = 0,
         main_pid: str = "4242",
+        main_pids: list[str] | None = None,
         environment_files: list[str] | None = None,
         on_daemon_reload=None,
     ) -> None:
         self.unit_present = unit_present
         self.active_after = active_after
         self.main_pid = main_pid
+        self.main_pids = list(main_pids) if main_pids else None
         self.environment_files = (
             list(environment_files)
             if environment_files is not None
@@ -90,8 +92,15 @@ class _Runner:
             state = "active" if self._active_checks > self.active_after else "activating"
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{state}\n", stderr="")
         if cmd[:3] == ["systemctl", "show", "-p"]:
+            pid = self.main_pid
+            if self.main_pids:
+                pid = (
+                    self.main_pids.pop(0)
+                    if len(self.main_pids) > 1
+                    else self.main_pids[0]
+                )
             return subprocess.CompletedProcess(
-                cmd, 0, stdout=f"{self.main_pid}\n", stderr=""
+                cmd, 0, stdout=f"{pid}\n", stderr=""
             )
         if cmd == ["systemctl", "daemon-reload"] and self.on_daemon_reload:
             self.on_daemon_reload()
@@ -343,6 +352,143 @@ def test_process_env_has_reads_running_environment(tmp_path):
     assert mod.process_env_has(9999, proc_root=tmp_path) is False
 
 
+def test_verify_retries_transient_unreadable_environ(tmp_path):
+    """A just-restarted process may not have exec'd when /proc is first read."""
+    mod = _installer()
+    proc = tmp_path / "proc"
+    environ = proc / "4242" / "environ"
+    environ.parent.mkdir(parents=True)
+    writes = []
+
+    def sleeper(_seconds):
+        writes.append(1)
+        environ.write_bytes(b"ENV=staging\0AUTH_COOKIE_SECURE=1\0")
+
+    ok, detail = mod.verify(
+        "fixhub-api",
+        "http://127.0.0.1:8000/health",
+        runner=_Runner(),
+        proc_root=proc,
+        health=lambda _url: True,
+        attempts=3,
+        sleeper=sleeper,
+    )
+    assert ok is True
+    assert len(writes) == 1
+    assert "responded 200" in detail
+
+
+def test_verify_follows_new_pid_after_restart(tmp_path):
+    """If the first PID exits, verification follows systemd's new MainPID."""
+    mod = _installer()
+    proc = tmp_path / "proc"
+    environ = proc / "2222" / "environ"
+    environ.parent.mkdir(parents=True)
+    environ.write_bytes(b"ENV=staging\0AUTH_COOKIE_SECURE=1\0")
+
+    ok, detail = mod.verify(
+        "fixhub-api",
+        "http://127.0.0.1:8000/health",
+        runner=_Runner(main_pids=["1111", "2222"]),
+        proc_root=proc,
+        health=lambda _url: True,
+        attempts=3,
+        sleeper=lambda _s: None,
+    )
+    assert ok is True
+    assert "responded 200" in detail
+
+
+def test_verify_fails_fast_on_readable_wrong_value(tmp_path):
+    """A process that exec'd with 0 cannot be fixed by retrying; report it."""
+    mod = _installer()
+    proc = tmp_path / "proc"
+    environ = proc / "4242" / "environ"
+    environ.parent.mkdir(parents=True)
+    environ.write_bytes(b"ENV=staging\0AUTH_COOKIE_SECURE=0\0")
+    sleeps = []
+    health_calls = []
+
+    ok, detail = mod.verify(
+        "fixhub-api",
+        "http://127.0.0.1:8000/health",
+        runner=_Runner(),
+        proc_root=proc,
+        health=lambda url: health_calls.append(url) or True,
+        attempts=5,
+        sleeper=sleeps.append,
+    )
+    assert ok is False
+    assert "AUTH_COOKIE_SECURE=0" in detail
+    assert sleeps == []  # no pointless waiting on a definite wrong value
+    assert health_calls == []  # a wrong environment is decisive
+
+
+def test_verify_retries_health_until_app_is_ready(tmp_path):
+    mod = _installer()
+    proc = tmp_path / "proc"
+    environ = proc / "4242" / "environ"
+    environ.parent.mkdir(parents=True)
+    environ.write_bytes(b"ENV=staging\0AUTH_COOKIE_SECURE=1\0")
+    calls = {"n": 0}
+
+    def health(_url):
+        calls["n"] += 1
+        return calls["n"] >= 3
+
+    ok, detail = mod.verify(
+        "fixhub-api",
+        "http://127.0.0.1:8000/health",
+        runner=_Runner(),
+        proc_root=proc,
+        health=health,
+        attempts=5,
+        sleeper=lambda _s: None,
+    )
+    assert ok is True
+    assert calls["n"] == 3
+
+
+def test_verify_reports_unreadable_separately_from_wrong_value(tmp_path):
+    mod = _installer()
+    proc = tmp_path / "proc"
+
+    ok, detail = mod.verify(
+        "fixhub-api",
+        "http://127.0.0.1:8000/health",
+        runner=_Runner(),
+        proc_root=proc,
+        health=lambda _url: True,
+        attempts=2,
+        sleeper=lambda _s: None,
+    )
+    assert ok is False
+    assert "not readable" in detail
+    assert "has AUTH_COOKIE_SECURE=" not in detail
+    assert "journalctl" in detail
+
+
+def test_verify_reports_missing_key_with_precedence_hint(tmp_path):
+    mod = _installer()
+    proc = tmp_path / "proc"
+    environ = proc / "4242" / "environ"
+    environ.parent.mkdir(parents=True)
+    environ.write_bytes(b"ENV=staging\0")
+
+    ok, detail = mod.verify(
+        "fixhub-api",
+        "http://127.0.0.1:8000/health",
+        runner=_Runner(),
+        proc_root=proc,
+        health=lambda _url: True,
+        attempts=2,
+        sleeper=lambda _s: None,
+    )
+    assert ok is False
+    assert "does not have AUTH_COOKIE_SECURE" in detail
+    assert "EnvironmentFile" in detail
+
+
 def test_verify_fails_closed_without_live_env(tmp_path):
     mod = _installer()
     proc = tmp_path / "proc"
@@ -378,6 +524,8 @@ def test_verify_fails_closed_without_live_env(tmp_path):
         runner=runner,
         proc_root=proc,
         health=lambda _url: False,
+        attempts=1,
+        sleeper=lambda _s: None,
     )
     assert ok is False
     assert "health check" in detail

@@ -12,7 +12,10 @@ deployed value wins without editing the host-managed `.env`.
 This installer is idempotent and fail-closed: it writes the root-owned env
 file and the tracked drop-in, reloads systemd, checks the merged
 `EnvironmentFile=` order, restarts only `fixhub-api`, and verifies that the
-RUNNING process actually has AUTH_COOKIE_SECURE=1 before reporting success.
+RUNNING process actually has AUTH_COOKIE_SECURE=1 and answers `/health`
+before reporting success. It retries the brief window where a restarted
+process has not exec'd or started listening yet; a readable wrong value fails
+immediately.
 
 It never edits the base unit, the worker, the database, migrations, or any
 Firecracker/networking configuration.
@@ -180,6 +183,33 @@ def main_pid(unit: str = DEFAULT_UNIT, *, runner=run) -> int:
         return 0
 
 
+def read_process_env(
+    pid: int,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, str] | None:
+    """Return the environment the process was exec'd with, or None if unreadable.
+
+    `/proc/<pid>/environ` only reflects the unit environment after execve(2).
+    Immediately after `systemctl restart`, systemd has spawned the child but it
+    may not have exec'd yet; its `/proc` entry then still shows the service
+    manager's environment. Callers must retry instead of treating that snapshot
+    as a wrong value.
+    """
+    environ = Path(proc_root) / str(pid) / "environ"
+    try:
+        raw = environ.read_bytes()
+    except OSError:
+        return None
+    env: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        if not entry or b"=" not in entry:
+            continue
+        key, _, value = entry.partition(b"=")
+        env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return env
+
+
 def process_env_has(
     pid: int,
     key: str = ENV_KEY,
@@ -188,12 +218,8 @@ def process_env_has(
     proc_root: Path = Path("/proc"),
 ) -> bool:
     """Check the environment the running process was actually started with."""
-    environ = Path(proc_root) / str(pid) / "environ"
-    try:
-        raw = environ.read_bytes()
-    except OSError:
-        return False
-    return f"{key}={expected}".encode() in raw.split(b"\0")
+    env = read_process_env(pid, proc_root=proc_root)
+    return env is not None and env.get(key) == expected
 
 
 def health_ok(url: str, timeout: float = 5.0) -> bool:
@@ -236,6 +262,13 @@ def _precedence_hint(
     )
 
 
+def _restart_hint(unit: str = DEFAULT_UNIT) -> str:
+    return (
+        f"Check `systemctl status {unit}` and "
+        f"`journalctl -u {unit} -n 100 --no-pager`."
+    )
+
+
 def verify(
     unit: str = DEFAULT_UNIT,
     health_url: str = DEFAULT_HEALTH_URL,
@@ -244,26 +277,65 @@ def verify(
     proc_root: Path = Path("/proc"),
     security_env: Path = DEFAULT_SECURITY_ENV,
     health=health_ok,
+    attempts: int = 60,
+    interval: float = 0.5,
+    sleeper=time.sleep,
 ) -> tuple[bool, str]:
-    """Prove the live service has the setting; never infer it from the file."""
-    pid = main_pid(unit, runner=runner)
-    if pid <= 0:
-        return False, f"{unit}.service is not running (MainPID=0)"
-    if not process_env_has(pid, proc_root=proc_root):
+    """Prove the live service has the setting; never infer it from the file.
+
+    `systemctl restart` returns once systemd has spawned the process, which is
+    before `/proc/<pid>/environ` is guaranteed to show the unit environment and
+    before the app is ready to answer `/health`. Retry both instead of failing
+    on a transient snapshot. A readable, wrong value fails immediately: retrying
+    cannot change the environment of a process that has already exec'd.
+    """
+    attempts = max(1, attempts)
+    last_problem = f"{unit}.service is not running (MainPID=0)"
+    kind = "not-running"
+    for attempt in range(attempts):
+        pid = main_pid(unit, runner=runner)
+        if pid <= 0:
+            last_problem = f"{unit}.service is not running (MainPID=0)"
+            kind = "not-running"
+        else:
+            env = read_process_env(pid, proc_root=proc_root)
+            if env is None:
+                last_problem = (
+                    f"{unit}.service (pid {pid}) environment is not readable "
+                    "(the process may still be starting or has exited)"
+                )
+                kind = "unreadable"
+            else:
+                actual = env.get(ENV_KEY)
+                if actual is None:
+                    last_problem = (
+                        f"{unit}.service (pid {pid}) does not have "
+                        f"{ENV_KEY} in its environment"
+                    )
+                    kind = "missing"
+                elif actual != ENV_VALUE:
+                    hint = _precedence_hint(unit, security_env, runner=runner)
+                    return False, (
+                        f"{unit}.service (pid {pid}) has "
+                        f"{ENV_KEY}={actual}, expected {ENV_VALUE}. {hint}"
+                    )
+                elif health(health_url):
+                    return True, (
+                        f"{unit}.service is active with {ENV_KEY}={ENV_VALUE}; "
+                        f"{health_url} responded 200"
+                    )
+                else:
+                    last_problem = (
+                        "process environment is correct but the health check "
+                        f"failed: {health_url}"
+                    )
+                    kind = "health"
+        if attempt + 1 < attempts:
+            sleeper(interval)
+    if kind == "missing":
         hint = _precedence_hint(unit, security_env, runner=runner)
-        return False, (
-            f"{unit}.service (pid {pid}) does not have "
-            f"{ENV_KEY}={ENV_VALUE} in its environment. {hint}"
-        )
-    if not health(health_url):
-        return False, (
-            "process environment is correct but the health check failed: "
-            f"{health_url}"
-        )
-    return True, (
-        f"{unit}.service is active with {ENV_KEY}={ENV_VALUE}; "
-        f"{health_url} responded 200"
-    )
+        return False, f"{last_problem}. {hint}"
+    return False, f"{last_problem}. {_restart_hint(unit)}"
 
 
 def main(argv: list[str] | None = None) -> int:

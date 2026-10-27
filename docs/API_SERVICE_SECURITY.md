@@ -53,8 +53,11 @@ The installer:
    file is read last,
 6. restarts only `fixhub-api`,
 7. verifies the **running** process has `AUTH_COOKIE_SECURE=1`
-   (reads `/proc/<MainPID>/environ`),
-8. checks `http://127.0.0.1:8000/health`.
+   (reads `/proc/<MainPID>/environ`) and that
+   `http://127.0.0.1:8000/health` returns 200,
+8. retries transient startup states: a just-spawned process may not have
+   exec'd yet, and the app may not be listening yet. A readable wrong value
+   fails immediately instead of waiting.
 
 It exits non-zero instead of claiming success. It never edits the base unit,
 the worker, the database, migrations, or Firecracker/networking config.
@@ -83,6 +86,19 @@ systemctl cat fixhub-api --no-pager | grep -i EnvironmentFile
 another drop-in (for example `20-*.conf`) is read after it, rename this
 drop-in so it sorts later, then re-run the installer. The installer refuses to
 restart when the security file is not last.
+
+If the installer reports `has AUTH_COOKIE_SECURE=0, expected 1`, systemd
+really did start the process with the old value. Check the merged unit before
+restarting again:
+
+```bash
+systemctl show fixhub-api -p EnvironmentFiles
+systemctl cat fixhub-api --no-pager | grep -E 'EnvironmentFile|Environment='
+```
+
+If it reports `environment is not readable`, the process exited or had not
+exec'd yet. The installer retries that state for up to 30 seconds; if it still
+fails, check `systemctl status` and the journal.
 
 If the security file is last but the process still has the old value, the
 running process predates the change:
