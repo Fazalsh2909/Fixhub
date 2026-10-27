@@ -223,7 +223,7 @@ class Settings(BaseSettings):
     # 1 = agent run commits+pushes+PRs immediately (legacy behaviour).
     # 0 = agent run stops at NEEDS_REVIEW; publish via POST /api/tasks/{id}/approve.
     AUTO_PUBLISH: int = 1
-    # Phase 4.5: must exceed AGENT_BUDGET_S + clone/gates/publish slack so the
+    # Phase 4.5: must exceed AGENT_BUDGET_S + clone/publish slack so the
     # cumulative budget (not the RQ kill) is what normally bounds agent work.
     JOB_TIMEOUT_S: int = 9000
 

@@ -29,7 +29,7 @@ SYSTEM_PROMPT = """You are an AI agent running in FixHub, a coding agent harness
 - Do not modify unrelated files.
 
 # Verification
-- Verify with execution when it is practical: run the focused check that exercises your change. FixHub runs the configured validation gates before publishing.
+- Verify with execution when it is practical: run the focused check that exercises your change. FixHub publishes what you leave in the workspace, so do not leave it knowingly red.
 - Base conclusions on evidence from the repository and tool output. If the evidence contradicts an earlier assumption, say so and follow the evidence.
 - If the task needs no repository change, explain why with evidence instead of making a cosmetic edit.
 

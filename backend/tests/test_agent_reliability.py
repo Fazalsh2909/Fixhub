@@ -3,10 +3,7 @@
 A. relative path resolution        B. absolute path rejection
 C. ../ traversal rejection         D. fixed command working directory
 E. exit-code handling              F. timeout handling
-G. duplicate command detection     H. failed-tool strategy change
-I. CI context injection            J. CI workflow discovery
-K. preflight failure -> NEEDS_REVIEW (+VALIDATION_FAILED)
-L. preflight success -> publish allowed (+VALIDATION_PASSED)
+I. CI context injection
 M. CI failure -> same-task repair (no second PR)
 N. max 3 CI repair attempts        O. successful CI -> COMPLETED
 P. third failed CI -> FAILED       Q. no infinite retry loop
@@ -189,61 +186,8 @@ def test_prompt_states_env_setup_discipline():
     from app.agent import prompt as _prompt
 
     for needle in ("ruff, mypy, and pytest are available",
-                   "pinned tool versions", "validation gates before publishing"):
+                   "pinned tool versions", "publishes what you leave in the workspace"):
         assert needle in _prompt.SYSTEM_PROMPT
-
-
-# --- J: workflow discovery ---
-
-def test_j_workflow_commands_extracted():
-    import os
-
-    from app.verify import gates as _g
-
-    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "mini_repo")
-    cmds = _g._pytest_commands(root, ["tests/test_app.py"])
-    assert cmds and all("deploy" not in c for _, c in cmds)
-    assert any("pytest" in c for _, c in cmds)
-    assert "pytest" in _g.detect_gates(root, ["tests/test_app.py"])
-
-
-# --- K/L: preflight outcomes (+validation events) ---
-
-def test_k_preflight_failure_needs_review_and_event(db, tmp_path, monkeypatch):
-    from tests.test_gates import _repo, _seams, _task
-
-    from app.db.models import TaskEvent
-    from app.tasks import service as _svc
-    from app.verify import gates as _gatesmod
-
-    remote = _repo(tmp_path)
-    t = _task(db)
-    _seams(monkeypatch, _svc)
-    monkeypatch.setattr(_gatesmod, "run_gates", lambda ws, files: (False, "ruff bad"))
-    out = _svc.run_task_inline(t.id, source=remote)
-    assert out["status"] == "NEEDS_REVIEW"
-    types = [e.type for e in db.query(TaskEvent).filter(TaskEvent.task_id == t.id).all()]
-    assert "VALIDATION_STARTED" in types and "VALIDATION_FAILED" in types
-
-
-def test_l_preflight_success_allows_publish_and_event(db, tmp_path, monkeypatch):
-    from tests.test_gates import _repo, _seams, _task
-
-    from app.db.models import TaskEvent
-    from app.tasks import service as _svc
-    from app.verify import gates as _gatesmod
-
-    remote = _repo(tmp_path)
-    t = _task(db)
-    _seams(monkeypatch, _svc)
-    monkeypatch.setattr(_gatesmod, "run_gates", lambda ws, files: (True, "clean"))
-    pushed = {}
-    monkeypatch.setattr(_svc, "_local_commit_push",
-                        lambda path, branch, title, start="": pushed.update(branch=branch))
-    out = _svc.run_task_inline(t.id, source=remote)
-    assert out["status"] == "COMPLETED"
-    types = [e.type for e in db.query(TaskEvent).filter(TaskEvent.task_id == t.id).all()]
-    assert "VALIDATION_PASSED" in types
 
 
 # --- M/N/O/P: CI watcher matrix ---

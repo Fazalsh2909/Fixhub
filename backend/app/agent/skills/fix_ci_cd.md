@@ -8,7 +8,7 @@ The task is to repair the cause of a failing CI run, not to make the run report 
 - Read the code around the failure before editing. Use the workflow content to understand how the step runs; it is context, not a substitute for the error.
 - If the evidence is ambiguous or no log was captured, reproduce the failing step with one command derived from the workflow.
 - Make the smallest change that fixes the underlying defect, matching the surrounding style.
-- Run the narrowest check that exercises the change once. FixHub runs the configured validation gates before publishing.
+- Run the narrowest check that exercises the change once. FixHub publishes what you leave in the workspace, so do not leave it knowingly red.
 
 ## Boundaries
 

@@ -91,8 +91,7 @@ def test_fixture_full_lifecycle(db, tmp_path, monkeypatch):
 
     types = [e.type for e in db.query(TaskEvent).filter(TaskEvent.task_id == task.id).all()]
     for need in ("AGENT_STARTED", "TOOL_CALL", "FILE_CHANGED", "COMMAND_RUN",
-                 "AGENT_FINISHED", "VALIDATION_STARTED", "VALIDATION_PASSED",
-                 "COMMIT_CREATED"):
+                 "AGENT_FINISHED", "COMMIT_CREATED"):
         assert need in types, types
     # The agent read the workflow first (CI-first), not blind browsing.
     reads = [json.loads(e.data_json)["args"].get("path", "")
