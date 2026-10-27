@@ -983,23 +983,6 @@ def _run_agent_tracked(db, task: Task, scope: _LLMScope, **kwargs):
 
     kwargs.setdefault("request_guard", _request_guard)
 
-    def _budget_guard() -> float:
-        """Fraction of the binding budget already spent (advisory)."""
-        try:
-            from app.db.database import SessionLocal as _SessionLocal
-
-            s = _SessionLocal()
-            try:
-                row = s.query(Task).filter(Task.id == task.id).first()
-                if row is None:
-                    return 1.0
-                return _usage_fraction(s, row, buf)
-            finally:
-                s.close()
-        except Exception:
-            return 0.0
-
-    kwargs.setdefault("budget_guard", _budget_guard)
     try:
         result = _loop.run_agent(**kwargs)
     except Exception as exc:

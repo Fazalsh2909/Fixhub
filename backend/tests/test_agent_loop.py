@@ -1,47 +1,6 @@
-"""Agent loop nudge: text-only finish with zero file changes is continued, not accepted."""
+"""Agent loop context compaction and live progress callback tests."""
 from app.agent import loop as _loop
 from app.llm.client import AssistantMessage, ToolCall
-
-
-def _seq(monkeypatch, script, exec_log):
-    calls = {"i": 0}
-
-    def fake_chat(messages, tools=None, **kw):
-        m = script[min(calls["i"], len(script) - 1)]
-        calls["i"] += 1
-        return m
-
-    monkeypatch.setattr(_loop._llm, "chat_completion", fake_chat)
-    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: exec_log.append(name) or "WROTE x")
-
-
-def test_nudge_continues_until_write(monkeypatch, tmp_path):
-    exec_log: list[str] = []
-    _seq(monkeypatch, [
-        AssistantMessage("I will now create the test file.", []),
-        # Phase 4.5 depth: two distinct evidence pieces before write.
-        AssistantMessage("", [ToolCall("0", "read_file", {"path": "t.py"})]),
-        AssistantMessage("", [ToolCall("1", "search_code", {"pattern": "t"})]),
-        AssistantMessage("", [ToolCall("2", "write_file", {"path": "t.py", "content": "x"})]),
-        AssistantMessage("Done, wrote the file.", []),
-    ], exec_log)
-    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
-                          issue_title="t", issue_body="b")
-    assert out.finished is True
-    assert "write_file" in exec_log
-    assert exec_log.count("write_file") == 1
-    assert any(e.get("tool") == "nudge_no_changes" for e in out.events)
-
-
-def test_nudge_gives_up_after_two(monkeypatch, tmp_path):
-    exec_log: list[str] = []
-    _seq(monkeypatch, [AssistantMessage("nothing to do.", [])], exec_log)
-    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
-                          issue_title="t", issue_body="b")
-    assert out.finished is True
-    assert out.summary == "nothing to do."
-    assert sum(1 for e in out.events if e.get("tool") == "nudge_no_changes") == 2
-    assert exec_log == []
 
 
 def test_window_keeps_tool_pairing(monkeypatch):
@@ -159,18 +118,6 @@ def test_ci_task_context_bounds_logs_and_keeps_workflow_visible():
     assert "src/failing_module.py" in message
 
 
-def test_ci_context_workflow_counts_as_evidence_without_re_read():
-    from app.agent import phase
-
-    tracker = phase.InvestigationTracker(skill="fix-ci-cd")
-    tracker.seed_ci_workflow_context(".github/workflows/ci.yml")
-    # Provided workflow counts, but a second distinct evidence item is still required.
-    assert tracker.evidence_met() is False
-    tracker.record("search_code", True, {"pattern": "failing_symbol"})
-    assert tracker.evidence_met() is True
-    assert tracker.phase == phase.DIAGNOSED
-
-
 def test_compacted_command_output_preserves_diagnostic_tail(monkeypatch):
     from app.config import settings as _settings
 
@@ -179,28 +126,6 @@ def test_compacted_command_output_preserves_diagnostic_tail(monkeypatch):
     result = _loop._compact_tool_result("run_command", value)
     assert len(result) <= 1600
     assert "FAILED test_specific_case" in result
-
-
-def test_thrash_guard_stops_rewrites(monkeypatch, tmp_path):
-    from app.config import settings as _settings
-
-    monkeypatch.setattr(_settings, "LLM_MAX_REWRITES_PER_PATH", 3)
-    exec_log: list[str] = []
-    # Phase 4.5 depth: read + search first so the edit is allowed, then thrash guard engages.
-    _seq(monkeypatch, [
-        AssistantMessage("", [ToolCall("0", "read_file", {"path": "a.py"})]),
-        AssistantMessage("", [ToolCall("1", "search_code", {"pattern": "a"})]),
-        AssistantMessage("", [ToolCall("2", "edit_file", {"path": "a.py", "old": "x", "new": "y"})]),
-    ], exec_log)
-    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
-                          issue_title="t", issue_body="b")
-    assert out.finished is True
-    assert "without converging" in out.summary
-    # read + search executed + 1 edit executed; identical-edit repeats are
-    # cache-reused (not re-executed) but still count toward the rewrite guard;
-    # the 4th edit attempt (6th tool call overall) triggers the guard.
-    assert exec_log == ["read_file", "search_code", "edit_file"]
-    assert out.tool_calls == 6
 
 
 def test_on_tool_called_live(monkeypatch, tmp_path):
@@ -218,24 +143,15 @@ def test_on_tool_called_live(monkeypatch, tmp_path):
 
     monkeypatch.setattr(_loop._llm, "chat_completion", fake_chat)
     monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "content")
-    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
-                          issue_title="t", issue_body="b", on_tool=seen.append)
+    out = _loop.run_agent(
+        workspace=str(tmp_path),
+        trigger_type="issue",
+        repository="r",
+        issue_title="t",
+        issue_body="b",
+        on_tool=seen.append,
+    )
     assert out.finished is True
-    # read_file is not a file-changing call, so the no-change nudge fires
-    # (twice, the bounded max) — all go through the live callback.
-    assert [e["tool"] for e in seen] == ["read_file", "nudge_no_changes", "nudge_no_changes"]
+    assert [e["tool"] for e in seen] == ["read_file"]
 
 
-def test_no_nudge_after_real_write(monkeypatch, tmp_path):
-    exec_log: list[str] = []
-    _seq(monkeypatch, [
-        # Phase 4.5 depth requires two evidence pieces; then a real write suppresses nudges.
-        AssistantMessage("", [ToolCall("0", "read_file", {"path": "t.py"})]),
-        AssistantMessage("", [ToolCall("1", "search_code", {"pattern": "t"})]),
-        AssistantMessage("", [ToolCall("2", "write_file", {"path": "t.py", "content": "x"})]),
-        AssistantMessage("Done.", []),
-    ], exec_log)
-    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
-                          issue_title="t", issue_body="b")
-    assert out.finished is True
-    assert not any(e.get("tool") == "nudge_no_changes" for e in out.events)

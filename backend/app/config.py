@@ -61,16 +61,12 @@ class Settings(BaseSettings):
     LLM_HISTORY_GROUPS: int = 4
     LLM_CONTEXT_MAX_CHARS: int = 16000
     LLM_TOOL_RESULT_MAX_CHARS: int = 3000
-    # CI fixes should converge quickly; validation gates provide a second check.
+    # CI fixes should converge quickly; this is the iteration backstop.
     LLM_CI_MAX_ITERATIONS: int = 100
-    # Task-wide cap shared by the initial CI fix and any gate-repair rounds.
-    # 30 (was 1000): a stateless provider re-charges the whole context on every
-    # call, and the old 16-request default was exhausted by investigation
-    # alone; 30 still fails fast on a looping model (stall breaker: 3 turns).
+    # Task-wide request cap for one CI task. 30 (was 1000): a stateless
+    # provider re-charges the whole context on every call, and the old
+    # 16-request default was exhausted by investigation alone.
     LLM_CI_MAX_REQUESTS_PER_TASK: int = 30
-    # Thrash guard: stop rewriting the same file after this many writes/edits
-    # and finish with what exists instead of burning the iteration budget.
-    LLM_MAX_REWRITES_PER_PATH: int = 25
     LLM_MAX_RUNTIME_S: int = 3600
     LLM_MAX_OUTPUT_BYTES: int = 200_000
 

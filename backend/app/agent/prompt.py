@@ -2,9 +2,9 @@
 
 Shape follows OpenCode's v2 harness prompt (identity -> harness ->
 communication -> working in codebases -> verification), with FixHub's
-workspace and publishing facts layered in. Runtime guardrails live in
-``loop.py``/``phase.py``; this text describes the environment rather than a
-phase script, so the model can spend its budget on the failure at hand.
+workspace and publishing facts layered in. Runtime enforcement lives in
+``loop.py``; this text describes the environment rather than a phase script,
+so the model can spend its budget on the failure at hand.
 """
 from __future__ import annotations
 

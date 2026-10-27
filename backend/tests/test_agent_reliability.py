@@ -108,41 +108,6 @@ def test_f_timeout(ws):
     assert _loop._parse_command_result(text)["exit_code"] is None
 
 
-# --- G/H: duplicates + strategy change ---
-
-def test_g_duplicate_success_cached(monkeypatch, tmp_path):
-    calls = []
-    _script(monkeypatch, [
-        AssistantMessage("", [ToolCall("1", "list_directory", {"path": "."})]),
-        AssistantMessage("", [ToolCall("2", "list_directory", {"path": "."})]),
-        AssistantMessage("", [ToolCall("3", "list_directory", {"path": "."})]),
-        AssistantMessage("done exploring, no changes needed.", []),
-    ])
-    monkeypatch.setattr(_loop, "_execute", lambda w, n, a: calls.append(n) or "f1\nf2")
-    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
-                          issue_title="t", issue_body="b")
-    assert calls == ["list_directory"]  # executed once; repeats cache-redirected
-    cached = [e for e in out.events if e.get("cached")]
-    assert len(cached) == 2
-    assert out.finished is True  # nudges exhausted -> accepts no-change finish
-
-
-def test_h_failed_tool_strategy_change(monkeypatch, tmp_path):
-    execs = []
-    _script(monkeypatch, [
-        AssistantMessage("", [ToolCall("1", "read_file", {"path": "nope.py"})]),
-        AssistantMessage("", [ToolCall("2", "read_file", {"path": "nope.py"})]),
-        AssistantMessage("", [ToolCall("3", "read_file", {"path": "nope.py"})]),
-        AssistantMessage("giving up.", []),
-    ])
-    monkeypatch.setattr(_loop, "_execute",
-                        lambda w, n, a: execs.append(n) or "ERROR: file not found: nope.py")
-    out = _loop.run_agent(workspace=str(tmp_path), trigger_type="issue", repository="r",
-                          issue_title="t", issue_body="b")
-    assert execs == ["read_file", "read_file"]  # 3rd identical failure blocked
-    blocked = [e for e in out.events if e.get("blocked")]
-    assert len(blocked) == 1
-
 
 # --- I: CI context injection ---
 
