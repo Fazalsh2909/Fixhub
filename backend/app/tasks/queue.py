@@ -41,6 +41,53 @@ def run_repair_job(task_id: int) -> dict:
     return _svc.run_task_inline(task_id, repair=True, worker_id=worker_identity())
 
 
+_LIVE_JOB_STATES = {"queued", "started", "deferred", "scheduled"}
+
+
+def is_repair_round(task) -> bool:
+    """True when a QUEUED row is a CI repair round, not an initial run.
+
+    `ciwatch` records the attempt number before re-queuing, so the row itself
+    says which job kind must be used. Initial CI tasks always have attempt 0.
+    """
+    try:
+        return (
+            str(getattr(task, "trigger_type", "") or "") == "ci"
+            and int(getattr(task, "ci_attempt_count", 0) or 0) > 0
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def job_id_for_task(task) -> str:
+    """Deterministic RQ job id for the row's CURRENT run kind.
+
+    Repair rounds use `fixhub-repair-<id>-<attempt>` (ciwatch); everything else
+    uses `fixhub-task-<id>`. Reconcilers must probe the same id the enqueue
+    path will use, otherwise a live repair job looks like a missing job.
+    """
+    if is_repair_round(task):
+        return f"fixhub-repair-{task.id}-{int(task.ci_attempt_count or 0)}"
+    return f"fixhub-task-{task.id}"
+
+
+def enqueue_for_task(task_id: int) -> dict[str, Any]:
+    """Enqueue the correct job kind for an existing task row. Never raises."""
+    from app.db.database import SessionLocal as _SessionLocal
+    from app.db.models import Task as _Task
+
+    db = _SessionLocal()
+    try:
+        task = db.query(_Task).filter(_Task.id == task_id).first()
+        if task is None:
+            return {"enqueued": False, "error": "task not found"}
+        if is_repair_round(task):
+            return enqueue_repair(task_id)
+        return enqueue_task(task_id)
+    finally:
+        db.close()
+
+
 def _concurrency_blocked(db, task) -> str:
     """Phase 4: global / per-user / per-repo running-task caps (0 = unlimited).
 
@@ -104,13 +151,40 @@ def _usage_blocked(db, task) -> str:
 def _enqueue_deduped(q, fn, task_id: int, job_id: str, **kwargs) -> dict[str, Any]:
     """Enqueue with a deterministic job id. A repeat delivery of the same
     task collapses to the already-queued job instead of a second execution.
-    The DB claim remains the final arbiter against true races."""
+    The DB claim remains the final arbiter against true races.
+
+    A FINISHED/FAILED job keeps its id for `result_ttl` (24h). Treating that
+    leftover as a live duplicate made an explicit retry silently do nothing,
+    so terminal leftovers are deleted and the id reused.
+    """
     try:
         existing = q.fetch_job(job_id)
     except Exception:
         existing = None
     if existing is not None:
-        return {"enqueued": True, "job_id": existing.id, "duplicate": True}
+        getter = getattr(existing, "get_status", None)
+        if getter is None:
+            # Legacy/fake job object: preserve the old duplicate contract.
+            return {"enqueued": True, "job_id": existing.id, "duplicate": True}
+        try:
+            status = str(getter(refresh=True) or "").lower()
+        except Exception:
+            # Unknown queue state: never risk double execution; fail clear.
+            return {
+                "enqueued": False,
+                "error": "queue job state unavailable; retry",
+                "job_id": job_id,
+            }
+        if status in _LIVE_JOB_STATES:
+            return {"enqueued": True, "job_id": existing.id, "duplicate": True}
+        try:
+            existing.delete()
+        except Exception as exc:
+            return {
+                "enqueued": False,
+                "error": f"stale queue job could not be replaced: {exc}"[:300],
+                "job_id": job_id,
+            }
     try:
         job = q.enqueue(fn, task_id, job_id=job_id, **kwargs)
         return {"enqueued": True, "job_id": job.id}
@@ -185,6 +259,15 @@ def job_failed(job, exc=None, *args, **kwargs) -> None:
             task.status = "FAILED"
             task.error = f"worker job crashed: {err}"[:1000]
             task.updated_at = datetime.now(timezone.utc)
+            # Terminal state must free the active dedupe identity, exactly like
+            # every other FAILED transition (see service._release_active_keys).
+            try:
+                from app.tasks.service import _release_active_keys
+
+                _release_active_keys(task)
+            except Exception:
+                task.dedupe_key = None
+                task.active_issue_key = None
             db.add(
                 TaskEvent(
                     task_id=task_id,

@@ -151,6 +151,38 @@ def extract_failure_signal(lines: list[str], *, max_bytes: int = 6000) -> str:
     return selected[:head] + marker + (selected[-tail:] if tail else "")
 
 
+def list_run_jobs(*, token: str, full_name: str, run_id: str) -> list[dict]:
+    """Jobs of one workflow run: [{id, name, conclusion, steps}]. Raises."""
+    jobs_url = (
+        f"{settings.GITHUB_API_URL}/repos/{full_name}/actions/runs/{run_id}/jobs"
+    )
+    resp = httpx.get(url=jobs_url, headers=_headers(token), timeout=30)
+    resp.raise_for_status()
+    return resp.json().get("jobs", []) or []
+
+
+_FAILED_JOB_CONCLUSIONS = {"failure", "timed_out", "startup_failure"}
+
+
+def _is_failed_job(job: dict) -> bool:
+    return str(job.get("conclusion") or "").lower() in _FAILED_JOB_CONCLUSIONS
+
+
+def _find_job(jobs: list[dict], job_name: str) -> dict | None:
+    """Exact match first, then case/space-insensitive (matrix job names)."""
+    name = (job_name or "").strip()
+    if not name:
+        return None
+    for job in jobs:
+        if job.get("name") == name:
+            return job
+    low = name.lower()
+    for job in jobs:
+        if str(job.get("name") or "").strip().lower() == low:
+            return job
+    return None
+
+
 def failed_log_tail(
     *,
     token: str,
@@ -167,17 +199,38 @@ def failed_log_tail(
     is downloaded; failure sections are extracted and noise (warnings
     summaries, timestamps) is dropped. Bounded; raises on API failure so
     callers can fall back to failing_logs_excerpt().
+
+    Job selection: an explicit `job_name` wins when that job is the failing
+    one; otherwise the actual failed job is selected (never `jobs[0]`, which
+    is usually a passing setup job and produced useless "evidence"). When the
+    caller passes a workflow name by mistake, it matches no job and the failed
+    job is still chosen.
     """
-    jobs_url = f"{settings.GITHUB_API_URL}/repos/{full_name}/actions/runs/{run_id}/jobs"
-    resp = httpx.get(url=jobs_url, headers=_headers(token), timeout=30)
-    resp.raise_for_status()
-    jobs = resp.json().get("jobs", [])
-    failed = [j for j in jobs if j.get("conclusion") == "failure"] or jobs[:1]
-    if job_name:
-        named = [j for j in failed if j.get("name") == job_name]
-        if named:
-            failed = named
-    job = failed[0]
+    jobs = list_run_jobs(token=token, full_name=full_name, run_id=run_id)
+    if not jobs:
+        raise RuntimeError(f"workflow run {run_id} reported no jobs")
+    failed = [j for j in jobs if _is_failed_job(j)]
+    named = _find_job(jobs, job_name)
+    if named is not None and (not failed or named in failed):
+        job = named
+    elif failed:
+        # Prefer a job with an explicitly failed step: matrix jobs can be
+        # marked failed while a sibling job carries the useful error.
+        job = next(
+            (
+                j
+                for j in failed
+                if any(
+                    str((s or {}).get("conclusion") or "").lower() == "failure"
+                    for s in (j.get("steps") or [])
+                )
+            ),
+            failed[0],
+        )
+    elif named is not None:
+        job = named
+    else:
+        raise RuntimeError(f"workflow run {run_id} has no failed job to read")
     log_url = (
         f"{settings.GITHUB_API_URL}/repos/{full_name}/actions/jobs/{job.get('id')}/logs"
     )

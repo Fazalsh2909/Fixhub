@@ -190,6 +190,7 @@ def run_agent(
             max(1, int(getattr(settings, "LLM_CI_MAX_ITERATIONS", 24))),
         )
 
+    governor = _Governor()
     for i in range(iteration_limit):
         iterations = i + 1
         if _cancelled():
@@ -205,12 +206,17 @@ def run_agent(
         if not _lease_ok():
             return _lease_lost_result()
         # Final hardening: verify per-user usage budget before every LLM
-        # request. The guard returns "" (allowed) or a limit reason.
+        # request. The guard returns "" (allowed) or a limit reason. A guard
+        # exception is fatal (fail closed): an unverifiable budget must never
+        # authorize another paid provider call.
         if request_guard is not None:
             try:
                 _limit_reason = request_guard()
-            except Exception:
-                _limit_reason = ""
+            except Exception as exc:
+                _limit_reason = (
+                    f"budget check failed ({type(exc).__name__}); "
+                    "stopping without further provider calls"
+                )
             if _limit_reason:
                 _emit(
                     {
@@ -282,19 +288,34 @@ def run_agent(
                 )
             tool_calls += 1
             args = tc.arguments or {}
-            result = _compact_tool_result(tc.name, _execute(workspace, tc.name, args))
-            meta = _parse_command_result(result) if tc.name == "run_command" else {}
-            # exit_code is authoritative (null = timeout). A non-zero command
-            # is a failed command, not a successful action: it must never count
-            # as progress or investigation evidence.
-            failed_command = bool(meta) and (
-                meta.get("timed_out") is True
-                or (
-                    meta.get("exit_code") is not None
-                    and meta.get("exit_code") != 0
+            blocked = governor.before(tc.name, args)
+            if blocked is not None:
+                result = blocked
+                meta: dict = {}
+                ok = False
+                governor.blocked_step()
+            else:
+                cached = governor.cached(tc.name, args)
+                result = (
+                    cached
+                    if cached is not None
+                    else _compact_tool_result(
+                        tc.name, _execute(workspace, tc.name, args)
+                    )
                 )
-            )
-            ok = not result.startswith("ERROR") and not failed_command
+                meta = _parse_command_result(result) if tc.name == "run_command" else {}
+                # exit_code is authoritative (null = timeout). A non-zero
+                # command is a failed command, not a successful action: it must
+                # never count as progress or investigation evidence.
+                failed_command = bool(meta) and (
+                    meta.get("timed_out") is True
+                    or (
+                        meta.get("exit_code") is not None
+                        and meta.get("exit_code") != 0
+                    )
+                )
+                ok = not result.startswith("ERROR") and not failed_command
+                governor.after(tc.name, args, result, ok)
             if ok:
                 state.last_successful_action = tc.name
                 if tc.name in ("write_file", "edit_file"):
@@ -312,8 +333,34 @@ def run_agent(
                 "step": tool_calls,
             }
             ev.update(meta)
+            if blocked is not None:
+                ev["blocked"] = True
+                ev["governor"] = True
             _emit(ev)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+            # Recovery nudge after a stretch of redundant activity; stop
+            # honestly if the run cannot produce new evidence.
+            note = governor.nudge()
+            if note:
+                messages.append({"role": "user", "content": note})
+            if governor.stalled():
+                _emit(
+                    {
+                        "tool": "stall",
+                        "args": {},
+                        "ok": False,
+                        "blocked": True,
+                        "stalled": True,
+                        "step": tool_calls,
+                    }
+                )
+                return LoopResult(
+                    False,
+                    "stalled: repeated actions produced no new evidence",
+                    iterations,
+                    tool_calls,
+                    events,
+                )
             # Final hardening: revalidate after every tool execution. A slow
             # tool (or a reap during execution) must not continue the batch
             # or reach the next LLM request on a dead lease.
@@ -434,6 +481,148 @@ def _fit_history_span(span: list[dict], budget: int) -> list[dict] | None:
     if sum(_message_size(m) for m in fitted) <= budget:
         return fitted
     return None
+
+
+class _Governor:
+    """General-purpose runtime safeguards (never dictates the plan).
+
+    Observes tool activity and refuses *redundant execution*: repeated reads
+    are answered from a mutation-invalidated cache, identical failing
+    commands/edits are bounded, and a run with no new evidence is nudged once
+    and then stopped honestly. The model remains free to choose any action.
+    """
+
+    READ_TOOLS = {
+        "read_file",
+        "list_directory",
+        "search_code",
+        "git_status",
+        "git_diff",
+    }
+    MUTATION_TOOLS = {"write_file", "edit_file"}
+
+    def __init__(self) -> None:
+        self.read_cache: dict[str, str] = {}
+        self.read_hits: dict[str, int] = {}
+        self.failed_edits: dict[str, int] = {}
+        self.cmd_results: dict[str, str] = {}
+        self.cmd_failures: dict[str, int] = {}
+        self.no_evidence = 0
+        self.nudges = 0
+
+    @staticmethod
+    def _key(name: str, args: dict) -> str:
+        try:
+            return name + ":" + json.dumps(args, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return name + ":" + str(args)
+
+    def before(self, name: str, args: dict) -> str | None:
+        """Return a suppression/block message, or None to execute."""
+        key = self._key(name, args)
+        if name == "edit_file":
+            if self.failed_edits.get(key, 0) >= int(
+                getattr(settings, "LLM_REPEAT_SUPPRESS_FAILED_EDITS", 5)
+            ):
+                return (
+                    "ERROR: this exact edit already failed repeatedly. Re-read the "
+                    "file (or the closest lines from the last error), then make a "
+                    "different edit."
+                )
+        if name == "run_command":
+            if self.cmd_failures.get(key, 0) >= int(
+                getattr(settings, "LLM_REPEAT_SUPPRESS_COMMANDS", 3)
+            ):
+                return (
+                    "ERROR: this exact command already failed repeatedly. Change "
+                    "the command, inspect the error, or take a different approach."
+                )
+        if name in self.READ_TOOLS:
+            hits = self.read_hits.get(key, 0)
+            cap = int(getattr(settings, "LLM_REPEAT_SUPPRESS_READS", 3))
+            if hits > cap:
+                return (
+                    "ERROR: identical read suppressed (already returned "
+                    f"{cap + 1} times). The workspace has not changed; use a "
+                    "different path/range or act on what you have."
+                )
+        return None
+
+    def cached(self, name: str, args: dict) -> str | None:
+        """Cached read result (with a provenance note), or None to execute."""
+        if name not in self.READ_TOOLS:
+            return None
+        key = self._key(name, args)
+        if key not in self.read_cache:
+            return None
+        self.read_hits[key] = self.read_hits.get(key, 0) + 1
+        return (
+            self.read_cache[key]
+            + "\n[cached: identical read; workspace unchanged since the first result]"
+        )
+
+    def after(self, name: str, args: dict, result: str, ok: bool) -> None:
+        key = self._key(name, args)
+        evidence = False
+        if name in self.MUTATION_TOOLS:
+            if ok:
+                # A real mutation invalidates every cached read.
+                self.read_cache.clear()
+                self.read_hits.clear()
+                self.failed_edits.pop(key, None)
+                evidence = True
+            else:
+                if name == "edit_file":
+                    self.failed_edits[key] = self.failed_edits.get(key, 0) + 1
+        elif name in self.READ_TOOLS:
+            if key not in self.read_cache:
+                self.read_cache[key] = result
+                evidence = True
+            self.read_hits[key] = self.read_hits.get(key, 0) + 1
+        elif name == "run_command":
+            # Commands can mutate the workspace (formatters, git checkout,
+            # codegen), so a cached read may be stale afterwards. Drop the
+            # cached content but keep hit counts: the anti-repeat bounds and
+            # stall detector must still apply.
+            self.read_cache.clear()
+            previous = self.cmd_results.get(key)
+            if previous is None or previous != result:
+                evidence = True
+            self.cmd_results[key] = result
+            if ok:
+                self.cmd_failures.pop(key, None)
+            else:
+                self.cmd_failures[key] = self.cmd_failures.get(key, 0) + 1
+        if evidence:
+            self.no_evidence = 0
+            self.nudges = 0
+        else:
+            self.no_evidence += 1
+
+    def blocked_step(self) -> None:
+        """A suppressed/blocked tool call produced no new evidence.
+
+        Without this, a model looping on a suppressed read would never trip
+        the stall detector (blocked calls skip `after`), spinning until the
+        hard iteration cap.
+        """
+        self.no_evidence += 1
+
+    def nudge(self) -> str | None:
+        window = max(2, int(getattr(settings, "LLM_STALL_WINDOW", 8)))
+        if self.no_evidence >= window and self.nudges < 2:
+            self.nudges += 1
+            return (
+                "Runtime note: the last several actions produced no new evidence "
+                "(identical reads/commands or rejected edits). Stop repeating them: "
+                "read a different region, change the command, or make the concrete "
+                "edit you already have enough information for."
+            )
+        return None
+
+    def stalled(self) -> bool:
+        window = max(2, int(getattr(settings, "LLM_STALL_WINDOW", 8)))
+        return self.no_evidence >= 2 * window
 
 
 def _diagnosis_brief(ctx) -> str:

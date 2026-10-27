@@ -66,10 +66,25 @@ class Task(Base):
     ci_job: Mapped[str] = mapped_column(String(255), default="")
     ci_url: Mapped[str] = mapped_column(String(512), default="")
     ci_excerpt: Mapped[str] = mapped_column(Text, default="")
+    # CI source context: which revision/branch/PR the failure came from, so a
+    # fix PR targets the right base and never silently lands against `main`
+    # for a feature-branch failure. NULL/"" = legacy rows (default-branch
+    # behavior). ci_is_fork marks forked-PR failures (never pushed to the fork).
+    ci_head_branch: Mapped[str] = mapped_column(String(255), default="")
+    ci_base_branch: Mapped[str] = mapped_column(String(255), default="")
+    ci_pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ci_is_fork: Mapped[int] = mapped_column(Integer, default=0)
+    # Bounded patience for a published commit whose check conclusion stays
+    # unknown (permissions/outage): FAILED(ci_unobservable) instead of forever.
+    ci_unobservable_ticks: Mapped[int] = mapped_column(Integer, default=0)
     # Phase 6: one task per external event. CI uses `ci:<owner/repo>:<sha>`;
     # issue tasks stay NULL (deduped by the active-task check instead). The
     # unique index is the arbiter against concurrent webhook deliveries.
     dedupe_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # Issue dedupe: `issue:<owner/repo>:<number>` while the task is active;
+    # cleared on every terminal transition so a reopened/re-triggered issue can
+    # create a new task. The unique index serializes concurrent deliveries.
+    active_issue_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # Phase 4: QUEUED birth + atomic worker claim (QUEUED -> RUNNING).
     # Lifecycle: QUEUED -> RUNNING -> COMPLETED|FAILED|BLOCKED|NEEDS_REVIEW|CANCELLED|AWAITING_CI;
     # AWAITING_CI -> COMPLETED | RUNNING (repair) | FAILED.
@@ -111,6 +126,7 @@ class Task(Base):
         Index("ix_tasks_owner_status", "owner_id", "status"),
         Index("ix_tasks_repo_status", "repository", "status"),
         Index("ix_tasks_dedupe_key", "dedupe_key", unique=True),
+        Index("ix_tasks_active_issue_key", "active_issue_key", unique=True),
     )
 
 
@@ -144,10 +160,28 @@ class PullRequest(Base):
 
 
 class WebhookDelivery(Base):
+    """Durable webhook inbox: a delivery is ack'd only after this row commits.
+
+    `state` moves received -> processed|rejected. A row stuck in `received`
+    (process crash between commit and effects) is re-processed by the
+    recovery sweep; task creation is idempotent (dedupe keys + CAS), so
+    replay never duplicates work. Existing rows default to `processed`.
+    """
+
     __tablename__ = "webhook_deliveries"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     delivery_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    state: Mapped[str] = mapped_column(String(16), default="processed", index=True)
+    event_type: Mapped[str] = mapped_column(String(64), default="")
+    payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    received_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )

@@ -85,9 +85,26 @@ _SCHEMA_PATCHES = {
         # Phase 6: one task per external event (CI dedupe). The unique index is
         # created below; a bare column is safe because existing rows are NULL.
         ("dedupe_key", "VARCHAR(512)"),
+        # Reliability remediation (0008): CI source context + issue dedupe.
+        ("ci_head_branch", "VARCHAR(255) NOT NULL DEFAULT ''"),
+        ("ci_base_branch", "VARCHAR(255) NOT NULL DEFAULT ''"),
+        ("ci_pr_number", "INTEGER"),
+        ("ci_is_fork", "INTEGER NOT NULL DEFAULT 0"),
+        ("ci_unobservable_ticks", "INTEGER NOT NULL DEFAULT 0"),
+        ("active_issue_key", "VARCHAR(512)"),
     ],
     "repositories": [
         ("owner_id", "INTEGER REFERENCES users(id)"),
+    ],
+    # Durable webhook inbox (0008). Legacy rows become 'processed' so a dev
+    # upgrade never replays historical deliveries.
+    "webhook_deliveries": [
+        ("state", "VARCHAR(16) NOT NULL DEFAULT 'processed'"),
+        ("event_type", "VARCHAR(64) NOT NULL DEFAULT ''"),
+        ("payload", "TEXT"),
+        ("error", "TEXT NOT NULL DEFAULT ''"),
+        ("received_at", "TIMESTAMP"),
+        ("processed_at", "TIMESTAMP"),
     ],
 }
 
@@ -132,18 +149,21 @@ def ensure_columns() -> None:
 
     # Indexes are not expressible as column patches. Keep pre-existing dev
     # databases aligned with the Alembic migration (production never gets here).
-    try:
-        with engine.begin() as conn:
-            conn.execute(
-                _text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_tasks_dedupe_key "
-                    "ON tasks (dedupe_key)"
-                )
-            )
-    except Exception:
-        # Duplicate legacy values would block the index; production is handled
-        # by Alembic, and dev can rebuild the SQLite file.
-        pass
+    for ddl in (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_tasks_dedupe_key "
+        "ON tasks (dedupe_key)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_tasks_active_issue_key "
+        "ON tasks (active_issue_key)",
+        "CREATE INDEX IF NOT EXISTS ix_webhook_deliveries_state "
+        "ON webhook_deliveries (state)",
+    ):
+        try:
+            with engine.begin() as conn:
+                conn.execute(_text(ddl))
+        except Exception:
+            # Duplicate legacy values would block a unique index; production is
+            # handled by Alembic, and dev can rebuild the SQLite file.
+            pass
 
 
 def get_db():

@@ -259,6 +259,89 @@ def build_ci_context(*, event_type: str, payload: dict, repo_name: str) -> dict:
     return ctx
 
 
+def build_ci_context_from_task(task) -> dict:
+    """Worker-side enrichment for a CI task (best-effort, never raises).
+
+    Reconstructs the same evidence fields the webhook used to fetch inline,
+    but without blocking the HTTP acknowledgement path. The revision comes
+    only from the task row (`ci_sha`), so enrichment can never change which
+    revision is being repaired.
+    """
+    ctx: dict = {
+        "provider": "github",
+        "workflow_name": getattr(task, "ci_workflow", "") or "",
+        "workflow_file": "",
+        "workflow_content": "",
+        "run_id": getattr(task, "ci_run_id", "") or "",
+        "commit_sha": getattr(task, "ci_sha", "") or "",
+        "branch": getattr(task, "ci_head_branch", "") or "",
+        "base_branch": getattr(task, "ci_base_branch", "") or "",
+        "pr_number": getattr(task, "ci_pr_number", None),
+        "is_fork": bool(getattr(task, "ci_is_fork", 0)),
+        "job": getattr(task, "ci_job", "") or "",
+        "step": "",
+        "exit_code": "",
+        "failure_logs": "",
+        "annotations": "",
+        "changed_files": "",
+        "url": getattr(task, "ci_url", "") or "",
+        "deferred": False,
+    }
+    try:
+        repo_name = getattr(task, "repository", "") or ""
+        token = _repo_token(repo_name)
+        if not token:
+            return ctx
+        run_id = ctx["run_id"]
+        if run_id and not ctx["workflow_file"]:
+            try:
+                from app.github import client as _ghc
+
+                wr = _ghc.get_workflow_run(
+                    token=token, full_name=repo_name, run_id=run_id
+                )
+                ctx["workflow_name"] = ctx["workflow_name"] or wr.get("name", "")
+                ctx["workflow_file"] = wr.get("path", "")
+            except Exception:
+                pass
+        if ctx["workflow_file"] and ctx["commit_sha"]:
+            try:
+                from app.github import client as _ghc
+
+                ctx["workflow_content"] = _ghc.get_workflow_content(
+                    token=token,
+                    full_name=repo_name,
+                    path=ctx["workflow_file"],
+                    ref=ctx["commit_sha"],
+                )[:6000]
+            except Exception:
+                pass
+        if run_id:
+            try:
+                steps = _gh_steps(token, repo_name, run_id)
+                if steps:
+                    # Preserve the exact identified job; only fill when absent.
+                    ctx["job"] = ctx["job"] or steps[0]["job"]
+                    ctx["step"] = "; ".join(
+                        f"{s['step']} ({s['conclusion']})" for s in steps[:4]
+                    )
+            except Exception:
+                pass
+        if ctx["pr_number"]:
+            try:
+                from app.github import client as _ghc
+
+                files = _ghc.pull_files(
+                    token=token, full_name=repo_name, number=int(ctx["pr_number"])
+                )
+                ctx["changed_files"] = ", ".join(files[:20])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ctx
+
+
 def _gh_steps(token: str, repo_name: str, run_id: str) -> list[dict]:
     from app.github import client as _ghc
 
@@ -407,12 +490,59 @@ def _dedupe_key(repo_name: str, sha: str) -> str:
     return f"ci:{repo_name.strip().lower()}:{sha.strip()}"[:512]
 
 
+def _issue_key(repo_name: str, number: int | None) -> str:
+    return f"issue:{repo_name.strip().lower()}:{int(number or 0)}"[:512]
+
+
+_ACTIVE_STATUSES = ("QUEUED", "RUNNING", "AWAITING_CI", "NEEDS_REVIEW")
+
+
+def _existing_ci_task(db: Session, *, repo_name: str, sha: str, key: str) -> Task | None:
+    """An ACTIVE task for this CI unit of work (repo+sha).
+
+    Terminal tasks are history, not a permanent veto: a genuinely new failing
+    run on the same revision must be able to create a new repair task. The
+    legacy `ci_sha` guard covers pre-dedupe rows whose key is NULL.
+    """
+    dup = (
+        db.query(Task)
+        .filter(Task.dedupe_key == key, Task.status.in_(_ACTIVE_STATUSES))
+        .first()
+    )
+    if dup is None:
+        dup = _active_ci_task(db, repo_name=repo_name, sha=sha)
+    return dup
+
+
 def _insert_task(db: Session, task: Task, *, dedupe_key: str = "") -> tuple[Task, str]:
-    """Insert a task; a racing twin returns the winner instead of a 500."""
+    """Insert a task; a racing twin returns the winner instead of a 500.
+
+    Terminal history rows holding the same key are released first: the unique
+    index enforces one ACTIVE task per key, not one task ever.
+    """
     from sqlalchemy.exc import IntegrityError
 
     if dedupe_key:
-        existing = db.query(Task).filter(Task.dedupe_key == dedupe_key).first()
+        stale = (
+            db.query(Task)
+            .filter(
+                Task.dedupe_key == dedupe_key,
+                Task.status.notin_(_ACTIVE_STATUSES),
+            )
+            .all()
+        )
+        for row in stale:
+            row.dedupe_key = None
+        if stale:
+            db.flush()
+        existing = (
+            db.query(Task)
+            .filter(
+                Task.dedupe_key == dedupe_key,
+                Task.status.in_(_ACTIVE_STATUSES),
+            )
+            .first()
+        )
         if existing is not None:
             return existing, "dedupe_key"
         task.dedupe_key = dedupe_key
@@ -422,7 +552,14 @@ def _insert_task(db: Session, task: Task, *, dedupe_key: str = "") -> tuple[Task
     except IntegrityError:
         db.rollback()
         if dedupe_key:
-            existing = db.query(Task).filter(Task.dedupe_key == dedupe_key).first()
+            existing = (
+                db.query(Task)
+                .filter(
+                    Task.dedupe_key == dedupe_key,
+                    Task.status.in_(_ACTIVE_STATUSES),
+                )
+                .first()
+            )
             if existing is not None:
                 return existing, "dedupe_key"
         raise
@@ -563,19 +700,42 @@ async def github_webhook(
         return JSONResponse(status_code=401, content={"error": "bad signature"})
     if not x_github_delivery:
         return JSONResponse(status_code=400, content={"error": "missing delivery id"})
+    # Parse BEFORE touching the inbox: a malformed payload must not consume
+    # the delivery id (GitHub's retry could never succeed, but an operator
+    # replay of a corrected payload should not be blocked by a burned row).
+    try:
+        payload = json.loads(body.decode("utf-8") or "{}")
+    except (ValueError, UnicodeDecodeError):
+        return JSONResponse(status_code=400, content={"error": "malformed payload"})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "malformed payload"})
 
     db = SessionLocal()
     try:
-        # Phase 4: durable idempotency. The pre-check is fast-path only; the
-        # UNIQUE constraint is the arbiter — a concurrent twin delivery loses
-        # here with IntegrityError and is reported as duplicate (no 500).
-        if (
+        row = (
             db.query(WebhookDelivery)
             .filter(WebhookDelivery.delivery_id == x_github_delivery)
             .first()
-        ):
+        )
+        if row is not None:
+            if row.state == "received":
+                # A previous attempt crashed after the durable commit but
+                # before its effects landed: process it now (idempotent).
+                return _process_delivery(db, row)
             return {"ok": True, "duplicate": True}
-        db.add(WebhookDelivery(delivery_id=x_github_delivery))
+        # Durable trigger first. Nothing is processed until this row exists,
+        # so a crash can never lose a signed delivery.
+        row = WebhookDelivery(
+            delivery_id=x_github_delivery,
+            state="received",
+            event_type=x_github_event,
+            # Store the payload verbatim: slicing the JSON string would make
+            # large-but-valid deliveries unparseable on replay (the column is
+            # Text, so there is no need to truncate).
+            payload=json.dumps(payload),
+            received_at=_utcnow(),
+        )
+        db.add(row)
         try:
             db.commit()
         except Exception as exc:
@@ -585,15 +745,150 @@ async def github_webhook(
             if isinstance(exc, IntegrityError):
                 return {"ok": True, "duplicate": True}
             raise
+        db.refresh(row)
+        return _process_delivery(db, row)
+    finally:
+        db.close()
 
-        payload = json.loads(body.decode("utf-8") or "{}")
-        if x_github_event == "issues":
-            return _handle_issue(db, payload)
-        if x_github_event == "workflow_run":
-            return _handle_workflow_run(db, payload)
-        if x_github_event == "check_run":
-            return _handle_check_run(db, payload)
-        return {"ok": True, "ignored": x_github_event}
+
+def _utcnow():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)
+
+
+def _process_delivery(db: Session, row: WebhookDelivery) -> dict:
+    """Apply one durable delivery; mark it processed only after effects commit.
+
+    Handlers are idempotent (active-task dedupe + unique keys), so replaying a
+    `received` row after a crash is safe. A handler exception leaves the row in
+    `received` (surfaced as 500 so GitHub retries; the recovery sweep also
+    retries it) instead of silently swallowing the trigger.
+    """
+    from fastapi.responses import JSONResponse
+
+    try:
+        payload = json.loads(row.payload or "{}")
+    except (TypeError, ValueError):
+        row.state = "rejected"
+        row.error = "malformed stored payload"
+        row.processed_at = _utcnow()
+        db.commit()
+        return {"ok": False, "error": "malformed payload"}
+    event = row.event_type or ""
+    delivery_id = row.delivery_id
+    try:
+        if event == "issues":
+            out = _handle_issue(db, payload)
+        elif event == "workflow_run":
+            out = _handle_workflow_run(db, payload)
+        elif event == "check_run":
+            out = _handle_check_run(db, payload)
+        else:
+            out = {"ok": True, "ignored": event}
+        ok = bool(out.get("ok", True))
+        row.state = "processed" if ok else "rejected"
+        row.error = "" if ok else str(out.get("error") or out.get("ignored") or "")[:1000]
+        row.processed_at = _utcnow()
+        db.commit()
+        return out
+    except Exception as exc:
+        # Keep state=received so the retry path can finish the effects.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            fresh = (
+                db.query(WebhookDelivery)
+                .filter(WebhookDelivery.delivery_id == delivery_id)
+                .first()
+            )
+            if fresh is not None:
+                fresh.error = str(exc)[:1000]
+                db.commit()
+        except Exception:
+            db.rollback()
+        log.exception("webhook delivery %s failed", delivery_id)
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": "delivery processing failed; retry"},
+        )
+
+
+def _prune_deliveries(db: Session) -> int:
+    """Delete terminal inbox rows past the retention window. Never raises."""
+    from datetime import timedelta
+
+    from app.db.database import utcnow
+
+    hours = max(1, int(getattr(settings, "WEBHOOK_DELIVERY_RETENTION_HOURS", 168)))
+    cutoff = utcnow() - timedelta(hours=hours)
+    try:
+        removed = (
+            db.query(WebhookDelivery)
+            .filter(
+                WebhookDelivery.state.in_(("processed", "rejected")),
+                WebhookDelivery.created_at.isnot(None),
+                WebhookDelivery.created_at < cutoff,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return int(removed or 0)
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return 0
+
+
+def reprocess_pending_deliveries(*, stale_s: int | None = None, limit: int = 20) -> dict:
+    """Recovery sweep: re-apply deliveries stuck in `received`. Never raises."""
+    from datetime import timedelta
+
+    from app.db.database import utcnow
+
+    grace = int(settings.WEBHOOK_DELIVERY_STALE_S if stale_s is None else stale_s)
+    db = SessionLocal()
+    try:
+        cutoff = utcnow() - timedelta(seconds=max(0, grace))
+        rows = (
+            db.query(WebhookDelivery)
+            .filter(
+                WebhookDelivery.state == "received",
+                WebhookDelivery.received_at.isnot(None),
+                WebhookDelivery.received_at < cutoff,
+            )
+            .order_by(WebhookDelivery.id.asc())
+            .limit(max(1, int(limit)))
+            .all()
+        )
+        done = 0
+        failed = 0
+        for row in rows:
+            try:
+                out = _process_delivery(db, row)
+                if isinstance(out, dict) and out.get("ok", True):
+                    done += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        pruned = _prune_deliveries(db)
+        return {
+            "checked": len(rows),
+            "processed": done,
+            "failed": failed,
+            "pruned": pruned,
+        }
+    except Exception as exc:
+        return {"checked": 0, "processed": 0, "failed": 0, "error": str(exc)[:300]}
     finally:
         db.close()
 
@@ -630,9 +925,20 @@ def _handle_issue(db: Session, payload: dict) -> dict:
         issue_body=(issue.get("body") or "")[:8000],
         issue_url=issue.get("html_url", ""),
         status="QUEUED",
+        active_issue_key=_issue_key(repo_name, issue.get("number")),
     )
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
+
     db.add(task)
-    db.commit()
+    try:
+        db.commit()
+    except _IntegrityError:
+        # Concurrent delivery/UI request won the active-issue key: return it.
+        db.rollback()
+        dup = _active_issue_task(db, repo_name=repo_name, number=issue.get("number"))
+        if dup is not None:
+            return {"ok": True, "task_id": dup.id, "duplicate": "active_task"}
+        raise
     db.refresh(task)
     _event(
         db, task.id, "TASK_CREATED", {"trigger": "issue", "issue": task.issue_number}
@@ -684,10 +990,23 @@ def _handle_workflow_run(db: Session, payload: dict) -> dict:
     sha = str(run.get("head_sha") or "")
     if not sha:
         return _ignored("workflow_run", "missing_sha", repository=repo_name)
+    # Source context: which branch/PR produced this failure. Never assume the
+    # failing revision came from the default branch.
+    prs = run.get("pull_requests") or []
+    pr = prs[0] if prs else {}
+    pr_head = (pr.get("head") or {}) if isinstance(pr, dict) else {}
+    pr_base = (pr.get("base") or {}) if isinstance(pr, dict) else {}
+    head_repo = (
+        (pr_head.get("repo") or {}).get("full_name")
+        or (run.get("head_repository") or {}).get("full_name")
+        or repo_name
+    )
+    head_branch = str(pr_head.get("ref") or branch or "")
+    base_branch = str(pr_base.get("ref") or repo.default_branch or "main")
+    pr_number = pr.get("number") if isinstance(pr, dict) else None
+    is_fork = 1 if str(head_repo).lower() != repo_name.lower() else 0
     key = _dedupe_key(repo_name, sha)
-    dup = db.query(Task).filter(Task.dedupe_key == key).first()
-    if dup is None:
-        dup = _active_ci_task(db, repo_name=repo_name, sha=sha)
+    dup = _existing_ci_task(db, repo_name=repo_name, sha=sha, key=key)
     if dup is not None:
         return {"ok": True, "task_id": dup.id, "duplicate": "dedupe_key"}
     base_excerpt = f"workflow {workflow} failed on {branch}"
@@ -700,6 +1019,10 @@ def _handle_workflow_run(db: Session, payload: dict) -> dict:
         ci_sha=sha,
         ci_workflow=workflow,
         ci_url=run.get("html_url", ""),
+        ci_head_branch=head_branch,
+        ci_base_branch=base_branch,
+        ci_pr_number=pr_number,
+        ci_is_fork=is_fork,
         # Fast webhook: one-line summary only. The worker fetches the real
         # failing-log tail (network + log download) before the agent starts.
         ci_excerpt=base_excerpt,
@@ -714,13 +1037,25 @@ def _handle_workflow_run(db: Session, payload: dict) -> dict:
         "TASK_CREATED",
         {"trigger": "ci", "run": task.ci_run_id, "conclusion": conclusion},
     )
+    # Identifiers only: workflow content/logs are fetched worker-side so the
+    # webhook never blocks on GitHub API calls.
     _event(
         db,
         task.id,
         "CI_CONTEXT_LOADED",
-        build_ci_context(
-            event_type="workflow_run", payload=payload, repo_name=repo_name
-        ),
+        {
+            "provider": "github",
+            "run_id": task.ci_run_id,
+            "commit_sha": sha,
+            "branch": head_branch,
+            "base_branch": base_branch,
+            "pr_number": pr_number,
+            "is_fork": bool(is_fork),
+            "job": task.ci_job,
+            "workflow_name": workflow,
+            "url": task.ci_url,
+            "deferred": True,
+        },
         limit=20000,
     )
     db.commit()
@@ -763,10 +1098,21 @@ def _handle_check_run(db: Session, payload: dict) -> dict:
     sha = str(run.get("head_sha") or "")
     if not sha:
         return _ignored("check_run", "missing_sha", repository=repo_name)
+    prs = run.get("pull_requests") or suite.get("pull_requests") or []
+    pr = prs[0] if prs else {}
+    pr_head = (pr.get("head") or {}) if isinstance(pr, dict) else {}
+    pr_base = (pr.get("base") or {}) if isinstance(pr, dict) else {}
+    head_repo = (
+        (pr_head.get("repo") or {}).get("full_name")
+        or (suite.get("head_repository") or {}).get("full_name")
+        or repo_name
+    )
+    head_branch = str(pr_head.get("ref") or branch or "")
+    base_branch = str(pr_base.get("ref") or repo.default_branch or "main")
+    pr_number = pr.get("number") if isinstance(pr, dict) else None
+    is_fork = 1 if str(head_repo).lower() != repo_name.lower() else 0
     key = _dedupe_key(repo_name, sha)
-    dup = db.query(Task).filter(Task.dedupe_key == key).first()
-    if dup is None:
-        dup = _active_ci_task(db, repo_name=repo_name, sha=sha)
+    dup = _existing_ci_task(db, repo_name=repo_name, sha=sha, key=key)
     if dup is not None:
         return {"ok": True, "task_id": dup.id, "duplicate": "dedupe_key"}
     job = str(run.get("name") or "")
@@ -781,6 +1127,10 @@ def _handle_check_run(db: Session, payload: dict) -> dict:
         ci_sha=sha,
         ci_job=job,
         ci_url=run.get("html_url", ""),
+        ci_head_branch=head_branch,
+        ci_base_branch=base_branch,
+        ci_pr_number=pr_number,
+        ci_is_fork=is_fork,
         # Fast webhook: one-line summary only. The worker fetches the real
         # failing-log tail before the agent starts.
         ci_excerpt=base_excerpt,
@@ -799,7 +1149,18 @@ def _handle_check_run(db: Session, payload: dict) -> dict:
         db,
         task.id,
         "CI_CONTEXT_LOADED",
-        build_ci_context(event_type="check_run", payload=payload, repo_name=repo_name),
+        {
+            "provider": "github",
+            "run_id": run_id,
+            "commit_sha": sha,
+            "branch": head_branch,
+            "base_branch": base_branch,
+            "pr_number": pr_number,
+            "is_fork": bool(is_fork),
+            "job": job,
+            "url": task.ci_url,
+            "deferred": True,
+        },
         limit=20000,
     )
     db.commit()

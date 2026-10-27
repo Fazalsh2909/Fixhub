@@ -357,13 +357,16 @@ def test_build_ci_context_check_run_fetches_workflow(monkeypatch):
 
 
 def test_ci_context_event_json_survives_a_full_workflow(db, monkeypatch):
-    """CI_CONTEXT_LOADED must stay parseable when the workflow is ~6000 chars.
+    """CI context events must stay parseable when the workflow is ~6000 chars.
 
-    The old 4000-char event cap cut the JSON mid-object; the worker then got
-    json.loads() == ValueError and silently lost workflow/job/step fields.
+    The webhook now records identifiers only (durable + fast ack); the worker
+    fetches the workflow and records CI_CONTEXT_ENRICHED. Both events go
+    through the same bounded-JSON path, and the old 4000-char cap cut the JSON
+    mid-object. This asserts the invariant at both hops.
     """
     import app.github.webhook as _wh
     from app.github import client as _gh
+    from app.tasks import service as _svc
 
     workflow = "name: CI\n" + ("# padding line for a realistic workflow\n" * 160)
     assert len(workflow) > 6000
@@ -398,10 +401,28 @@ def test_ci_context_event_json_survives_a_full_workflow(db, monkeypatch):
     )
     assert ev is not None
     data = json.loads(ev.data_json)  # must not be truncated mid-object
-    assert data["workflow_file"] == ".github/workflows/ci.yml"
-    assert data["workflow_name"] == "CI"
-    assert len(data["workflow_content"]) == 6000
+    assert data["job"] == "backend"
     assert data["run_id"] == "4242"
+    assert data["deferred"] is True
+
+    # Worker-side enrichment is where the (bounded) workflow content lands.
+    task = db.query(Task).filter(Task.id == r.json()["task_id"]).first()
+    ctx = _wh.build_ci_context_from_task(task)
+    assert ctx["workflow_file"] == ".github/workflows/ci.yml"
+    assert ctx["workflow_name"] == "CI"
+    assert len(ctx["workflow_content"]) == 6000
+    assert ctx["run_id"] == "4242"
+    _svc._event(db, task.id, "CI_CONTEXT_ENRICHED", ctx, limit=20000)
+    db.commit()
+    enriched = (
+        db.query(TaskEvent)
+        .filter(TaskEvent.type == "CI_CONTEXT_ENRICHED")
+        .order_by(TaskEvent.id.desc())
+        .first()
+    )
+    parsed = json.loads(enriched.data_json)  # must not be truncated mid-object
+    assert parsed["workflow_file"] == ".github/workflows/ci.yml"
+    assert len(parsed["workflow_content"]) == 6000
 
 
 def test_check_run_enrichment_failure_falls_back(db, monkeypatch):

@@ -27,13 +27,32 @@ app.include_router(github_router)
 app.include_router(ide_router)
 
 
+_VALID_ENVS = {"dev", "staging", "prod"}
+
+
+def _env_name() -> str:
+    """Validated environment name. A typo must never silently disable guards.
+
+    Before this check `ENV=production` (or any unrecognized value) skipped
+    every production guard because each one compared against the literal
+    "prod". Unknown values now refuse startup instead of running unprotected.
+    """
+    env = (settings.ENV or "").strip().lower()
+    if env not in _VALID_ENVS:
+        raise RuntimeError(
+            f"refusing startup: unknown ENV={settings.ENV!r} "
+            "(expected dev|staging|prod)"
+        )
+    return env
+
+
 @app.on_event("startup")
 def _create_tables() -> None:
     from app.db import migrate as _migrate
     from app.db.database import ensure_columns
 
-    # Phase 4.5: production fail-fast. Never silently run prod on SQLite,
-    # insecure cookies, or without credential encryption.
+    # Phase 4.5: production/staging fail-fast. Never silently run a deployed
+    # environment on SQLite, insecure cookies, or without credential encryption.
     _enforce_production_guards()
     # Final hardening: timeout/usage coherence validated on every boot.
     _validate_startup_timeouts()
@@ -42,16 +61,15 @@ def _create_tables() -> None:
     try:
         _validate_usage(settings)
     except ValueError as exc:
-        if settings.ENV.strip().lower() == "prod":
-            raise RuntimeError(f"refusing production startup: {exc}") from exc
+        # Both deployed environments and dev refuse an incoherent usage config;
+        # the message differs only in whether guards are environment-scoped.
         raise RuntimeError(f"refusing startup: {exc}") from exc
-    # Gate 0: Alembic is the schema authority. In production a failed
+    # Gate 0: Alembic is the schema authority. In production/staging a failed
     # migration stops startup (MigrationFailed propagates — NO create_all
-    # fallback, NO partial schema). Production never calls create_all or
-    # ensure_columns at all; dev/test keep create_all bootstrapping
+    # fallback, NO partial schema). Dev/test keep create_all bootstrapping
     # (explicit local convenience only, loudly).
     _migrate.upgrade_head()
-    if settings.ENV.strip().lower() != "prod":
+    if _env_name() == "dev":
         Base.metadata.create_all(bind=engine)
         ensure_columns()
     _promote_admins()
@@ -62,45 +80,56 @@ def _create_tables() -> None:
 
 
 def _enforce_production_guards() -> None:
-    """Phase 4.5 + final hardening: refuse to boot production unsafe."""
+    """Phase 4.5 + final hardening: refuse to boot a deployed env unsafe.
+
+    Applies to `staging` as well as `prod`: staging holds real repositories,
+    real user rows, and (often) real credentials, so the same data/secret/
+    sandbox invariants must hold. Dev stays permissive. ENV is validated
+    first so a typo cannot bypass every guard.
+    """
     from app.config import validate_timeout_ladder, validate_usage_limits
 
-    if settings.ENV.strip().lower() != "prod":
+    env = _env_name()
+    if env not in {"staging", "prod"}:
         return
+    # Keep the historical "production startup" wording (existing runbooks and
+    # tests match it); staging gets its own explicit label.
+    label = "production" if env == "prod" else env
     url = (settings.DATABASE_URL or "").strip().lower()
     if url.startswith("sqlite"):
         raise RuntimeError(
-            "refusing production startup on SQLite (set a postgresql DATABASE_URL)"
+            f"refusing {label} startup on SQLite (set a postgresql DATABASE_URL)"
         )
     if not url.startswith("postgres"):
         raise RuntimeError(
-            f"refusing production startup on unsupported database: {url[:32]}"
+            f"refusing {label} startup on unsupported database: {url[:32]}"
         )
     if not bool(settings.AUTH_COOKIE_SECURE):
         raise RuntimeError(
-            "refusing production startup with insecure auth cookie (set AUTH_COOKIE_SECURE=1)"
+            f"refusing {label} startup with insecure auth cookie "
+            "(set AUTH_COOKIE_SECURE=1)"
         )
     if not (settings.FIXHUB_CREDENTIAL_ENCRYPTION_KEY or "").strip():
         raise RuntimeError(
-            "refusing production startup without FIXHUB_CREDENTIAL_ENCRYPTION_KEY"
+            f"refusing {label} startup without FIXHUB_CREDENTIAL_ENCRYPTION_KEY"
         )
     # Final hardening: unbounded workers and incoherent ladders fail closed.
     try:
         validate_usage_limits(settings)
     except ValueError as exc:
-        raise RuntimeError(f"refusing production startup: {exc}") from exc
+        raise RuntimeError(f"refusing {label} startup: {exc}") from exc
     try:
         validate_timeout_ladder(settings)
     except ValueError as exc:
-        raise RuntimeError(f"refusing production startup: {exc}") from exc
-    # Phase 5: production requires the real microVM backend. The legacy host
-    # subprocess sandbox must never serve production traffic for untrusted code.
+        raise RuntimeError(f"refusing {label} startup: {exc}") from exc
+    # Phase 5: deployed environments require the real microVM backend. The
+    # legacy host subprocess sandbox must never serve untrusted code.
     # Checked last so each earlier guard keeps its own error (and its tests).
     backend = str(getattr(settings, "SANDBOX_BACKEND", "host") or "host").strip().lower()
     if backend != "firecracker":
         raise RuntimeError(
-            f"refusing production startup on SANDBOX_BACKEND={backend!r} "
-            "(production requires SANDBOX_BACKEND=firecracker)"
+            f"refusing {label} startup on SANDBOX_BACKEND={backend!r} "
+            "(deployed environments require SANDBOX_BACKEND=firecracker)"
         )
     try:
         from app.sandbox import images as _images
@@ -108,13 +137,13 @@ def _enforce_production_guards() -> None:
         prereq = _images.verify_artifacts()
         if not prereq["ok"]:
             raise RuntimeError(
-                "refusing production startup: firecracker prerequisites missing: "
+                f"refusing {label} startup: firecracker prerequisites missing: "
                 + "; ".join(prereq["missing"])
             )
     except RuntimeError:
         raise
     except Exception as exc:
-        raise RuntimeError(f"refusing production startup: sandbox check failed: {exc}")
+        raise RuntimeError(f"refusing {label} startup: sandbox check failed: {exc}")
 
 
 def _validate_startup_timeouts() -> None:
@@ -131,8 +160,8 @@ def _validate_startup_timeouts() -> None:
         validate_timeout_ladder(settings)
         return
     except ValueError as exc:
-        is_prod = settings.ENV.strip().lower() == "prod"
-        if is_prod:
+        is_deployed = _env_name() in {"staging", "prod"}
+        if is_deployed:
             raise RuntimeError(f"refusing startup: {exc}") from exc
         if int(getattr(settings, "DEV_SLOW_MODEL", 0) or 0) == 1:
             return
@@ -279,6 +308,9 @@ def _sweep_stale_running_tasks() -> None:
                         :1000
                     ]
                 )
+                # Terminal transition frees the active dedupe identity.
+                t.dedupe_key = None
+                t.active_issue_key = None
                 db.add(
                     TaskEvent(
                         task_id=t.id,
@@ -289,6 +321,23 @@ def _sweep_stale_running_tasks() -> None:
             db.commit()
         finally:
             db.close()
+    except Exception:
+        pass
+    # Durable webhook inbox: re-apply deliveries stuck in `received` (a crash
+    # between the durable commit and its effects). Handlers are idempotent, so
+    # replay can never duplicate a task.
+    try:
+        import logging as _logging
+
+        from app.github.webhook import reprocess_pending_deliveries
+
+        out = reprocess_pending_deliveries()
+        if out.get("failed"):
+            _logging.getLogger("fixhub.webhook").warning(
+                "pending webhook replay: checked=%s failed=%s",
+                out.get("checked"),
+                out.get("failed"),
+            )
     except Exception:
         pass
     # Gate 0 (P0-2): the API tier MUST NOT reap microVMs. destroy_orphans()
@@ -871,9 +920,75 @@ def rerun_task(
     Pass ?sync=true to run inline (explicit development/debug path only).
     When Redis is unavailable the task stays QUEUED and the failure is
     reported clearly — production never executes inline silently.
+
+    A FAILED/BLOCKED/CANCELLED/NEEDS_REVIEW task is first moved back to QUEUED
+    with an atomic CAS. Without that transition `claim_task` (correctly) never
+    claims it and the endpoint looked successful while doing nothing. The CAS
+    also serializes double-clicks: exactly one request re-queues.
     """
     require_csrf(request)
-    require_owned_task(task_id, user, db)
+    row = require_owned_task(task_id, user, db)
+    status = str(row.status or "").upper()
+    if status in {"FAILED", "BLOCKED", "CANCELLED", "NEEDS_REVIEW"}:
+        from sqlalchemy.exc import IntegrityError
+
+        from app.tasks.service import _active_keys_for, cas_status
+
+        fields: dict = {
+            "error": "",
+            "claimed_by": "",
+            "claimed_at": None,
+            "lease_expires_at": None,
+        }
+        # Re-take the active identity in the SAME update (a crash between two
+        # commits would otherwise leave a terminal row holding the key).
+        fields.update(_active_keys_for(row))
+        try:
+            moved = cas_status(db, task_id, {status}, "QUEUED", **fields)
+        except IntegrityError:
+            db.rollback()
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "task_id": task_id,
+                    "queued": False,
+                    "error": (
+                        "another active task already covers this issue/revision"
+                    ),
+                },
+            )
+        if not moved:
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "task_id": task_id,
+                    "queued": False,
+                    "error": "task state changed; refresh and retry",
+                },
+            )
+        db.expire_all()
+    elif status not in {"QUEUED", "RUNNING"}:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=409,
+            content={
+                "task_id": task_id,
+                "queued": False,
+                "error": (
+                    f"task is {status}; it cannot be re-queued"
+                    + (
+                        " (it will be repaired automatically when CI finishes)"
+                        if status == "AWAITING_CI"
+                        else ""
+                    )
+                ),
+            },
+        )
     if sync:
         from app.tasks.service import run_task_inline
 
@@ -881,7 +996,7 @@ def rerun_task(
         return {"task_id": task_id, "result": result, "sync": True}
     from app.tasks import queue as _queue
 
-    out = _queue.enqueue_task(task_id)
+    out = _queue.enqueue_for_task(task_id)
     if out.get("enqueued"):
         return {"task_id": task_id, "queued": True, "job_id": out.get("job_id")}
     if out.get("limited"):
@@ -948,6 +1063,10 @@ def cancel_unconnected_tasks(
         t.status = "CANCELLED"
         t.cancel_requested = 1
         t.error = "repository not connected in FixHub; task cancelled"[:1000]
+        # Terminal transition frees the active dedupe identity (a cancelled
+        # issue task must not block a later trigger via the unique index).
+        t.dedupe_key = None
+        t.active_issue_key = None
         db.add(
             TaskEvent(
                 task_id=t.id,

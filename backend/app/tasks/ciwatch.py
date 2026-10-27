@@ -9,6 +9,8 @@ then FAILED with the preserved failure. Never raises out of check_awaiting_ci.
 
 from __future__ import annotations
 
+from app.config import settings
+
 MAX_CI_REPAIRS = 3
 
 
@@ -57,6 +59,44 @@ def _repo_token(db, repository: str) -> str:
         return ""
 
 
+def _unobservable(db, task, conclusion: str) -> str:
+    """Bounded patience for a check that cannot be observed. Returns pending|failed.
+
+    `unknown` (no check reported) and observation failures (missing token,
+    API error) are counted; `pending` (checks exist but are still running) is
+    NOT, so a legitimately long CI job is never failed as "unobservable".
+    """
+    import json as _json
+
+    from app.db.models import TaskEvent
+
+    max_ticks = max(1, int(getattr(settings, "CI_UNOBSERVABLE_MAX_TICKS", 30)))
+    task.ci_unobservable_ticks = int(task.ci_unobservable_ticks or 0) + 1
+    if task.ci_unobservable_ticks >= max_ticks:
+        task.status = "FAILED"
+        task.error = (
+            "CI result could not be observed after "
+            f"{max_ticks} checks (conclusion={conclusion or 'unknown'}); "
+            "verify GitHub App checks:read permissions or the run URL"
+        )[:1000]
+        from app.tasks.service import _release_active_keys
+
+        _release_active_keys(task)
+        db.add(
+            TaskEvent(
+                task_id=task.id,
+                type="CI_UNOBSERVABLE",
+                data_json=_json.dumps(
+                    {"ticks": task.ci_unobservable_ticks, "conclusion": conclusion}
+                )[:4000],
+            )
+        )
+        db.commit()
+        return "failed"
+    db.commit()
+    return "pending"
+
+
 def _check_one(db, task) -> str:
     """Returns one of: completed | repair_enqueued | failed | pending."""
     import json as _json
@@ -66,16 +106,20 @@ def _check_one(db, task) -> str:
 
     token = _repo_token(db, task.repository)
     if not token or not task.commit_sha:
-        return "pending"  # cannot observe; retry next tick
+        return _unobservable(db, task, "unavailable")
     try:
         conclusion = _gh.sha_check_conclusion(
             token=token, full_name=task.repository, sha=task.commit_sha
         )
     except Exception:
-        return "pending"
+        return _unobservable(db, task, "api_error")
     if conclusion == "success":
         task.status = "COMPLETED"
         task.error = ""
+        task.ci_unobservable_ticks = 0
+        from app.tasks.service import _release_active_keys
+
+        _release_active_keys(task)
         db.add(
             TaskEvent(
                 task_id=task.id,
@@ -85,15 +129,24 @@ def _check_one(db, task) -> str:
         )
         db.commit()
         return "completed"
-    if conclusion != "failure":
+    if conclusion == "pending":
+        # Checks exist and are still running: observation works, keep waiting.
+        task.ci_unobservable_ticks = 0
+        db.commit()
         return "pending"
-    # Failure: fetch the tail for the repair round (best-effort).
+    if conclusion != "failure":
+        # Permissions/outage can leave the check unobservable. Never wait
+        # forever: after a bounded patience window, fail honestly.
+        return _unobservable(db, task, conclusion)
+    # Failure: fetch the tail for the repair round (best-effort). Use the
+    # exact identified job when known; empty lets the client pick the actual
+    # failed job instead of guessing the workflow name.
     try:
         tail = _gh.failed_log_tail(
             token=token,
             full_name=task.repository,
             run_id=task.ci_run_id,
-            job_name=task.ci_job or task.ci_workflow,
+            job_name=task.ci_job or "",
         )
     except Exception:
         tail = ""
@@ -103,8 +156,11 @@ def _check_one(db, task) -> str:
         task.error = (
             f"CI failed after {MAX_CI_REPAIRS} repairs "
             f"on {task.pr_url or task.branch}: {(tail or task.last_ci_failure or '')[:800]}"
-        )
+        )[:1000]
         task.last_ci_failure = tail[:6000] if tail else task.last_ci_failure
+        from app.tasks.service import _release_active_keys
+
+        _release_active_keys(task)
         db.add(
             TaskEvent(
                 task_id=task.id,
@@ -129,6 +185,9 @@ def _check_one(db, task) -> str:
         "QUEUED",
         ci_attempt_count=attempt,
         last_ci_failure=task.last_ci_failure,
+        # A new repair round observes a new revision: old "unobservable"
+        # ticks must not make the fresh revision fail prematurely.
+        ci_unobservable_ticks=0,
     ):
         db.rollback()
         return "pending"  # another tick claimed it first

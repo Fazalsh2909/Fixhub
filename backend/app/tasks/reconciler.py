@@ -50,24 +50,34 @@ def requeue_orphaned(*, grace_s: int = GRACE_S, limit: int = BATCH) -> dict:
     db = SessionLocal()
     try:
         cutoff = utcnow() - timedelta(seconds=max(int(grace_s), 0))
+        # Eligibility is filtered in SQL, not after LIMIT: a backlog of
+        # cancelled/unconnected rows must never consume the whole batch and
+        # starve runnable tasks forever (the queue-starvation bug).
+        connected = _connected_repo_names(db)
+        if not connected:
+            return {"ok": True, "checked": 0, "requeued": 0, "skipped": 0}
         rows = (
             db.query(Task)
-            .filter(Task.status == "QUEUED", Task.created_at < cutoff)
+            .filter(
+                Task.status == "QUEUED",
+                Task.created_at < cutoff,
+                Task.repository.in_(sorted(connected)),
+                Task.cancel_requested == 0,
+            )
             .order_by(Task.id.asc())
             .limit(max(int(limit), 1))
             .all()
         )
         if not rows:
             return {"ok": True, "checked": 0, "requeued": 0, "skipped": 0}
-        connected = _connected_repo_names(db)
         requeued: list[int] = []
         skipped = 0
         failed = 0
         for task in rows:
-            if task.cancel_requested or task.repository not in connected:
-                skipped += 1
-                continue
-            job_id = f"fixhub-task-{task.id}"
+            # Repair rounds use a different deterministic job id; probing the
+            # initial-run id made a live repair look missing and re-enqueued a
+            # duplicate initial run.
+            job_id = _queue.job_id_for_task(task)
             try:
                 job = q.fetch_job(job_id)
                 if job is not None:
@@ -82,7 +92,7 @@ def requeue_orphaned(*, grace_s: int = GRACE_S, limit: int = BATCH) -> dict:
                 # Redis hiccup: never risk double execution.
                 skipped += 1
                 continue
-            out = _queue.enqueue_task(task.id)
+            out = _queue.enqueue_for_task(task.id)
             if out.get("enqueued"):
                 task.queue_job_id = str(out.get("job_id") or job_id)[:128]
                 task.error = ""
@@ -91,7 +101,11 @@ def requeue_orphaned(*, grace_s: int = GRACE_S, limit: int = BATCH) -> dict:
                         task_id=task.id,
                         type="QUEUE_RETRIED",
                         data_json=json.dumps(
-                            {"job": task.queue_job_id, "reason": "queued_reconciler"}
+                            {
+                                "job": task.queue_job_id,
+                                "reason": "queued_reconciler",
+                                "repair": _queue.is_repair_round(task),
+                            }
                         )[:4000],
                     )
                 )

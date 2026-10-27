@@ -70,6 +70,20 @@ class Settings(BaseSettings):
     LLM_MAX_RUNTIME_S: int = 3600
     LLM_MAX_OUTPUT_BYTES: int = 200_000
 
+    # Agent loop governor (general-purpose safeguards, not a phase script).
+    # Identical tool calls beyond these caps are answered from cache/suppressed
+    # instead of re-executed; the model keeps full freedom over WHAT to do.
+    LLM_REPEAT_SUPPRESS_READS: int = 3
+    LLM_REPEAT_SUPPRESS_COMMANDS: int = 3
+    LLM_REPEAT_SUPPRESS_FAILED_EDITS: int = 5
+    # Consecutive steps without new evidence before the loop nudges once, then
+    # stops with a "stalled" outcome (never a false COMPLETED).
+    LLM_STALL_WINDOW: int = 8
+    # Retain processed webhook deliveries this long (audit + replay window).
+    WEBHOOK_DELIVERY_RETENTION_HOURS: int = 168
+    # A delivery stuck in "received" longer than this is re-processed.
+    WEBHOOK_DELIVERY_STALE_S: int = 300
+
     # Agent tool bounds
     TOOL_OUTPUT_MAX_BYTES: int = 20_000
     # Default per-command wall time. Package installs routinely exceed 60s on
@@ -216,6 +230,13 @@ class Settings(BaseSettings):
     CI_IGNORE_BRANCH_PREFIXES: str = "fixhub-fixes/"
     # Conclusions that count as a broken CI/CD pipeline.
     CI_FAILURE_CONCLUSIONS: str = "failure,timed_out,startup_failure"
+    # An AWAITING_CI task whose check conclusion stays "unknown"/absent for
+    # this many watcher ticks becomes FAILED(ci_unobservable) instead of
+    # waiting forever. The watcher runs every 60s, so 30 ≈ 30 minutes.
+    CI_UNOBSERVABLE_MAX_TICKS: int = 30
+    # Pre-publish guard against "fixes" that disable required CI: off | warn |
+    # block. Inspects the workspace diff only (runs no repo commands).
+    CI_WEAKENING_GATE: str = "block"
     # 1 = agent run commits+pushes+PRs immediately (legacy behaviour).
     # 0 = agent run stops at NEEDS_REVIEW; publish via POST /api/tasks/{id}/approve.
     AUTO_PUBLISH: int = 1

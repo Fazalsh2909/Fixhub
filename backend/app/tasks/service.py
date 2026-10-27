@@ -20,8 +20,52 @@ from app.github import publisher as _pub
 from app.repo import workspace as _ws
 
 
-def _event(db, task_id: int, type_: str, data: dict) -> None:
-    db.add(TaskEvent(task_id=task_id, type=type_, data_json=json.dumps(data)[:4000]))
+def _event(db, task_id: int, type_: str, data: dict, *, limit: int = 4000) -> None:
+    db.add(TaskEvent(task_id=task_id, type=type_, data_json=json.dumps(data)[:limit]))
+
+
+_TERMINAL_STATUSES = {"COMPLETED", "FAILED", "BLOCKED", "CANCELLED"}
+
+
+def _release_active_keys(task: Task) -> None:
+    """Free dedupe identity on terminal states.
+
+    One ACTIVE task per CI revision / issue; terminal tasks are history. This
+    is what lets a genuinely new failing run (or an explicit retry) create a
+    new task without weakening concurrent-delivery protection.
+    """
+    task.dedupe_key = None
+    task.active_issue_key = None
+
+
+def _active_keys_for(task: Task) -> dict:
+    """Dedupe identity a retried task must re-take, as plain values.
+
+    A terminal transition released the key; an explicit retry of the SAME task
+    must take it back, otherwise a concurrent webhook could create a second
+    active task for the same issue/revision (two branches, two PRs). The unique
+    index remains the arbiter: a genuine conflict raises IntegrityError and the
+    retry is refused instead of duplicating work.
+
+    Returns values instead of mutating the ORM row: the caller passes them to
+    `cas_status`, and mutating a loaded row first would let autoflush commit
+    the keys even when the CAS loses.
+    """
+    repo = (task.repository or "").strip().lower()
+    if str(task.trigger_type or "") == "ci" and task.ci_sha:
+        return {
+            "dedupe_key": f"ci:{repo}:{str(task.ci_sha).strip()}"[:512],
+            "active_issue_key": None,
+        }
+    if str(task.trigger_type or "") == "issue" and task.issue_number:
+        return {
+            "active_issue_key": f"issue:{repo}:{int(task.issue_number)}"[:512],
+            "dedupe_key": None,
+        }
+    return {
+        "dedupe_key": task.dedupe_key,
+        "active_issue_key": task.active_issue_key,
+    }
 
 
 def _is_file_change_event(ev: dict) -> bool:
@@ -86,6 +130,8 @@ def _pin_ci_workspace(path: str, sha: str) -> dict:
 def _set(db, task: Task, **fields) -> None:
     for k, v in fields.items():
         setattr(task, k, v)
+    if str(fields.get("status") or "") in _TERMINAL_STATUSES:
+        _release_active_keys(task)
     task.updated_at = datetime.now(timezone.utc)
 
 
@@ -229,6 +275,116 @@ def _resolve_auto_publish(auto_publish: bool | None) -> bool:
         return bool(settings.AUTO_PUBLISH)
     except Exception:
         return True
+
+
+def _ci_weakening_signal(path: str) -> tuple[bool, str]:
+    """Diff-only check for a "fix" that disables required CI or deletes tests.
+
+    Returns (workflow_edited, weakening_reason). Runs no repository commands
+    (safe for arbitrary toolchains). Any workflow edit is surfaced as a
+    warning; deleting a workflow, removing a test invocation, or stripping
+    every run/uses step is a weakening signal that the gate may block.
+    """
+    try:
+        out = _pub.diff_paths(path, ".github/workflows")
+    except Exception:
+        return False, ""
+    if not out:
+        return False, ""
+    if "deleted file mode" in out:
+        return True, "a workflow file was deleted"
+    removed = [
+        ln[1:].strip()
+        for ln in out.splitlines()
+        if ln.startswith("-") and not ln.startswith("---")
+    ]
+    added = [
+        ln[1:].strip()
+        for ln in out.splitlines()
+        if ln.startswith("+") and not ln.startswith("+++")
+    ]
+    if not removed:
+        return True, ""
+    tokens = ("pytest", "npm test", "yarn test", "go test", "cargo test", "tox", "coverage")
+    removed_tokens = {t for t in tokens if any(t in ln.lower() for ln in removed)}
+    added_tokens = {t for t in tokens if any(t in ln.lower() for ln in added)}
+    gone = sorted(removed_tokens - added_tokens)
+    if gone:
+        return True, "test invocation removed from workflow: " + ", ".join(gone)
+    if any(ln.lower().startswith(("run:", "uses:")) for ln in removed) and not any(
+        ln.lower().startswith(("run:", "uses:")) for ln in added
+    ):
+        return True, "workflow run/uses steps removed"
+    return True, ""
+
+
+def _no_changes_outcome(db, task: Task) -> dict:
+    """Honest outcome when the agent produced no diff.
+
+    Issue tasks: nothing to change can be legitimate completion. CI tasks:
+    COMPLETED only when the failing revision is observably green; otherwise
+    NEEDS_REVIEW with an explicit reason — never a false "repair succeeded".
+    """
+    if task.trigger_type != "ci":
+        _set(db, task, status="COMPLETED", error="")
+        db.commit()
+        _cleanup(task.id)
+        return {"status": "COMPLETED", "no_changes": True}
+    conclusion = ""
+    try:
+        from app.github import client as _gh
+
+        token = _repo_token(db, task)
+        if token and task.ci_sha:
+            conclusion = _gh.sha_check_conclusion(
+                token=token, full_name=task.repository, sha=task.ci_sha
+            )
+    except Exception:
+        conclusion = ""
+    if conclusion == "success":
+        _set(db, task, status="COMPLETED", error="")
+        _event(db, task.id, "CI_ALREADY_GREEN", {"sha": task.ci_sha})
+        db.commit()
+        _cleanup(task.id)
+        return {"status": "COMPLETED", "no_changes": True, "ci": "success"}
+    reason = (
+        "no changes produced but CI is not green "
+        f"(conclusion={conclusion or 'unknown'})"
+    )
+    _set(db, task, status="NEEDS_REVIEW", error=reason[:1000])
+    _event(
+        db,
+        task.id,
+        "NEEDS_REVIEW",
+        {"reason": "no_changes_ci_red", "conclusion": conclusion},
+    )
+    db.commit()
+    return {"status": "NEEDS_REVIEW", "error": task.error, "no_changes": True}
+
+
+def _ci_publish_target(task: Task, default_branch: str, fix_branch: str) -> dict:
+    """Decide where a CI fix lands (never blindly against the default branch).
+
+    - Same-repository PR failure on a non-default head branch: append the fix
+      to that PR's head branch and reuse the PR (`repair_pr=True`).
+    - Fork PR failure: never push to the fork; publish the task's own fix
+      branch against the base repo's default branch (the caller adds a note).
+    - Legacy rows without PR context: keep the default-branch behavior.
+    """
+    head = (task.ci_head_branch or "").strip()
+    base = (task.ci_base_branch or "").strip()
+    repair_pr = bool(
+        task.trigger_type == "ci"
+        and not int(task.ci_is_fork or 0)
+        and task.ci_pr_number
+        and head
+        and head != default_branch
+    )
+    return {
+        "repair_pr": repair_pr,
+        "branch": head if repair_pr else fix_branch,
+        "base": (base or default_branch) if repair_pr else default_branch,
+    }
 
 
 def _pending_title_body(task: Task, summary: str) -> tuple[str, str, str]:
@@ -388,10 +544,7 @@ def approve_task(task_id: int, *, title: str = "", body: str = "") -> dict:
             return {"status": "FAILED", "error": task.error}
         try:
             if not _pub.has_meaningful_changes(path):
-                _set(db, task, status="COMPLETED", error="")
-                db.commit()
-                _cleanup(task.id)
-                return {"status": "COMPLETED", "no_changes": True}
+                return _no_changes_outcome(db, task)
         except _pub.PublishError as exc:
             _set(db, task, status="FAILED", error=str(exc)[:1000])
             db.commit()
@@ -487,26 +640,75 @@ def _publish_task(
     # New fix branches build on the failing commit when this is a CI task, so
     # the PR diff is scoped to the actual failure (not rebased onto main).
     start = task.ci_sha if task.trigger_type == "ci" else ""
+    # --- CI source targeting: never assume the failure came from `main` ---
+    # Same-repository PR failure -> append the fix to the originating PR's head
+    # branch and reuse that PR. Fork PR failure -> never push to the fork; open
+    # a fix PR against the base repo's default branch with an explicit note.
+    target = _ci_publish_target(task, default_branch, branch)
+    repair_pr = bool(target["repair_pr"])
+    publish_branch = str(target["branch"])
+    pr_base = str(target["base"])
+    if task.trigger_type == "ci" and int(task.ci_is_fork or 0) and task.ci_pr_number:
+        body = (
+            f"{body}\n\n> Note: the failing CI run came from fork PR "
+            f"#{task.ci_pr_number}. FixHub never pushes to forks, so this fix "
+            f"targets `{default_branch}`."
+        )
+    # --- CI weakening gate (diff-only; runs no repo commands) ---
+    gate = str(getattr(settings, "CI_WEAKENING_GATE", "block") or "block").lower()
+    if task.trigger_type == "ci" and gate != "off":
+        edited, weaken = _ci_weakening_signal(path)
+        if edited:
+            _event(
+                db,
+                task.id,
+                "CI_WEAKENING_WARNING" if weaken else "CI_WORKFLOW_EDITED",
+                {"reason": weaken[:500], "gate": gate},
+            )
+            db.commit()
+            if weaken and gate == "block":
+                _set(
+                    db,
+                    task,
+                    status="BLOCKED",
+                    error=f"ci_weakening_detected: {weaken}"[:1000],
+                )
+                _event(
+                    db,
+                    task.id,
+                    "BLOCKED",
+                    {"reason": "ci_weakening_detected", "detail": weaken[:300]},
+                )
+                db.commit()
+                _cleanup(task.id)
+                return {"status": "BLOCKED", "error": task.error}
     if not token:
         # Final hardening: re-fence the local push path too (time passed since
         # the entry check while resolving repo/token/changed files).
         if check_lease and not _holds_lease(db, task):
             return _fail_lease_lost(db, task, at="at publish (local push fence)")
         try:
-            _local_commit_push(path, branch, title, start=start)
+            _local_commit_push(path, publish_branch, title, start=start)
             sha = _ws.head_sha(path)
-            _set(db, task, status="COMPLETED", branch=branch, commit_sha=sha, error="")
+            _set(
+                db,
+                task,
+                status="COMPLETED",
+                branch=publish_branch,
+                commit_sha=sha,
+                error="",
+            )
             _event(
                 db,
                 task.id,
                 "COMMIT_CREATED",
-                {"branch": branch, "sha": sha, "via": "approve"},
+                {"branch": publish_branch, "sha": sha, "via": "approve"},
             )
             db.commit()
             _cleanup(task.id)
             return {
                 "status": "COMPLETED",
-                "branch": branch,
+                "branch": publish_branch,
                 "commit": sha,
                 "summary": summary,
             }
@@ -522,30 +724,56 @@ def _publish_task(
         return True if not check_lease else _holds_lease(db, task)
 
     try:
-        pub = _pub.publish(
-            path=path,
-            full_name=task.repository,
-            base=default_branch,
-            title=title,
-            body=body,
-            token=token,
-            branch=branch,
-            start=start,
-            lease_check=_pub_lease if check_lease else None,
-        )
+        if repair_pr:
+            pub = _pub.publish_to_existing_branch(
+                path=path,
+                full_name=task.repository,
+                branch=publish_branch,
+                base=pr_base,
+                title=title,
+                body=body,
+                token=token,
+                lease_check=_pub_lease if check_lease else None,
+            )
+        else:
+            pub = _pub.publish(
+                path=path,
+                full_name=task.repository,
+                base=pr_base,
+                title=title,
+                body=body,
+                token=token,
+                branch=publish_branch,
+                start=start,
+                lease_check=_pub_lease if check_lease else None,
+            )
     except Exception as exc:
         msg = str(exc)
         if "lease lost" in msg.lower():
             return _fail_lease_lost(db, task, at="at publish (push/PR fence)")
+        if "originating PR is no longer open" in msg:
+            _set(
+                db,
+                task,
+                status="BLOCKED",
+                error=f"originating_pr_unavailable: {exc}"[:1000],
+            )
+            _event(
+                db,
+                task.id,
+                "BLOCKED",
+                {"reason": "originating_pr_unavailable", "pr": task.ci_pr_number},
+            )
+            db.commit()
+            _cleanup(task.id)
+            return {"status": "BLOCKED", "error": task.error}
         _set(db, task, status="FAILED", error=f"publish failed: {exc}"[:1000])
         _event(db, task.id, "FAILED", {"reason": "publish_failed"})
         db.commit()
         _cleanup(task.id)
         return {"status": "FAILED", "error": task.error}
     if pub.get("no_changes"):
-        _set(db, task, status="COMPLETED", error="")
-        db.commit()
-        return {"status": "COMPLETED", "no_changes": True}
+        return _no_changes_outcome(db, task)
     _set(
         db,
         task,
@@ -683,11 +911,18 @@ _VALID_TRANSITIONS = {
 def cas_status(db, task_id: int, expect: set[str], new: str, **fields) -> bool:
     """Phase 4: atomic compare-and-set status transition. Returns True iff the
     single row moved. Exactly-one-winner claiming and duplicate suppression
-    both reduce to this primitive (works on SQLite and PostgreSQL)."""
+    both reduce to this primitive (works on SQLite and PostgreSQL).
+
+    Terminal transitions also release the task's active dedupe identity, so a
+    new event for the same issue/revision can create a new task.
+    """
     from app.db.database import utcnow
 
     now = utcnow()
     values = {"status": new, "updated_at": now}
+    if new in _TERMINAL_STATUSES:
+        values["dedupe_key"] = None
+        values["active_issue_key"] = None
     values.update(fields)
     rows = (
         db.query(Task)
@@ -696,6 +931,42 @@ def cas_status(db, task_id: int, expect: set[str], new: str, **fields) -> bool:
     )
     db.commit()
     return rows == 1
+
+
+def _capacity_reason(db, task: Task) -> str:
+    """Global/user/repo live-capacity check (0 = unlimited).
+
+    Mirrors the enqueue-time fast check but is called inside the claim
+    transaction (serialized by a PostgreSQL advisory lock) so two API
+    instances can never oversubscribe the caps. A RUNNING row whose lease has
+    already expired is reclaimable and does not hold a slot.
+    """
+    from sqlalchemy import or_
+
+    from app.db.database import utcnow
+
+    now = utcnow()
+    live = ["RUNNING", "AWAITING_CI"]
+    base = db.query(Task).filter(Task.status.in_(live), Task.id != task.id)
+    base = base.filter(
+        or_(
+            Task.status != "RUNNING",
+            Task.lease_expires_at.is_(None),
+            Task.lease_expires_at >= now,
+        )
+    )
+    if settings.MAX_RUNNING_TASKS_GLOBAL > 0:
+        if base.count() >= settings.MAX_RUNNING_TASKS_GLOBAL:
+            return "global concurrency limit reached"
+    if task.owner_id is not None and settings.MAX_RUNNING_PER_USER > 0:
+        n = base.filter(Task.owner_id == task.owner_id).count()
+        if n >= settings.MAX_RUNNING_PER_USER:
+            return "per-user concurrency limit reached"
+    if settings.MAX_RUNNING_PER_REPO > 0:
+        n = base.filter(Task.repository == task.repository).count()
+        if n >= settings.MAX_RUNNING_PER_REPO:
+            return "per-repository concurrency limit reached"
+    return ""
 
 
 def claim_task(
@@ -707,15 +978,33 @@ def claim_task(
     direct-DB test tasks), and AWAITING_CI rows for explicit repair rounds.
     A second concurrent claim sees RUNNING with a live lease and loses
     (returns None) — exactly one worker executes.
+
+    Capacity is reserved inside this transaction: a claim that would exceed a
+    global/user/repo cap returns None and leaves the row QUEUED (eligible for
+    a later reconciler retry), never FAILED and never oversubscribed.
     """
     from datetime import timedelta
 
-    from sqlalchemy import and_, or_
+    from sqlalchemy import and_, or_, text
 
     from app.config import settings
     from app.db.database import utcnow
 
     now = utcnow()
+    row = db.query(Task).filter(Task.id == task_id).first()
+    if row is None:
+        return None
+    # Serialize capacity reservation across workers/API instances. The lock is
+    # transaction-scoped; the claim commit (or rollback) releases it.
+    try:
+        bind = db.get_bind()
+        if bind is not None and bind.dialect.name == "postgresql":
+            db.execute(text("SELECT pg_advisory_xact_lock(6842101)"))
+    except Exception:
+        pass
+    if _capacity_reason(db, row):
+        db.rollback()
+        return None
     lease_until = now + timedelta(seconds=settings.TASK_LEASE_S)
     claimable = or_(
         Task.status == "QUEUED",
@@ -967,6 +1256,9 @@ def _run_agent_tracked(db, task: Task, scope: _LLMScope, **kwargs):
 
     def _request_guard() -> str:
         # Fresh-session read so concurrent rounds see committed totals.
+        # Fail CLOSED: if the budget cannot be verified, no further paid
+        # provider request is allowed. (The lease guard already behaves this
+        # way; treating an unverifiable budget as permission was the bug.)
         try:
             from app.db.database import SessionLocal as _SessionLocal
 
@@ -978,8 +1270,11 @@ def _run_agent_tracked(db, task: Task, scope: _LLMScope, **kwargs):
                 return _usage_limit_reason(s, row, buf)
             finally:
                 s.close()
-        except Exception:
-            return ""
+        except Exception as exc:
+            return (
+                "budget check failed "
+                f"({type(exc).__name__}); refusing further provider calls"
+            )
 
     kwargs.setdefault("request_guard", _request_guard)
 
@@ -1404,7 +1699,10 @@ def run_task_inline(
                     repository=task.repository,
                     installation_id=installation_id,
                     run_id=task.ci_run_id,
-                    job_name=task.ci_job or task.ci_workflow,
+                    # Only the exact job identity (when known); an empty value
+                    # makes the client select the actual failed job instead of
+                    # guessing the workflow name (which matched no job).
+                    job_name=task.ci_job or "",
                     check_url=task.ci_url,
                 )
                 if tail:
@@ -1412,6 +1710,16 @@ def run_task_inline(
                     task.ci_excerpt = excerpt
                     has_signal = _ctxmod.has_failure_signal(excerpt)
                     db.commit()
+            # Deferred webhook enrichment: workflow content / steps / PR files
+            # are fetched HERE (worker), never in the webhook request path.
+            try:
+                from app.github.webhook import build_ci_context_from_task as _ctx_from_task
+
+                enriched = _ctx_from_task(task)
+                _event(db, task.id, "CI_CONTEXT_ENRICHED", enriched, limit=20000)
+                db.commit()
+            except Exception:
+                db.rollback()
             ci_info = (
                 f"workflow={task.ci_workflow} job={task.ci_job} sha={task.ci_sha} "
                 f"run={task.ci_url}\nexcerpt:\n{_ctxmod.clip_logs(excerpt, 6000)}"
@@ -1649,15 +1957,11 @@ def run_task_inline(
         # --- git (FixHub owns it) ---
         try:
             if not _pub.has_meaningful_changes(path):
-                _set(db, task, status="COMPLETED", error="")
                 _event(db, task.id, "AGENT_FINISHED", {"result": "no changes produced"})
                 db.commit()
-                _cleanup(task.id)
-                return {
-                    "status": "COMPLETED",
-                    "summary": result.summary,
-                    "no_changes": True,
-                }
+                out = _no_changes_outcome(db, task)
+                out.setdefault("summary", result.summary)
+                return out
         except _pub.PublishError as exc:
             _set(db, task, status="FAILED", error=str(exc)[:1000])
             _event(db, task.id, "FAILED", {"reason": "git_status_failed"})

@@ -221,6 +221,102 @@ def publish(
     }
 
 
+def publish_to_existing_branch(
+    *,
+    path: str,
+    full_name: str,
+    branch: str,
+    base: str,
+    title: str,
+    body: str,
+    token: str,
+    lease_check=None,
+) -> dict:
+    """Commit the workspace and push it onto an originating PR's head branch.
+
+    Used only for same-repository pull-request failures: the agent's workspace
+    is already pinned to the failing commit (the PR head at trigger time), so
+    the fix commit is appended without checking out a possibly-advanced branch.
+    The push is a fast-forward or it fails — FixHub never force-pushes a user
+    branch. The PR is reused, never duplicated.
+
+    Fork PRs are never pushed here (service refuses before calling).
+    """
+    if not branch:
+        raise PublishError("originating PR head branch is unknown")
+
+    def _fenced(stage: str) -> None:
+        if lease_check is None:
+            return
+        try:
+            ok = bool(lease_check())
+        except Exception:
+            ok = False
+        if not ok:
+            raise PublishError(f"lease lost {stage}; refusing GitHub side effect")
+
+    if not has_meaningful_changes(path):
+        return {
+            "branch": branch,
+            "commit_sha": "",
+            "pr_number": None,
+            "pr_url": "",
+            "no_changes": True,
+        }
+    # Reuse-or-fail: a closed/renamed originating PR must not receive a push.
+    existing = _find_open_pr(token=token, full_name=full_name, branch=branch)
+    if existing is None:
+        raise PublishError(
+            "originating PR is no longer open; refusing to push to a stale branch"
+        )
+
+    def _run(step: str, args: list[str]) -> None:
+        proc = _git(path, *args)
+        if proc.returncode != 0:
+            raise PublishError(
+                f"git {step} failed: {(proc.stderr or proc.stdout)[-500:]}"
+            )
+
+    _run("add", ["add", "-A"])
+    _unstage_bytecode(path)
+    _run(
+        "commit",
+        [
+            "-c",
+            "user.name=fixhub",
+            "-c",
+            "user.email=fixhub@fixhub.local",
+            "commit",
+            "-m",
+            title,
+        ],
+    )
+    _fenced("before push")
+    # Explicit refspec: push the workspace HEAD onto the PR head branch without
+    # a checkout (never force). Non-fast-forward = the user moved the branch;
+    # surface that instead of overwriting their work.
+    _run("push", ["push", "origin", f"HEAD:refs/heads/{branch}"])
+    sha = _git(path, "rev-parse", "HEAD").stdout.strip()
+    _fenced("before PR reuse")
+    return {
+        "branch": branch,
+        "commit_sha": sha,
+        "pr_number": existing["number"],
+        "pr_url": existing["url"],
+    }
+
+
+def diff_paths(path: str, *paths: str) -> str:
+    """Bounded unified diff for specific repo-relative paths ("" on failure)."""
+    try:
+        proc = _git(path, "diff", "HEAD", "--", *paths)
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout or ""
+    except Exception:
+        return ""
+
+
 def _unstage_bytecode(path: str) -> None:
     """Remove interpreter bytecode from the git index (never commit .pyc).
 
