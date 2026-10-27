@@ -20,13 +20,18 @@ the guard is working; the deployed process is missing the setting.
 ## What the repository provides
 
 - `infra/systemd/fixhub-api.service.d-10-security.conf` — tracked systemd
-  drop-in that sets `Environment=AUTH_COOKIE_SECURE=1` for the API.
-- `infra/systemd/install_api_security.py` — idempotent installer.
+  drop-in that sets `Environment=AUTH_COOKIE_SECURE=1` and appends
+  `EnvironmentFile=/etc/fixhub/api-security.env`.
+- `infra/systemd/install_api_security.py` — idempotent installer that writes
+  both files.
 
 The base `fixhub-api.service` unit is host-managed and not tracked, so the
-repository adds a drop-in instead of overwriting the unit. `Environment=`
-becomes a process environment variable, which takes precedence over
-`backend/.env`.
+repository adds a drop-in instead of overwriting the unit. The base unit reads
+`/home/ubuntu/Fixhub/backend/.env` through `EnvironmentFile=`, and systemd
+gives `EnvironmentFile=` precedence over `Environment=`. The drop-in therefore
+adds a second, later `EnvironmentFile=`; systemd reads multiple files in order
+and the later file wins, so `/etc/fixhub/api-security.env` overrides
+`backend/.env` for this setting. `Environment=` remains as defense in depth.
 
 ## Apply on the EC2 host (after `git pull`)
 
@@ -39,13 +44,17 @@ sudo python3 infra/systemd/install_api_security.py
 The installer:
 
 1. verifies `fixhub-api.service` exists,
-2. installs the drop-in to
+2. writes `/etc/fixhub/api-security.env` (root-owned, mode 0600) with
+   `AUTH_COOKIE_SECURE=1`,
+3. installs the drop-in to
    `/etc/systemd/system/fixhub-api.service.d/10-security.conf`,
-3. runs `systemctl daemon-reload`,
-4. restarts only `fixhub-api`,
-5. verifies the **running** process has `AUTH_COOKIE_SECURE=1`
+4. runs `systemctl daemon-reload`,
+5. checks the merged `EnvironmentFile=` order and fails unless the security
+   file is read last,
+6. restarts only `fixhub-api`,
+7. verifies the **running** process has `AUTH_COOKIE_SECURE=1`
    (reads `/proc/<MainPID>/environ`),
-6. checks `http://127.0.0.1:8000/health`.
+8. checks `http://127.0.0.1:8000/health`.
 
 It exits non-zero instead of claiming success. It never edits the base unit,
 the worker, the database, migrations, or Firecracker/networking config.
@@ -64,14 +73,28 @@ as fixed until it does.
 
 ## If verification fails with an `EnvironmentFile` hint
 
-systemd gives `EnvironmentFile=` precedence over `Environment=`. If the base
-unit reads an env file that sets `AUTH_COOKIE_SECURE=0`, set it to `1` in that
-host-managed file (never commit it), then re-run the installer:
+Check the read order:
 
 ```bash
 systemctl cat fixhub-api --no-pager | grep -i EnvironmentFile
+```
+
+`/etc/fixhub/api-security.env` must be the **last** `EnvironmentFile=`. If
+another drop-in (for example `20-*.conf`) is read after it, rename this
+drop-in so it sorts later, then re-run the installer. The installer refuses to
+restart when the security file is not last.
+
+If the security file is last but the process still has the old value, the
+running process predates the change:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart fixhub-api
 sudo python3 infra/systemd/install_api_security.py
 ```
+
+Do not edit `backend/.env` to fix this; the tracked deployment mechanism
+overrides it intentionally.
 
 ## Local development
 
@@ -83,6 +106,7 @@ working without HTTPS.
 
 ```bash
 sudo rm /etc/systemd/system/fixhub-api.service.d/10-security.conf
+sudo rm -f /etc/fixhub/api-security.env
 sudo systemctl daemon-reload
 sudo systemctl restart fixhub-api
 ```

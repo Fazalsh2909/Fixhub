@@ -2,10 +2,17 @@
 """Install the deployed API security drop-in (AUTH_COOKIE_SECURE=1).
 
 The base `fixhub-api.service` unit is host-managed and not tracked, so the
-repository ships a systemd drop-in instead of overwriting it. This installer
-is idempotent and fail-closed: it writes the tracked drop-in, reloads systemd,
-restarts only `fixhub-api`, and verifies that the RUNNING process actually has
-AUTH_COOKIE_SECURE=1 before reporting success.
+repository ships a systemd drop-in instead of overwriting it. The base unit
+also reads `/home/ubuntu/Fixhub/backend/.env` via `EnvironmentFile=`, and
+systemd gives `EnvironmentFile=` precedence over `Environment=`. The drop-in
+therefore appends a second, later `EnvironmentFile=` pointing at
+`/etc/fixhub/api-security.env`; systemd reads it after the base file, so the
+deployed value wins without editing the host-managed `.env`.
+
+This installer is idempotent and fail-closed: it writes the root-owned env
+file and the tracked drop-in, reloads systemd, checks the merged
+`EnvironmentFile=` order, restarts only `fixhub-api`, and verifies that the
+RUNNING process actually has AUTH_COOKIE_SECURE=1 before reporting success.
 
 It never edits the base unit, the worker, the database, migrations, or any
 Firecracker/networking configuration.
@@ -28,10 +35,12 @@ from pathlib import Path
 DEFAULT_UNIT = "fixhub-api"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8000/health"
 DEFAULT_SYSTEMD_DIR = Path("/etc/systemd/system")
+DEFAULT_SECURITY_ENV = Path("/etc/fixhub/api-security.env")
 DROPIN_NAME = "10-security.conf"
 SOURCE = Path(__file__).with_name("fixhub-api.service.d-10-security.conf")
 ENV_KEY = "AUTH_COOKIE_SECURE"
 ENV_VALUE = "1"
+SECURITY_ENV_TEXT = f"{ENV_KEY}={ENV_VALUE}\n"
 
 
 class InstallerError(RuntimeError):
@@ -63,6 +72,29 @@ def environment_files(unit: str = DEFAULT_UNIT, *, runner=run) -> list[str]:
     return files
 
 
+def install_security_env(path: Path = DEFAULT_SECURITY_ENV) -> Path:
+    """Write the root-owned file read after the unit's own EnvironmentFile=.
+
+    systemd reads multiple `EnvironmentFile=` entries in order and lets the
+    later file win. This file is deliberately tiny and contains no secrets; it
+    exists so the deployed value overrides `backend/.env` without editing that
+    host-managed file. Safe to re-run.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.is_file() or path.read_text(encoding="utf-8") != SECURITY_ENV_TEXT:
+        path.write_text(SECURITY_ENV_TEXT, encoding="utf-8")
+    os.chmod(path, 0o600)
+    if os.name == "posix" and os.geteuid() == 0:
+        try:
+            os.chown(path, 0, 0)
+        except OSError as exc:
+            raise InstallerError(
+                f"could not set root ownership on {path}: {exc}"
+            ) from exc
+    return path
+
+
 def install_dropin(
     *,
     source: Path = SOURCE,
@@ -78,6 +110,15 @@ def install_dropin(
         raise InstallerError(
             f"{source} does not set Environment={ENV_KEY}={ENV_VALUE}"
         )
+    if not any(
+        line.strip().startswith("EnvironmentFile=")
+        for line in text.splitlines()
+    ):
+        raise InstallerError(
+            f"{source} does not append an EnvironmentFile=; without it the "
+            "base unit's EnvironmentFile= would override "
+            f"{ENV_KEY}={ENV_VALUE}"
+        )
     target_dir = Path(systemd_dir) / f"{unit}.service.d"
     target_dir.mkdir(parents=True, exist_ok=True)
     dest = target_dir / DROPIN_NAME
@@ -91,13 +132,15 @@ def apply_config(
     *,
     source: Path = SOURCE,
     systemd_dir: Path = DEFAULT_SYSTEMD_DIR,
+    security_env: Path = DEFAULT_SECURITY_ENV,
     runner=run,
 ) -> Path:
-    """Install the drop-in and reload systemd (no restart)."""
+    """Install the env file and drop-in, then reload systemd (no restart)."""
     if not unit_exists(unit, runner=runner):
         raise InstallerError(
             f"{unit}.service not found; install the base unit first"
         )
+    install_security_env(security_env)
     dest = install_dropin(source=source, unit=unit, systemd_dir=systemd_dir)
     reloaded = runner(["systemctl", "daemon-reload"])
     if reloaded.returncode != 0:
@@ -161,12 +204,45 @@ def health_ok(url: str, timeout: float = 5.0) -> bool:
         return False
 
 
+def _precedence_hint(
+    unit: str = DEFAULT_UNIT,
+    security_env: Path = DEFAULT_SECURITY_ENV,
+    *,
+    runner=run,
+) -> str:
+    """Explain why the deployed value is still losing, using the merged unit."""
+    files = environment_files(unit, runner=runner)
+    # Unit files always use POSIX paths, even when the installer is exercised
+    # from a Windows development checkout.
+    ours = Path(security_env).as_posix()
+    if ours not in files:
+        return (
+            f"{unit}.service does not list EnvironmentFile={ours}; the "
+            "security drop-in may not be installed "
+            f"(check `systemctl cat {unit}.service`)."
+        )
+    if files[-1] != ours:
+        later = ", ".join(files[files.index(ours) + 1 :])
+        return (
+            f"EnvironmentFile={ours} is read before {later}; systemd lets the "
+            "later file win. Rename this drop-in so it sorts after the other "
+            f"drop-in (check `systemctl cat {unit}.service`)."
+        )
+    return (
+        f"EnvironmentFile={ours} is read last, but the running process still "
+        "has the wrong value. Run `systemctl daemon-reload` and restart the "
+        f"service (check `systemctl show {unit}.service -p EnvironmentFiles` "
+        "and `/proc/<MainPID>/environ`)."
+    )
+
+
 def verify(
     unit: str = DEFAULT_UNIT,
     health_url: str = DEFAULT_HEALTH_URL,
     *,
     runner=run,
     proc_root: Path = Path("/proc"),
+    security_env: Path = DEFAULT_SECURITY_ENV,
     health=health_ok,
 ) -> tuple[bool, str]:
     """Prove the live service has the setting; never infer it from the file."""
@@ -174,12 +250,10 @@ def verify(
     if pid <= 0:
         return False, f"{unit}.service is not running (MainPID=0)"
     if not process_env_has(pid, proc_root=proc_root):
+        hint = _precedence_hint(unit, security_env, runner=runner)
         return False, (
             f"{unit}.service (pid {pid}) does not have "
-            f"{ENV_KEY}={ENV_VALUE} in its environment. If the base unit uses "
-            "EnvironmentFile=, systemd gives that file precedence over the "
-            "drop-in; set AUTH_COOKIE_SECURE=1 there too "
-            f"(check `systemctl cat {unit}.service`)."
+            f"{ENV_KEY}={ENV_VALUE} in its environment. {hint}"
         )
     if not health(health_url):
         return False, (
@@ -218,19 +292,40 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        files = environment_files(args.unit)
-        if files:
-            print(
-                "[install-api-security] NOTE: "
-                f"{args.unit}.service uses EnvironmentFile= "
-                f"({', '.join(files)}); systemd gives those files precedence "
-                "over Environment=. Live verification will catch a conflict."
-            )
         dest = apply_config(
             unit=args.unit,
             systemd_dir=Path(args.systemd_dir),
         )
-        print(f"[install-api-security] installed {dest}")
+        print(
+            f"[install-api-security] installed {DEFAULT_SECURITY_ENV} "
+            f"and {dest}"
+        )
+        files = environment_files(args.unit)
+        security = DEFAULT_SECURITY_ENV.as_posix()
+        if files:
+            print(
+                "[install-api-security] EnvironmentFile order: "
+                + " -> ".join(files)
+            )
+        if security not in files:
+            print(
+                "[install-api-security] ERROR: "
+                f"{args.unit}.service does not list "
+                f"EnvironmentFile={security} after daemon-reload; "
+                f"check `systemctl cat {args.unit}.service`",
+                file=sys.stderr,
+            )
+            return 1
+        if files[-1] != security:
+            print(
+                "[install-api-security] ERROR: "
+                f"EnvironmentFile={security} is not read last "
+                f"({', '.join(files)}); a later EnvironmentFile= would "
+                "override it. Rename this drop-in so it sorts after the other "
+                "drop-ins.",
+                file=sys.stderr,
+            )
+            return 1
         if args.no_restart:
             print(
                 "[install-api-security] daemon-reload done; restart skipped. "
@@ -252,7 +347,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"[install-api-security] OK: {detail}")
         return 0
-    except InstallerError as exc:
+    except (InstallerError, OSError) as exc:
         print(f"[install-api-security] ERROR: {exc}", file=sys.stderr)
         return 1
 
