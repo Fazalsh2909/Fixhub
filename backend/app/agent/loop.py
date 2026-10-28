@@ -543,6 +543,7 @@ class _Governor:
         self.no_evidence = 0
         self.nudges = 0
         self.recent: deque[str] = deque(maxlen=REPEAT_STOP_WINDOW)
+        self.path_reads: dict[str, int] = {}
 
     @staticmethod
     def _key(name: str, args: dict) -> str:
@@ -550,6 +551,19 @@ class _Governor:
             return name + ":" + json.dumps(args, sort_keys=True, ensure_ascii=False)
         except (TypeError, ValueError):
             return name + ":" + str(args)
+
+    @staticmethod
+    def _window_key(name: str, args: dict) -> str:
+        """Repeat-window key, path-normalized for the read/list tools.
+
+        Jittered offset/limit arguments must not make re-reads of the same
+        path look novel: production task #68 paged one 77-line workflow ~30
+        times with varying offset/limit, and every call was a brand-new
+        exact-args key that evaded repeat detection while burning budget.
+        """
+        if name in ("read_file", "list_directory"):
+            return name + ":" + str((args or {}).get("path", ""))
+        return _Governor._key(name, args)
 
     def before(self, name: str, args: dict) -> str | None:
         """Return a suppression/block message, or None to execute."""
@@ -570,6 +584,17 @@ class _Governor:
                 return (
                     "ERROR: this exact command already failed repeatedly. Change "
                     "the command, inspect the error, or take a different approach."
+                )
+        if name in ("read_file", "list_directory"):
+            path = str((args or {}).get("path", ""))
+            seen = self.path_reads.get(path, 0)
+            cap = max(1, int(getattr(settings, "LLM_MAX_READS_PER_PATH", 4)))
+            if path and seen >= cap:
+                return (
+                    f"ERROR: '{path}' has already been read {seen} times; further "
+                    "reads of this path are blocked. You already have its content: "
+                    "act on what you have — make the edit, verify it with the "
+                    "git_diff tool, or finish the task."
                 )
         if name in self.READ_TOOLS:
             hits = self.read_hits.get(key, 0)
@@ -597,7 +622,11 @@ class _Governor:
 
     def after(self, name: str, args: dict, result: str, ok: bool) -> None:
         key = self._key(name, args)
-        self.recent.append(key)
+        self.recent.append(self._window_key(name, args))
+        if name in ("read_file", "list_directory"):
+            path = str((args or {}).get("path", ""))
+            if path:
+                self.path_reads[path] = self.path_reads.get(path, 0) + 1
         evidence = False
         if name in self.MUTATION_TOOLS:
             if ok:
@@ -642,7 +671,7 @@ class _Governor:
         hard iteration cap.
         """
         if name:
-            self.recent.append(self._key(name, args or {}))
+            self.recent.append(self._window_key(name, args or {}))
         self.no_evidence += 1
 
     def _repeat_count(self, window: int) -> tuple[int, int]:

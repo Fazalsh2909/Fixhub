@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     # Consecutive steps without new evidence before the loop nudges once, then
     # stops with a "stalled" outcome (never a false COMPLETED).
     LLM_STALL_WINDOW: int = 8
+    # Distinct reads of one path (read_file/list_directory, any offset/limit)
+    # before further reads of that path are blocked with an act-on-what-you-
+    # have error. Bounds chunked-paging loops (production task #68).
+    LLM_MAX_READS_PER_PATH: int = 4
     # Retain processed webhook deliveries this long (audit + replay window).
     WEBHOOK_DELIVERY_RETENTION_HOURS: int = 168
     # A delivery stuck in "received" longer than this is re-processed.

@@ -824,6 +824,84 @@ def test_prompt_documents_sandbox_git():
 
     assert "no `.git`" in SYSTEM_PROMPT
     assert "git_diff" in SYSTEM_PROMPT
+    assert "offset/limit" in SYSTEM_PROMPT
+
+
+def test_governor_caps_reads_per_path(monkeypatch):
+    """Jittered offset/limit must not defeat read accounting: after the cap,
+    further reads of the same path are blocked while other paths stay open."""
+    import app.agent.loop as _loop
+
+    monkeypatch.setattr(settings, "LLM_MAX_READS_PER_PATH", 2)
+    g = _loop._Governor()
+    for off in ("1", "30"):
+        args = {"path": "ci.yml", "offset": off, "limit": "20"}
+        assert g.before("read_file", args) is None
+        g.after("read_file", args, "content", True)
+    blocked = g.before("read_file", {"path": "ci.yml", "offset": "60", "limit": "20"})
+    assert blocked is not None and blocked.startswith("ERROR")
+    assert "act on what you have" in blocked
+    # A different path is unaffected.
+    assert g.before("read_file", {"path": "other.yml"}) is None
+
+
+def test_governor_window_key_treats_jittered_reads_as_repeats():
+    """Path-normalized window keys: re-reading one path with varying
+    offset/limit must trip the repeat guard (production task #68 paged one
+    77-line file ~30 times, each a 'new' exact-args key)."""
+    import app.agent.loop as _loop
+
+    g = _loop._Governor()
+    for i in range(_loop.REPEAT_STOP_WINDOW):
+        g.after(
+            "read_file",
+            {"path": "ci.yml", "offset": str(i), "limit": str(10 + i)},
+            "content",
+            True,
+        )
+    assert g.stalled() is True
+
+
+def test_preserve_partial_work_keeps_changed_workspace(db, tmp_path):
+    """A stopped run with real changes must land in NEEDS_REVIEW, not be
+    wiped (production task #68: correct edit at step 8, then budget burn)."""
+    import subprocess
+
+    from app.tasks import service as svc
+
+    def _git(*args):
+        subprocess.run(
+            ["git", *args], cwd=str(tmp_path), check=True, capture_output=True
+        )
+
+    _git("init")
+    (tmp_path / "ci.yml").write_text("name: CI\n")
+    _git("add", ".")
+    _git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "init")
+    (tmp_path / "ci.yml").write_text("name: CI-fixed\n")
+
+    u = _own(db)
+    task = Task(
+        repository="acme/rel",
+        trigger_type="ci",
+        owner_id=u.id,
+        status="RUNNING",
+        workspace=str(tmp_path),
+    )
+    db.add(task)
+    db.commit()
+
+    out = svc._preserve_partial_work(db, task, str(tmp_path), "agent_stopped")
+    assert out is not None and out["status"] == "NEEDS_REVIEW"
+    db.expire_all()
+    row = db.query(Task).filter(Task.id == task.id).first()
+    assert row.status == "NEEDS_REVIEW"
+    assert "work preserved" in (row.error or "")
+
+    # A workspace with nothing uncommitted must not be preserved (the normal
+    # failure path stays FAILED).
+    _git("checkout", "--", "ci.yml")
+    assert svc._preserve_partial_work(db, task, str(tmp_path), "agent_stopped") is None
 
 
 def test_agent_loop_stops_when_actions_stall(monkeypatch, tmp_path):

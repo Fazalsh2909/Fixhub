@@ -1468,6 +1468,45 @@ def _usage_fraction(db, task: Task, buf: list[dict] | None = None) -> float:
     return max(0.0, min(1.0, frac))
 
 
+def _preserve_partial_work(db, task: Task, path: str, reason: str) -> dict | None:
+    """NEEDS_REVIEW instead of FAILED+wipe when the workspace holds real work.
+
+    A stall-stop, budget exhaustion, or crash can happen after the model
+    already made the correct edit (production task #68: the fix landed at
+    step 8, then the run burned its remaining budget exploring and the
+    workspace was wiped along with it). Preserving the workspace keeps that
+    work actionable; the user still approves the publish, so nothing
+    unreviewed reaches GitHub.
+    """
+    # Firecracker: guest results reach the host only on the success path, so
+    # sync them back before judging whether anything was produced.
+    try:
+        from app.sandbox.backend import active_backend_name as _active_backend
+
+        if _active_backend() == "firecracker":
+            from app.sandbox import firecracker as _fc
+
+            _fc.sync_guest_to_host(task_id=task.id, workspace=path)
+    except Exception:
+        pass
+    try:
+        if not _pub.has_meaningful_changes(path):
+            return None
+    except Exception:
+        return None
+    branch, _, _ = _pending_title_body(task, "")
+    _set(
+        db,
+        task,
+        status="NEEDS_REVIEW",
+        branch=branch,
+        error=f"work preserved ({reason}); review before publishing"[:1000],
+    )
+    _event(db, task.id, "NEEDS_REVIEW", {"reason": reason[:200], "branch": branch})
+    db.commit()
+    return {"status": "NEEDS_REVIEW", "branch": branch}
+
+
 def _fail_usage_limit(db, task: Task, reason: str) -> dict:
     """Final hardening: terminal failure on budget exhaustion. Records a safe
     usage/limit event (owner + reason only, never secrets) and makes no
@@ -1870,6 +1909,11 @@ def run_task_inline(
                 if getattr(result, "lease_lost", False):
                     return _fail_lease_lost(db, task, at="during agent run")
                 if getattr(result, "usage_limited", False):
+                    preserved = _preserve_partial_work(
+                        db, task, path, "usage_limit"
+                    )
+                    if preserved is not None:
+                        return preserved
                     return _fail_usage_limit(
                         db,
                         task,
@@ -1888,27 +1932,9 @@ def run_task_inline(
             # Crash with uncommitted work (e.g. transient network drop after a
             # productive run): keep the workspace for review/resume instead of
             # wiping it.
-            try:
-                crashed_with_changes = _pub.has_meaningful_changes(path)
-            except Exception:
-                crashed_with_changes = False
-            if crashed_with_changes:
-                branch, _, _ = _pending_title_body(task, "")
-                _set(
-                    db,
-                    task,
-                    status="NEEDS_REVIEW",
-                    branch=branch,
-                    error=f"agent crashed mid-run, work preserved: {exc}"[:1000],
-                )
-                _event(
-                    db,
-                    task.id,
-                    "NEEDS_REVIEW",
-                    {"reason": "agent_crash", "branch": branch},
-                )
-                db.commit()
-                return {"status": "NEEDS_REVIEW", "branch": branch}
+            preserved = _preserve_partial_work(db, task, path, "agent_crash")
+            if preserved is not None:
+                return preserved
             _set(db, task, status="FAILED", error=f"agent crashed: {exc}"[:1000])
             _event(db, task.id, "FAILED", {"reason": "agent_crash"})
             db.commit()
@@ -1929,6 +1955,12 @@ def run_task_inline(
             return {"status": "CANCELLED"}
 
         if not result.finished:
+            # A stall-stop can follow a correct edit (the model kept looping
+            # after the fix landed). Preserve real work for review instead of
+            # wiping the workspace along with it.
+            preserved = _preserve_partial_work(db, task, path, "agent_stopped")
+            if preserved is not None:
+                return preserved
             _set(db, task, status="FAILED", error=result.summary[:1000])
             _event(db, task.id, "FAILED", {"reason": result.summary[:500]})
             db.commit()
