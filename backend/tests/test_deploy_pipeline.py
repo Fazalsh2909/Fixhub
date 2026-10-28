@@ -201,9 +201,19 @@ def test_deploy_script_never_destroys_state(deploy_sh):
     code = _code_lines(deploy_sh)
     # No destructive cleanup, ever.
     assert "git clean" not in code
-    assert "rm -rf" not in code
-    assert "rm -fr" not in code
-    assert "rm " not in code, "deploy script should not delete anything"
+    assert "rm -rf /" not in code
+    # Deletion is legitimate in exactly two narrowly-scoped places inside the
+    # service-tree sync: removing the temporary staging export directory, and
+    # removing a single validated repo-relative path that git reports as
+    # deleted between two validated commits. Any other rm is a regression.
+    rm_lines = [
+        line for line in code.splitlines() if re.search(r"(?<![\w-])rm\s", line)
+    ]
+    assert rm_lines, "service-tree sync deletion logic missing"
+    for line in rm_lines:
+        assert ('"$NET_SYNC_STAGING"' in line) or ('"$delete_path"' in line), (
+            f"rm outside the scoped sync primitives: {line.strip()}"
+        )
     # No automatic database downgrade, ever.
     assert "alembic downgrade" not in code
     assert "downgrade head" not in code
@@ -220,6 +230,13 @@ def test_deploy_script_has_required_safety_properties(deploy_sh):
         # Exact-SHA validation before anything else runs.
         "is not a 40-hex commit SHA",
         "merge-base --is-ancestor",
+        # Service-tree sync: validated export from the canonical checkout,
+        # never a git checkout of /opt/fixhub (which has no .git).
+        "sync_net_tree",
+        "git archive",
+        "--no-renames",
+        "_net_path_is_safe",
+        "does not exist; provision it first",
         # Single explicit migration step, before restarts.
         "alembic upgrade head",
         # Worker drain with a documented timeout, never a kill.
@@ -307,6 +324,226 @@ def test_health_check_fails_after_bounded_attempts():
     assert "rc=1" in result.stdout, result.stdout + result.stderr
     assert "FAILED after 3 attempts" in result.stdout
     assert calls == "3", "must stop after the bounded attempts"
+
+
+# ---------------------------------------------------------------------------
+# deploy.sh: service-tree sync (/opt/fixhub has no .git)
+# ---------------------------------------------------------------------------
+
+
+def _run_sync_script(body: str, timeout: int = 120):
+    """Run a bash snippet with deploy.sh sourced and paths isolated.
+
+    deploy.sh assigns its default server paths at source time, so the test
+    overrides REPO_APP/REPO_NET *after* sourcing (every function reads the
+    globals at call time) and replaces git_as_owner with plain git — tests
+    run unprivileged in throwaway temp directories and never touch the real
+    server paths. Assertions happen inside the bash snippet (the temp dir is
+    deleted when this helper returns), so each scenario prints PASS/FAIL
+    markers that the test asserts on.
+    """
+    import tempfile
+
+    if not _bash_ok():
+        pytest.skip("no working bash on this machine")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).as_posix()
+        prelude = (
+            # deploy.sh enables `set -euo pipefail`; every potentially
+            # failing statement in the body must be guarded.
+            "set -u\n"
+            f'ROOT="{root}"\n'
+            f'source "{DEPLOY_SH.as_posix()}"\n'
+            # deploy.sh assigns its default server paths at source time but
+            # every function reads the globals at call time, so the isolated
+            # paths must be overridden AFTER sourcing.
+            'REPO_APP="$ROOT/canonical"\n'
+            'REPO_NET="$ROOT/service-tree"\n'
+            "git_as_owner() { local repo=\"$1\"; shift; git -C \"$repo\" \"$@\"; }\n"
+            "make_repo() {\n"
+            '  git init -q "$REPO_APP"\n'
+            '  git -C "$REPO_APP" config user.email test@example.com\n'
+            '  git -C "$REPO_APP" config user.name test\n'
+            # Keep blob == worktree content byte-identical on Windows hosts.
+            '  git -C "$REPO_APP" config core.autocrlf false\n'
+            "}\n"
+            "commit_all() {\n"
+            '  git -C "$REPO_APP" add -A\n'
+            '  git -C "$REPO_APP" commit -qm "$1"\n'
+            '  git -C "$REPO_APP" rev-parse HEAD\n'
+            "}\n"
+        )
+        script = prelude + body
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result
+
+
+def test_net_sync_full_export_into_plain_directory():
+    body = (
+        "make_repo\n"
+        'mkdir -p "$REPO_APP/backend/app" "$REPO_APP/infra/firecracker"\n'
+        'echo v1 > "$REPO_APP/backend/app/main.py"\n'
+        'echo helper-v1 > "$REPO_APP/infra/firecracker/fixhub-netd.py"\n'
+        "A=$(commit_all a)\n"
+        # The service tree is a plain directory with runtime state and NO .git.
+        'mkdir -p "$REPO_NET/backend/app"\n'
+        'echo venv-marker > "$REPO_NET/backend/.venv-marker"\n'
+        'echo SECRET=1 > "$REPO_NET/backend/.env"\n'
+        'mkdir -p "$REPO_NET/workspaces"\n'
+        'echo runtime > "$REPO_NET/workspaces/ws.txt"\n'
+        'sync_net_tree "" "$A" || echo "FAIL: full sync rc=$?"\n'
+        'grep -q v1 "$REPO_NET/backend/app/main.py" '
+        '&& echo "PASS: tracked file copied" || echo "FAIL: tracked file missing"\n'
+        'grep -q helper-v1 "$REPO_NET/infra/firecracker/fixhub-netd.py" '
+        '&& echo "PASS: helper source copied" || echo "FAIL: helper missing"\n'
+        'grep -q venv-marker "$REPO_NET/backend/.venv-marker" '
+        '&& echo "PASS: venv preserved" || echo "FAIL: venv lost"\n'
+        'grep -q SECRET=1 "$REPO_NET/backend/.env" '
+        '&& echo "PASS: env preserved" || echo "FAIL: env lost"\n'
+        'grep -q runtime "$REPO_NET/workspaces/ws.txt" '
+        '&& echo "PASS: workspaces preserved" || echo "FAIL: workspaces lost"\n'
+    )
+    result = _run_sync_script(body)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "FAIL" not in out, out
+    assert "full export applied" in out
+    assert "PASS: tracked file copied" in out
+    assert "PASS: venv preserved" in out
+    assert "PASS: env preserved" in out
+    assert "PASS: workspaces preserved" in out
+
+
+def test_net_sync_applies_exactly_the_requested_diff():
+    body = (
+        "make_repo\n"
+        'mkdir -p "$REPO_APP/backend/app" "$REPO_APP/infra/firecracker"\n'
+        'echo v1 > "$REPO_APP/backend/app/main.py"\n'
+        'echo helper-v1 > "$REPO_APP/infra/firecracker/fixhub-netd.py"\n'
+        'echo obsolete > "$REPO_APP/obsolete.txt"\n'
+        "A=$(commit_all a)\n"
+        'mkdir -p "$REPO_NET/backend/app" "$REPO_NET/infra/firecracker"\n'
+        'echo SECRET=1 > "$REPO_NET/backend/.env"\n'
+        'sync_net_tree "" "$A" || echo "FAIL: seed full sync rc=$?"\n'
+        # Commit B: modify a file, add a file, modify the helper, delete one.
+        'echo v2 > "$REPO_APP/backend/app/main.py"\n'
+        'echo new > "$REPO_APP/backend/app/egress.py"\n'
+        'echo helper-v2 > "$REPO_APP/infra/firecracker/fixhub-netd.py"\n'
+        'git -C "$REPO_APP" rm -q obsolete.txt\n'
+        "B=$(commit_all b)\n"
+        'sync_net_tree "$A" "$B" || echo "FAIL: incremental rc=$?"\n'
+        'git -C "$REPO_APP" show "$B:backend/app/main.py" > "$ROOT/expected-main.txt"\n'
+        'diff -q "$REPO_NET/backend/app/main.py" "$ROOT/expected-main.txt" >/dev/null '
+        '&& echo "PASS: content matches commit B" || echo "FAIL: content mismatch"\n'
+        'grep -q new "$REPO_NET/backend/app/egress.py" '
+        '&& echo "PASS: added file synced" || echo "FAIL: added file missing"\n'
+        'grep -q helper-v2 "$REPO_NET/infra/firecracker/fixhub-netd.py" '
+        '&& echo "PASS: helper source refreshed" || echo "FAIL: helper stale"\n'
+        '[ ! -e "$REPO_NET/obsolete.txt" ] '
+        '&& echo "PASS: deleted file removed" || echo "FAIL: deleted file still present"\n'
+        'grep -q SECRET=1 "$REPO_NET/backend/.env" '
+        '&& echo "PASS: env still preserved" || echo "FAIL: env lost"\n'
+    )
+    result = _run_sync_script(body)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "FAIL" not in out, out
+    assert "copied 3, deleted 1" in out, out
+    assert "PASS: content matches commit B" in out
+    assert "PASS: helper source refreshed" in out
+    assert "PASS: deleted file removed" in out
+
+
+def test_net_sync_reverse_diff_restores_previous_tree():
+    body = (
+        "make_repo\n"
+        'mkdir -p "$REPO_APP/backend/app"\n'
+        'echo v1 > "$REPO_APP/backend/app/main.py"\n'
+        'echo keep > "$REPO_APP/backend/app/stable.py"\n'
+        "A=$(commit_all a)\n"
+        'mkdir -p "$REPO_NET/backend/app"\n'
+        'echo SECRET=1 > "$REPO_NET/backend/.env"\n'
+        'sync_net_tree "" "$A" || echo "FAIL: seed full sync rc=$?"\n'
+        'echo v2 > "$REPO_APP/backend/app/main.py"\n'
+        'echo added > "$REPO_APP/backend/app/egress.py"\n'
+        'git -C "$REPO_APP" rm -q backend/app/stable.py\n'
+        "B=$(commit_all b)\n"
+        'sync_net_tree "$A" "$B" || echo "FAIL: forward sync rc=$?"\n'
+        # Rollback path: the reverse diff must restore the previous tree
+        # without any .git under the service tree.
+        'sync_net_tree "$B" "$A" || echo "FAIL: reverse sync rc=$?"\n'
+        'grep -q v1 "$REPO_NET/backend/app/main.py" '
+        '&& echo "PASS: modified restored" || echo "FAIL: modified not restored"\n'
+        '[ ! -e "$REPO_NET/backend/app/egress.py" ] '
+        '&& echo "PASS: added removed" || echo "FAIL: added still present"\n'
+        'grep -q keep "$REPO_NET/backend/app/stable.py" '
+        '&& echo "PASS: deleted restored" || echo "FAIL: deleted not restored"\n'
+        'grep -q SECRET=1 "$REPO_NET/backend/.env" '
+        '&& echo "PASS: env preserved through rollback" || echo "FAIL: env lost"\n'
+    )
+    result = _run_sync_script(body)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "FAIL" not in out, out
+    assert "PASS: modified restored" in out
+    assert "PASS: added removed" in out
+    assert "PASS: deleted restored" in out
+    assert "PASS: env preserved through rollback" in out
+
+
+def test_net_sync_fails_closed_on_bad_sha_and_missing_tree():
+    body = (
+        "make_repo\n"
+        'mkdir -p "$REPO_APP/backend"\n'
+        'echo v1 > "$REPO_APP/backend/app.py"\n'
+        "A=$(commit_all a)\n"
+        'mkdir -p "$REPO_NET"\n'
+        "rc=0\n"
+        'sync_net_tree "" "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" || rc=$?\n'
+        '[ "$rc" = "1" ] && echo "PASS: bad sha rc=1" || echo "FAIL: bad sha rc=$rc"\n'
+        'echo "$A" | grep -q "^[0-9a-f]\\{40\\}$" && echo "PASS: sha sanity" || echo "FAIL: sha sanity"\n'
+        # A missing service tree is never created blindly.
+        "SAVED_NET=$REPO_NET\n"
+        'REPO_NET="$ROOT/does-not-exist"\n'
+        "rc=0\n"
+        'sync_net_tree "" "$A" || rc=$?\n'
+        'REPO_NET="$SAVED_NET"\n'
+        '[ "$rc" = "1" ] && echo "PASS: missing tree rc=1" || echo "FAIL: missing tree rc=$rc"\n'
+        '[ ! -e "$ROOT/does-not-exist" ] '
+        '&& echo "PASS: tree not created blindly" || echo "FAIL: tree was created"\n'
+    )
+    result = _run_sync_script(body)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "FAIL" not in out, out
+    assert "sync: git archive of deadbeef" in out
+    assert "PASS: bad sha rc=1" in out
+    assert "PASS: missing tree rc=1" in out
+    assert "PASS: tree not created blindly" in out
+
+
+def test_rollback_without_prev_state_is_not_reported_as_success():
+    body = (
+        "TARGET_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        "PREV_SHA=\n"
+        "rc=0\n"
+        "rollback || rc=$?\n"
+        '[ "$rc" = "1" ] && echo "PASS: rollback rc=1" || echo "FAIL: rollback rc=$rc"\n'
+        'echo "$ROLLBACK_OK" | grep -q "^0$" && echo "PASS: not marked ok" || echo "FAIL: marked ok"\n'
+    )
+    result = _run_sync_script(body)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "no previously deployed SHA recorded; automatic rollback not possible" in out
+    assert "has no .git and never needs one" in out
+    assert "PASS: rollback rc=1" in out
+    assert "PASS: not marked ok" in out
+    assert "rollback verified" not in out
 
 
 # ---------------------------------------------------------------------------

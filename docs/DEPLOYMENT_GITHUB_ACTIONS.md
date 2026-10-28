@@ -17,9 +17,10 @@ deploy job (needs: [backend, frontend])
   1. OIDC: GitHub exchanges its token for short-lived AWS credentials
   2. assumes the dedicated deployment IAM role
   3. preflight: instance must be SSM-Online
-  4. SSM Run Command -> server: fetch + checkout the EXACT commit
+  4. SSM Run Command -> server: deploy the EXACT commit
   5. server runs infra/deploy/deploy.sh:
-       deps -> systemd config -> migrations -> drain worker
+       sync canonical checkout -> sync service tree -> deps
+       -> systemd config -> migrations -> drain worker
        -> restarts -> live security verify -> health checks
        (rollback to previous SHA on failure; DB never downgraded)
   6. workflow polls the command; non-zero server exit fails the job
@@ -115,11 +116,12 @@ nothing else (this is the complete policy — repo AND branch restricted):
   `rc/public-app-v1` branch. Workflow dispatch runs on that branch carry the
   same `sub`, so manual deploys work too; PRs and other branches cannot
   assume the role even if the workflow guard were ever bypassed.
-- Role name: `fixhub-staging-deploy` (any name works; record it for B2).
+- Role name: `FixHubGitHubDeployRole` (the name actually in use; record it
+  for B2).
 - Do **not** attach any AWS-managed policy like AdministratorAccess.
 
 Then add the inline **least-privilege permissions policy** (IAM -> Roles ->
-`fixhub-staging-deploy` -> Permissions -> Add inline policy), replacing
+`FixHubGitHubDeployRole` -> Permissions -> Add inline policy), replacing
 `<ACCOUNT_ID>` and `<INSTANCE_ID>`:
 
 ```json
@@ -167,12 +169,26 @@ no other regions.
 
 #### A5. One-time server preparation
 
-None beyond what the server already has. The deploy path reuses the existing
-checkout at `/home/ubuntu/Fixhub` (whose `git fetch` already works for manual
-pulls), the existing venv `/home/ubuntu/.venvs/fixhub312`, the existing
-`/opt/fixhub` checkout for the root-owned netd/egress services, and the
-existing `install_api_security.py` flow. SSM Run Command runs as root by
-default; the deploy script performs git operations as the repository owner.
+None beyond what the server already has. The deploy path reuses the
+existing server layout:
+
+- `/home/ubuntu/Fixhub` — the **canonical Git checkout**. It is the only
+  place on the server that needs `.git`; its `git fetch` already works for
+  manual pulls. The api and worker services run from this tree with the
+  venv `/home/ubuntu/.venvs/fixhub312`.
+- `/opt/fixhub` — the **service-code tree** executed by the root-owned
+  `fixhub-netd` and `fixhub-egress` services (with its own
+  `backend/.venv`). It does **not** need to be a Git checkout and the
+  deploy never creates one there: every deploy synchronizes it from a
+  validated `git archive` of the exact target commit, read from the
+  canonical checkout's object database. Only tracked paths are ever copied
+  or removed, so untracked runtime state — `backend/.venv`, `backend/.env`,
+  workspaces, databases — is untouched by construction, and both trees
+  always end at the same SHA.
+- The existing `install_api_security.py` flow.
+
+SSM Run Command runs as root by default; the deploy script performs git
+operations as the repository owner, and only inside the canonical checkout.
 
 Optional server-tunable knobs live in `/etc/fixhub/deploy.env` (create it
 root-owned `0600` if needed; it is never committed):
@@ -207,7 +223,7 @@ New repository variable**, three entries:
 | --- | --- | --- |
 | `AWS_REGION` | `ap-south-1` | fixed for this deployment |
 | `EC2_INSTANCE_ID` | `i-0...` | step A1 |
-| `AWS_ROLE_ARN` | `arn:aws:iam::<ACCOUNT_ID>:role/fixhub-staging-deploy` | step A4 |
+| `AWS_ROLE_ARN` | `arn:aws:iam::<ACCOUNT_ID>:role/FixHubGitHubDeployRole` | step A4 |
 
 No secrets are required: OIDC issues short-lived credentials per run, so
 there is no AWS key to store. (If you ever need a genuinely secret value,
@@ -234,11 +250,22 @@ job appears only after `backend` and `frontend` both pass.
   usually means the agent dropped offline mid-deploy; check Fleet Manager
   and the instance's `amazon-ssm-agent` logs.
 - **Deployment failed at health checks**: the workflow fails and the job
-  summary reports the deployed SHA. The server attempted a code-only rollback
-  to the previous SHA (see `/var/log/fixhub/deploy-latest.log` for
-  `rollback verified` or the manual-recovery steps). The database is never
-  downgraded automatically; if the previous code cannot serve the migrated
-  schema, the log says exactly that and names the manual steps.
+  summary reports the deployed SHA. When a previous successful deployment is
+  recorded, the server attempts a code-only rollback to that SHA (see
+  `/var/log/fixhub/deploy-latest.log` for `rollback verified` or the
+  manual-recovery steps). The database is never downgraded automatically; if
+  the previous code cannot serve the migrated schema, the log says exactly
+  that and names the manual steps.
+- **First automated deployment fails**: with no previous successful
+  deployment recorded there is nothing to roll back to, and the log says so
+  explicitly (`no previously deployed SHA recorded; automatic rollback not
+  possible`) instead of claiming a rollback happened. This is safe to retry:
+  the failed run leaves the service tree untouched or only partially synced,
+  and the next successful run heals it with a full export of tracked files
+  (nothing runtime-owned is ever deleted). To recover manually, use git only
+  in `/home/ubuntu/Fixhub` — never in `/opt/fixhub`, which has no `.git` —
+  then re-run the deploy script with the last good SHA; it re-validates the
+  commit, re-syncs both trees, and restarts safely.
 - **Worker busy at deploy time**: the deploy waits up to `DRAIN_TIMEOUT_S`
   (default 900s) for the running RQ job, then fails without killing it.
   Re-run the deployment when the job finishes, or raise the timeout in
@@ -250,8 +277,11 @@ job appears only after `backend` and `frontend` both pass.
 ## What deploy.sh will and will not do
 
 Will: validate the SHA (40-hex + ancestor of `origin/rc/public-app-v1`);
-sync BOTH checkouts (`/home/ubuntu/Fixhub` for api/worker, `/opt/fixhub` for
-netd/egress) to that exact SHA; pip-sync a venv only when
+sync the canonical checkout `/home/ubuntu/Fixhub` (api/worker) to that exact
+SHA and synchronize the `/opt/fixhub` service tree (netd/egress — no `.git`
+required) from a validated `git archive` of the same commit, copying only
+tracked paths so untracked runtime state (`backend/.venv`, `backend/.env`,
+workspaces) is untouched by construction; pip-sync a venv only when
 `backend/requirements.txt` changed; reinstall tracked systemd drop-ins and
 run `install_api_security.py` only when `infra/systemd/**` changed; run
 `alembic upgrade head` once before restarts; drain the worker; restart
@@ -259,11 +289,20 @@ services in dependency order (egress -> netd -> worker -> api); verify the
 live process still has `AUTH_COOKIE_SECURE=1`; health-check locally and
 publicly; record the deployed SHA in `/var/lib/fixhub/deploy-state.json`.
 
-Will not: run `git clean`; delete or rewrite `backend/.env`, virtualenvs,
-databases, or task workspaces; touch host-managed systemd units or
-server-specific drop-ins it does not own; restart netd/egress unless their
-code or configuration actually changed; downgrade the database; interrupt
-active Firecracker sandboxes to make deployment easier; print secrets.
+Will not: run `git clean`; require or create `.git` under `/opt/fixhub`;
+delete or rewrite `backend/.env`, virtualenvs, databases, or task
+workspaces; delete a directory during sync (an upstream directory removal
+fails the deploy instead of destroying possible runtime data); touch
+host-managed systemd units or server-specific drop-ins it does not own;
+restart netd/egress unless their code or configuration actually changed;
+downgrade the database; interrupt active Firecracker sandboxes to make
+deployment easier; print secrets.
+
+Known limitation: the restart planner restarts `fixhub-egress` only when
+sandbox or netd code changes. Backend changes outside `app/sandbox/` (for
+example `app/config.py`) are synchronized into `/opt/fixhub` on every
+deploy, but the running egress process keeps the previous code until the
+next sandbox/netd change restarts it.
 
 ## Relation to the manual AUTH_COOKIE_SECURE runbook
 

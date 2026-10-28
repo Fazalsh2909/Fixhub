@@ -9,6 +9,13 @@
 #     SHA must be a 40-hex commit that is an ancestor of origin/rc/public-app-v1.
 #   * Never runs `git clean`; never deletes or rewrites backend/.env, either
 #     virtualenv, the database, task workspaces, or any other runtime state.
+#   * /home/ubuntu/Fixhub is the ONLY Git checkout (canonical). /opt/fixhub —
+#     the service tree that fixhub-netd/fixhub-egress execute — has no .git
+#     and never needs one: it is synchronized from a validated `git archive`
+#     of the exact commit taken from the canonical checkout's object
+#     database. Only TRACKED paths are ever copied or removed, so untracked
+#     runtime state (backend/.venv, backend/.env, workspaces, databases) is
+#     untouched by construction. Both trees always end at the same SHA.
 #   * Touches only files the repository owns: tracked systemd drop-ins are
 #     reinstalled only when infra/systemd/** changed in this deploy; the
 #     host-managed base units and any server-specific configuration are never
@@ -71,6 +78,7 @@ ROLLBACK_ATTEMPTED=0
 ROLLBACK_OK=0
 IN_ROLLBACK=0
 RESTARTED_UNITS=""
+NET_SYNC_STAGING=""
 
 log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 die() { log "FATAL: $*"; exit 1; }
@@ -127,6 +135,168 @@ sync_repo() {
     [ "$actual" = "$TARGET_SHA" ] || die "$repo HEAD is $actual, expected $TARGET_SHA"
   fi
   log "$repo is at $TARGET_SHA"
+}
+
+# --- service tree synchronization (/opt/fixhub, no .git required) ----------
+#
+# /opt/fixhub holds the code that fixhub-netd and fixhub-egress execute. It
+# is NOT a Git checkout: the canonical repository lives at /home/ubuntu/Fixhub
+# and the service tree is synchronized from it so both trees serve the exact
+# same commit. Only TRACKED paths are ever copied or removed, which makes
+# preservation of runtime state structural rather than best-effort:
+# backend/.venv, backend/.env, workspaces, databases and every other
+# untracked file cannot collide with a tracked path, so they are never
+# touched. Deleted tracked files are removed individually after validation;
+# a directory is never deleted (fail closed if a tracked directory is
+# removed upstream while runtime data may live under it).
+
+cleanup_net_staging() {
+  if [ -n "${NET_SYNC_STAGING:-}" ] && [ -d "$NET_SYNC_STAGING" ]; then
+    rm -rf "$NET_SYNC_STAGING"
+  fi
+  NET_SYNC_STAGING=""
+}
+
+# Refuse absolute paths, backslashes, and "." / ".." path components before
+# any path taken from git output touches the filesystem.
+_net_path_is_safe() {
+  local p="$1" comp
+  [ -n "$p" ] || return 1
+  case "$p" in
+    /*|*\\*) return 1 ;;
+  esac
+  local IFS="/"
+  for comp in $p; do
+    case "$comp" in
+      ""|.|..) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# Copy one exported file into the service tree. Existing files are
+# overwritten in place (cp -f), which keeps their current owner and group;
+# permission bits follow the commit so tracked scripts stay executable.
+# Tracked symlinks are recreated exactly.
+_net_copy_file() { # $1=staging dir, $2=repo-relative path
+  local staging="$1" p="$2" dest="$REPO_NET/$2" mode
+  if ! _net_path_is_safe "$p"; then
+    log "sync: refusing unsafe path from git: '$p'"
+    return 1
+  fi
+  if [ -L "$staging/$p" ]; then
+    _net_delete_file "$p" || return 1
+    ln -sfn "$(readlink "$staging/$p")" "$dest" || { log "sync: symlink $p failed"; return 1; }
+    return 0
+  fi
+  if [ ! -f "$staging/$p" ]; then
+    log "sync: exported file missing: $p"
+    return 1
+  fi
+  if [ -d "$dest" ]; then
+    log "sync: refusing to overwrite a directory with a file: $p"
+    return 1
+  fi
+  mkdir -p "$(dirname "$dest")" || { log "sync: mkdir for $p failed"; return 1; }
+  cp -f "$staging/$p" "$dest" || { log "sync: copy of $p failed"; return 1; }
+  mode="$(stat -c '%a' "$staging/$p")"
+  chmod "$mode" "$dest" || { log "sync: chmod $p failed"; return 1; }
+  return 0
+}
+
+# Remove one path from the service tree — only ever called with a relative
+# path that git reports as deleted between two validated commits, and only
+# after _net_path_is_safe accepts it. A missing file is fine (idempotent);
+# a directory is refused (runtime data may live under it).
+_net_delete_file() { # $1=repo-relative path
+  local delete_path="$REPO_NET/$1"
+  if ! _net_path_is_safe "$1"; then
+    log "sync: refusing unsafe path from git: '$1'"
+    return 1
+  fi
+  if [ -L "$delete_path" ] || [ -f "$delete_path" ]; then
+    rm -f "$delete_path" || { log "sync: delete of $1 failed"; return 1; }
+  elif [ -d "$delete_path" ]; then
+    log "sync: refusing to delete directory $1 (runtime data may live under it); resolve manually"
+    return 1
+  fi
+  return 0
+}
+
+# Full synchronization (first deploy / unknown previous state): copy every
+# tracked file at the target commit. Nothing is ever deleted here, so a
+# stale or partially synced service tree heals without data loss.
+_net_copy_all() { # $1=staging dir, $2=target sha
+  local staging="$1" to="$2" p list copied=0
+  list="$staging/tracked-files.z"
+  git_as_owner "$REPO_APP" ls-tree -r --name-only -z "$to" > "$list" \
+    || { log "sync: git ls-tree failed"; return 1; }
+  while IFS= read -r -d '' p; do
+    _net_copy_file "$staging" "$p" || return 1
+    copied=$((copied + 1))
+  done < "$list"
+  log "sync: full export applied ($copied file(s))"
+}
+
+# Incremental synchronization: apply exactly the changes between the two
+# validated commits. --no-renames turns a rename into delete+add so the two
+# primitives above remain the only filesystem operations. The -z output is
+# written to a file inside the staging directory because command
+# substitution cannot carry NUL bytes.
+_net_apply_diff() { # $1=from sha, $2=to sha, $3=staging dir
+  local from="$1" to="$2" staging="$3" status p list copied=0 deleted=0
+  list="$staging/name-status.z"
+  git_as_owner "$REPO_APP" diff --no-renames --name-status -z "$from" "$to" > "$list" \
+    || { log "sync: git diff $from..$to failed"; return 1; }
+  while IFS= read -r -d '' status && IFS= read -r -d '' p; do
+    case "$status" in
+      A|M)
+        _net_copy_file "$staging" "$p" || return 1
+        copied=$((copied + 1))
+        ;;
+      D)
+        _net_delete_file "$p" || return 1
+        deleted=$((deleted + 1))
+        ;;
+      *)
+        log "sync: unexpected diff status '$status' for $p"
+        return 1
+        ;;
+    esac
+  done < "$list"
+  log "sync: applied $from..$to (copied $copied, deleted $deleted)"
+}
+
+# Synchronize the service tree to the target commit.
+#   sync_net_tree ""      "$SHA"  -> full export (first deploy / unknown state)
+#   sync_net_tree "$FROM" "$SHA"  -> apply exactly $FROM..$SHA
+# The export is a `git archive` of the validated commit read from the
+# canonical checkout's object database, so no partially validated or
+# working-tree-dependent content is ever used, and nothing is executed from
+# the staging directory. It is HEAD-independent: the canonical checkout does
+# not need to sit at $to for the sync to be correct.
+sync_net_tree() { # $1=previous sha ("" allowed), $2=target sha
+  local from="$1" to="$2" staging
+  if [ ! -d "$REPO_NET" ]; then
+    log "service tree $REPO_NET does not exist; provision it first (infra/firecracker/provision-host.sh) — this script never creates it blindly"
+    return 1
+  fi
+  staging="$(mktemp -d)" || { log "sync: cannot create staging directory"; return 1; }
+  NET_SYNC_STAGING="$staging"
+  if [ -n "$from" ]; then
+    log "syncing service tree $REPO_NET: applying $from..$to"
+  else
+    log "syncing service tree $REPO_NET: full export of $to (no previous deployment state)"
+  fi
+  git_as_owner "$REPO_APP" archive --format=tar "$to" | tar -x -C "$staging" \
+    || { log "sync: git archive of $to failed"; cleanup_net_staging; return 1; }
+  if [ -n "$from" ]; then
+    _net_apply_diff "$from" "$to" "$staging" || { cleanup_net_staging; return 1; }
+  else
+    _net_copy_all "$staging" "$to" || { cleanup_net_staging; return 1; }
+  fi
+  cleanup_net_staging
+  log "service tree $REPO_NET is at $to"
 }
 
 load_prev_state() {
@@ -363,10 +533,12 @@ collect_diagnostics() {
   log "----- end diagnostics -----"
 }
 
-# Code-only rollback: restore the previous SHA in BOTH checkouts, re-sync
-# dependencies if they changed, restart what was restarted, re-verify.
-# The database is NEVER downgraded; if the previous code cannot serve against
-# the migrated schema, the failure is reported with manual recovery steps.
+# Code-only rollback: restore the previous SHA in the canonical checkout,
+# re-sync the service tree from it (works without any .git under
+# /opt/fixhub), re-sync dependencies if they changed, restart what was
+# restarted, re-verify. The database is NEVER downgraded; if the previous
+# code cannot serve against the migrated schema, the failure is reported
+# with manual recovery steps.
 rollback() {
   IN_ROLLBACK=1
   set +e
@@ -374,11 +546,13 @@ rollback() {
   log "----- rollback -----"
   if [ -z "$PREV_SHA" ]; then
     log "no previously deployed SHA recorded; automatic rollback not possible"
-    log "manual recovery: pick the last good commit, then in BOTH $REPO_APP and $REPO_NET run:"
-    log "  sudo -u \"\$(stat -c %U <repo>)\" git fetch origin $DEPLOY_BRANCH"
-    log "  sudo -u \"\$(stat -c %U <repo>)\" git checkout -B $DEPLOY_BRANCH <last-good-sha>"
-    log "  $VENV_APP_PY -m pip install -r $REPO_APP/backend/requirements.txt"
-    log "  sudo systemctl restart $UNIT_WORKER $UNIT_API"
+    log "this is expected on a FIRST automated deployment: no prior state exists to roll back to."
+    log "manual recovery (git is used only in $REPO_APP; $REPO_NET has no .git and never needs one):"
+    log "  cd $REPO_APP"
+    log "  sudo -u \"\$(stat -c %U $REPO_APP)\" git fetch origin $DEPLOY_BRANCH"
+    log "  sudo -u \"\$(stat -c %U $REPO_APP)\" git checkout -B $DEPLOY_BRANCH <last-good-sha>"
+    log "  sudo bash $REPO_APP/infra/deploy/deploy.sh <last-good-sha>"
+    log "The re-run validates the SHA, re-syncs $REPO_NET (full export of tracked files, nothing deleted), and restarts safely."
     log "migrations were $([ "$MIGRATIONS_RAN" = "1" ] && echo APPLIED || echo NOT applied); the database was NOT downgraded."
     return 1
   fi
@@ -389,8 +563,10 @@ rollback() {
   log "rolling application code back to $PREV_SHA (database is NOT downgraded)"
   git_as_owner "$REPO_APP" checkout --quiet -B "$DEPLOY_BRANCH" "$PREV_SHA" \
     || { log "git checkout $PREV_SHA failed in $REPO_APP"; return 1; }
-  git_as_owner "$REPO_NET" checkout --quiet -B "$DEPLOY_BRANCH" "$PREV_SHA" \
-    || { log "git checkout $PREV_SHA failed in $REPO_NET"; return 1; }
+  if ! sync_net_tree "$TARGET_SHA" "$PREV_SHA"; then
+    log "service tree rollback sync failed; $REPO_NET may be mixed-revision — resolve manually before restarting"
+    return 1
+  fi
   if [ "$SYNC_APP_DEPS" = "1" ]; then
     "$VENV_APP_PY" -m pip install --quiet --disable-pip-version-check \
       -r "$REPO_APP/backend/requirements.txt" \
@@ -422,6 +598,7 @@ finish() {
   local rc="$1"
   [ "$rc" -eq 0 ] && return 0
   [ "$IN_ROLLBACK" = "1" ] && return 0
+  cleanup_net_staging || true
   collect_diagnostics || true
   rollback || true
   log "deployment FAILED (exit $rc); deployed_sha=$TARGET_SHA previous_sha=${PREV_SHA:-none} rollback_attempted=$ROLLBACK_ATTEMPTED rollback_ok=$ROLLBACK_OK"
@@ -435,10 +612,10 @@ main() {
   validate_sha
   log "deploy request: sha=$TARGET_SHA branch=$DEPLOY_BRANCH"
   sync_repo "$REPO_APP"
-  sync_repo "$REPO_NET"
   load_prev_state
   compute_plan
   log "plan: api=$RESTART_API worker=$RESTART_WORKER netd=$RESTART_NETD egress=$RESTART_EGRESS app_deps=$SYNC_APP_DEPS net_deps=$SYNC_NET_DEPS systemd=$INSTALL_SYSTEMD_CONFIG netd_helper=$REINSTALL_NETD_HELPER migrations=$RUN_MIGRATIONS frontend=$BUILD_FRONTEND"
+  sync_net_tree "$PREV_SHA" "$TARGET_SHA" || die "service tree sync failed"
   sync_deps
   install_systemd_config
   reinstall_netd_helper
