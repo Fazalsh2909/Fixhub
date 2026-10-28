@@ -2,12 +2,19 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+# Minimal workflow-wide permissions. The deploy job additionally grants
+# id-token: write (AWS OIDC) and nothing else.
+permissions:
+  contents: read
+
 jobs:
   backend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - name: Install system deps
@@ -25,8 +32,8 @@ jobs:
   frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "20"
           cache: npm
@@ -46,3 +53,157 @@ jobs:
   # reviewed, pinned revisions on a dedicated KVM host
   # (FIXHUB_FIRECRACKER_TEST=1, FC_REQUIRE_KVM=1). Public CI stays on
   # ubuntu-latest so untrusted PR code never executes on privileged runners.
+
+  # Deploys the exact commit that passed every required job above to the
+  # staging EC2 instance over AWS SSM (no SSH port, no long-lived keys).
+  # See docs/DEPLOYMENT_GITHUB_ACTIONS.md for the one-time AWS/GitHub setup.
+  deploy:
+    name: deploy (staging EC2)
+    # Only a push to the deployment branch — or a manual dispatch run ON that
+    # branch — may deploy. Pull requests and every other branch can never
+    # reach the server.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/rc/public-app-v1'
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    environment: staging
+    # One deployment at a time. A newer push WAITS for the running deployment
+    # to finish instead of cancelling it mid-flight (cancel-in-progress:
+    # false) — two concurrent deploys must never mutate the server together.
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check deployment variables
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+        run: |
+          missing=0
+          for v in AWS_REGION EC2_INSTANCE_ID AWS_ROLE_ARN; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Repository variable $v is not set. See docs/DEPLOYMENT_GITHUB_ACTIONS.md (GitHub setup)."
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Preflight — instance must be SSM-online
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+        run: |
+          STATUS="$(aws ssm describe-instance-information \
+            --region "$AWS_REGION" \
+            --instance-information-filter-list "key=InstanceIds,valueSet=${EC2_INSTANCE_ID}" \
+            --query 'InstanceInformationList[0].PingStatus' \
+            --output text)"
+          echo "SSM ping status: $STATUS"
+          if [ "$STATUS" != "Online" ]; then
+            echo "::error::Instance ${EC2_INSTANCE_ID} is not reachable via SSM (status: ${STATUS})."
+            echo "One-time fix: docs/DEPLOYMENT_GITHUB_ACTIONS.md -> 'AWS setup' (SSM agent + instance profile)."
+            exit 1
+          fi
+
+      # The bootstrap is deliberately tiny and stable: it fetches the branch,
+      # checks out the EXACT commit that passed CI, and execs the freshly
+      # checked-out deploy.sh — so even a deploy that changes the deploy
+      # script itself runs the new logic. Changes to this bootstrap only take
+      # effect on the deployment AFTER the one that introduces them.
+      - name: Send deploy command (exact SHA) via SSM
+        id: send
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          BOOT=$(cat <<'EOF'
+          set -euo pipefail
+          REPO=/home/ubuntu/Fixhub
+          TARGET_SHA="__FIXHUB_DEPLOY_SHA__"
+          OWNER="$(stat -c '%U' "$REPO")"
+          sudo -u "$OWNER" git -C "$REPO" fetch --quiet origin rc/public-app-v1
+          sudo -u "$OWNER" git -C "$REPO" checkout --quiet -B rc/public-app-v1 "$TARGET_SHA"
+          exec sudo bash "$REPO/infra/deploy/deploy.sh" "$TARGET_SHA"
+          EOF
+          )
+          BOOT="${BOOT/__FIXHUB_DEPLOY_SHA__/$TARGET_SHA}"
+          PARAMS="$(jq -n --arg script "$BOOT" '{commands: [$script], executionTimeout: ["3600"]}')"
+          COMMAND_ID="$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --comment "FixHub deploy $TARGET_SHA" \
+            --timeout-seconds 3600 \
+            --parameters "$PARAMS" \
+            --query "Command.CommandId" --output text)"
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          echo "SSM command queued: $COMMAND_ID"
+
+      - name: Wait for deployment and report
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          COMMAND_ID: ${{ steps.send.outputs.command_id }}
+          POLL_TIMEOUT_S: 2700
+          POLL_INTERVAL_S: 20
+        run: |
+          deadline=$((SECONDS + POLL_TIMEOUT_S))
+          while :; do
+            RESULT="$(aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query '{Status:Status,Details:StatusDetails,Out:StandardOutputContent,Err:StandardErrorContent}' \
+              --output json)"
+            STATUS="$(jq -r '.Status' <<<"$RESULT")"
+            case "$STATUS" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Timed out after ${POLL_TIMEOUT_S}s waiting for SSM command ${COMMAND_ID}."
+              echo "$RESULT"
+              exit 1
+            fi
+            sleep "$POLL_INTERVAL_S"
+          done
+          echo "----- SSM stdout (may be truncated; full log: /var/log/fixhub/ on the server) -----"
+          jq -r '.Out // empty' <<<"$RESULT"
+          echo "----- SSM stderr -----"
+          jq -r '.Err // empty' <<<"$RESULT"
+          echo "SSM status: $STATUS"
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::Deployment command finished with status ${STATUS}. See the output above and /var/log/fixhub/ on the server."
+            exit 1
+          fi
+
+      - name: Job summary
+        if: always()
+        env:
+          TARGET_SHA: ${{ github.sha }}
+          COMMAND_ID: ${{ steps.send.outputs.command_id }}
+          DEPLOY_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## FixHub staging deployment"
+            echo ""
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| commit | \`${TARGET_SHA}\` |"
+            echo "| target | staging EC2 via SSM (docs/DEPLOYMENT_GITHUB_ACTIONS.md) |"
+            echo "| workflow status | ${DEPLOY_STATUS} |"
+            echo "| SSM command | \`${COMMAND_ID:-not-sent}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
