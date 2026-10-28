@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 from app.agent import prompt as _prompt
@@ -293,7 +294,7 @@ def run_agent(
                 result = blocked
                 meta: dict = {}
                 ok = False
-                governor.blocked_step()
+                governor.blocked_step(tc.name, args)
             else:
                 cached = governor.cached(tc.name, args)
                 result = (
@@ -483,6 +484,38 @@ def _fit_history_span(span: list[dict], budget: int) -> list[dict] | None:
     return None
 
 
+# Sliding-window repeat detection. Cycling through previously seen reads and
+# commands (interleaved with novel ones) is the observed production failure
+# mode: task #66 re-explored the whole repo after a successful edit until the
+# token budget died, while the consecutive no-evidence counter kept resetting
+# on every novel key. Unlike that counter, this window survives novel
+# interludes and cannot be reset by pointless exploration.
+REPEAT_NUDGE_WINDOW = 12
+REPEAT_NUDGE_LIMIT = 8
+REPEAT_STOP_WINDOW = 20
+REPEAT_STOP_LIMIT = 13
+
+
+def _read_digest(content: str, head: int = 10, tail: int = 8, cap: int = 1400) -> str:
+    """Bounded head/tail digest of a cached read.
+
+    Returning the full content again on every identical read re-injects the
+    whole file into context (the production run burned its budget re-reading
+    the same workflow). The digest keeps orientation anchors without the token
+    cost.
+    """
+    lines = content.split("\n")
+    if len(lines) <= head + tail + 2:
+        return content[:cap]
+    omitted = len(lines) - head - tail
+    out = (
+        "\n".join(lines[:head])
+        + f"\n... [{omitted} middle lines omitted; identical to the first read] ...\n"
+        + "\n".join(lines[-tail:])
+    )
+    return out[:cap]
+
+
 class _Governor:
     """General-purpose runtime safeguards (never dictates the plan).
 
@@ -509,6 +542,7 @@ class _Governor:
         self.cmd_failures: dict[str, int] = {}
         self.no_evidence = 0
         self.nudges = 0
+        self.recent: deque[str] = deque(maxlen=REPEAT_STOP_WINDOW)
 
     @staticmethod
     def _key(name: str, args: dict) -> str:
@@ -557,12 +591,13 @@ class _Governor:
             return None
         self.read_hits[key] = self.read_hits.get(key, 0) + 1
         return (
-            self.read_cache[key]
+            _read_digest(self.read_cache[key])
             + "\n[cached: identical read; workspace unchanged since the first result]"
         )
 
     def after(self, name: str, args: dict, result: str, ok: bool) -> None:
         key = self._key(name, args)
+        self.recent.append(key)
         evidence = False
         if name in self.MUTATION_TOOLS:
             if ok:
@@ -599,18 +634,39 @@ class _Governor:
         else:
             self.no_evidence += 1
 
-    def blocked_step(self) -> None:
+    def blocked_step(self, name: str = "", args: dict | None = None) -> None:
         """A suppressed/blocked tool call produced no new evidence.
 
         Without this, a model looping on a suppressed read would never trip
         the stall detector (blocked calls skip `after`), spinning until the
         hard iteration cap.
         """
+        if name:
+            self.recent.append(self._key(name, args or {}))
         self.no_evidence += 1
+
+    def _repeat_count(self, window: int) -> tuple[int, int]:
+        """(repeats, total) over the last `window` tool keys.
+
+        A repeat is a key already seen earlier inside the window.
+        """
+        items = list(self.recent)[-window:]
+        if not items:
+            return 0, 0
+        seen: set[str] = set()
+        repeats = 0
+        for k in items:
+            if k in seen:
+                repeats += 1
+            else:
+                seen.add(k)
+        return repeats, len(items)
 
     def nudge(self) -> str | None:
         window = max(2, int(getattr(settings, "LLM_STALL_WINDOW", 8)))
-        if self.no_evidence >= window and self.nudges < 2:
+        if self.nudges >= 2:
+            return None
+        if self.no_evidence >= window:
             self.nudges += 1
             return (
                 "Runtime note: the last several actions produced no new evidence "
@@ -618,11 +674,24 @@ class _Governor:
                 "read a different region, change the command, or make the concrete "
                 "edit you already have enough information for."
             )
+        repeats, total = self._repeat_count(REPEAT_NUDGE_WINDOW)
+        if total >= REPEAT_NUDGE_WINDOW and repeats >= REPEAT_NUDGE_LIMIT:
+            self.nudges += 1
+            return (
+                "Runtime note: most of your recent tool calls repeated earlier "
+                "reads/commands. Cycling through the same files will not finish "
+                "the task: make the concrete edit you already have enough "
+                "information for, verify it once with the git_diff tool, and "
+                "finish."
+            )
         return None
 
     def stalled(self) -> bool:
         window = max(2, int(getattr(settings, "LLM_STALL_WINDOW", 8)))
-        return self.no_evidence >= 2 * window
+        if self.no_evidence >= 2 * window:
+            return True
+        repeats, total = self._repeat_count(REPEAT_STOP_WINDOW)
+        return total >= REPEAT_STOP_WINDOW and repeats >= REPEAT_STOP_LIMIT
 
 
 def _diagnosis_brief(ctx) -> str:

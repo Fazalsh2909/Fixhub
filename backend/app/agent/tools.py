@@ -382,6 +382,26 @@ def _format_command_result(res) -> str:
     )
 
 
+def _is_raw_git(command: str) -> bool:
+    """True when the shell command invokes git directly.
+
+    The firecracker guest workspace has no .git (host-side git architecture),
+    so every raw git command fails there with exit 128/129. Detects git as the
+    first meaningful token of any `&&` chain segment, skipping leading
+    environment assignments (FOO=1 git status).
+    """
+    s = (command or "").strip()
+    if not s:
+        return False
+    for segment in s.split("&&"):
+        token = segment.strip()
+        while token and "=" in token.split(" ", 1)[0]:
+            token = token.split(" ", 1)[1].strip() if " " in token else ""
+        if token == "git" or token.startswith("git "):
+            return True
+    return False
+
+
 def run_command(workspace: str, command: str, cwd: str = ".") -> str:
     """Run a shell command with a fixed repository-relative working directory.
 
@@ -390,6 +410,16 @@ def run_command(workspace: str, command: str, cwd: str = ".") -> str:
     Dispatches to the active sandbox backend (host | firecracker); any backend
     failure is reported as blocked (never host fallback).
     """
+    if _use_firecracker() and _is_raw_git(command):
+        # The guest has no .git, so this would fail with exit 128/129 and the
+        # model would burn turns rediscovering that (production task #66).
+        return (
+            "ERROR: git is unavailable inside the sandbox: the workspace has "
+            "no .git (git objects stay on the FixHub host), so raw git "
+            "commands always fail here. FixHub owns Git anyway: use the "
+            "git_status and git_diff tools instead — git_diff shows the real "
+            "diff of your edits."
+        )
     try:
         from app.sandbox.backend import run_command as _dispatch
 

@@ -768,6 +768,64 @@ def test_governor_counts_blocked_steps_toward_stall(monkeypatch):
     assert g.nudge() is None
 
 
+def test_governor_repeat_window_nudges_on_novel_interleaved_cycles():
+    """Cycling through seen reads with novel interludes must trip the repeat
+    guard: production task #66 re-explored the repo after a successful edit
+    and the consecutive no-evidence counter kept resetting on novel keys."""
+    import app.agent.loop as _loop
+
+    g = _loop._Governor()
+    keys = ["a", "b", "c", "d", "a", "b", "c", "d", "a", "b", "c", "a"]
+    for i, k in enumerate(keys):
+        g.after("read_file", {"path": f"{k}.py"}, f"content {i}", True)
+    repeats, total = g._repeat_count(_loop.REPEAT_NUDGE_WINDOW)
+    assert total == _loop.REPEAT_NUDGE_WINDOW
+    assert repeats >= _loop.REPEAT_NUDGE_LIMIT
+    assert g.nudge() is not None
+
+
+def test_governor_repeat_window_ignores_linear_novel_work():
+    """A linear investigation (all unique keys) must never trip the guard."""
+    import app.agent.loop as _loop
+
+    g = _loop._Governor()
+    for i in range(25):
+        g.after("run_command", {"command": f"unique-cmd-{i}"}, f"out {i}", True)
+    assert g.nudge() is None
+    assert g.stalled() is False
+
+
+def test_governor_repeat_window_hard_stops_on_cycles():
+    import app.agent.loop as _loop
+
+    g = _loop._Governor()
+    for i, k in enumerate(["a", "b", "c", "d"] * 5):
+        g.after("read_file", {"path": f"{k}.py"}, f"content {i}", True)
+    assert g.stalled() is True
+
+
+def test_cached_read_returns_bounded_digest():
+    """A repeat read must not re-inject the full file into context."""
+    import app.agent.loop as _loop
+
+    g = _loop._Governor()
+    content = "\n".join(f"line {i}" for i in range(200))
+    g.after("read_file", {"path": "big.yml"}, content, True)
+    out = g.cached("read_file", {"path": "big.yml"})
+    assert out is not None
+    assert len(out) < 1600
+    assert "cached" in out
+    assert "line 0" in out and "line 199" in out
+
+
+def test_prompt_documents_sandbox_git():
+    """The model must be told raw git fails in the sandbox before it tries."""
+    from app.agent.prompt import SYSTEM_PROMPT
+
+    assert "no `.git`" in SYSTEM_PROMPT
+    assert "git_diff" in SYSTEM_PROMPT
+
+
 def test_agent_loop_stops_when_actions_stall(monkeypatch, tmp_path):
     import app.agent.loop as _loop
     from app.llm.client import AssistantMessage, ToolCall

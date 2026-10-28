@@ -9,6 +9,7 @@ The task is to repair the cause of a failing CI run, not to make the run report 
 - If the evidence is ambiguous or no log was captured, reproduce the failing step with one command derived from the workflow.
 - Make the smallest change that fixes the underlying defect, matching the surrounding style.
 - Run the narrowest check that exercises the change once. FixHub publishes what you leave in the workspace, so do not leave it knowingly red.
+- The sandbox workspace has no `.git`: raw `git` commands via `run_command` always fail. Verify edits with the `git_diff` tool, not with git commands, then finish.
 
 ## Boundaries
 

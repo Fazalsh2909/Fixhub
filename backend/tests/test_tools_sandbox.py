@@ -139,6 +139,21 @@ def test_run_command_jailed_and_denied(ws):
         _sb.run_command("/nonexistent-ws", "echo hi")
 
 
+def test_run_command_rejects_raw_git_in_sandbox(monkeypatch, ws):
+    """The guest workspace has no .git, so raw git commands always fail with
+    exit 128/129. The tool must say so up front and point at the
+    git_status/git_diff tools (production task #66 burned its budget
+    rediscovering this and then re-exploring the repo)."""
+    monkeypatch.setattr(_t, "_use_firecracker", lambda: True)
+    for cmd in ("git log --oneline -5", "cd apps/api && git diff", "git status"):
+        out = _t.run_command(ws, cmd)
+        assert out.startswith("ERROR")
+        assert "git_status" in out and "git_diff" in out
+    # Host mode keeps real git (the host workspace has .git).
+    monkeypatch.setattr(_t, "_use_firecracker", lambda: False)
+    assert "exit_code" in _t.run_command(ws, "git status")
+
+
 def test_timeout_kills_process_tree(ws):
     """Grandchildren holding pipes must not defeat the timeout (Windows
     pipe-inheritance deadlock regression)."""
