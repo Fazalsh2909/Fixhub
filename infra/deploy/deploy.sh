@@ -16,6 +16,13 @@
 #     database. Only TRACKED paths are ever copied or removed, so untracked
 #     runtime state (backend/.venv, backend/.env, workspaces, databases) is
 #     untouched by construction. Both trees always end at the same SHA.
+#   * Dependency installation never recreates a virtualenv and never assumes
+#     pip exists inside it (the server's uv-managed venvs do not seed pip):
+#     it prefers uv (UV_BIN in /etc/fixhub/deploy.env, then `command -v`,
+#     then known install locations), falls back to the venv's own pip, then
+#     to ensurepip strictly inside that venv. Installs run as the venv's
+#     owner; with no mechanism available the deploy fails with an explicit
+#     diagnostic instead of skipping dependencies.
 #   * Touches only files the repository owns: tracked systemd drop-ins are
 #     reinstalled only when infra/systemd/** changed in this deploy; the
 #     host-managed base units and any server-specific configuration are never
@@ -326,17 +333,127 @@ compute_plan() {
   eval "$PLAN_OUTPUT"
 }
 
+# --- dependency installation (venvs may lack pip; the server uses uv) ------
+#
+# Both virtualenvs are long-lived and are NEVER recreated by this script.
+# The server's Python is uv-managed: `uv venv` does not seed pip, so
+# `python -m pip` can legitimately be absent from a working environment
+# (that is what failed the first automated deploy). Installation therefore
+# resolves the first supported mechanism instead of assuming pip:
+#   1. uv — $UV_BIN (settable in /etc/fixhub/deploy.env), then `command -v`,
+#      then the known per-user/system install locations
+#   2. pip already present inside the target venv
+#   3. ensurepip — bootstraps pip into THAT venv only; never --user, never
+#      the system Python, and only when the interpreter supports it
+# Every install runs as the venv's owner so no root-owned files appear
+# inside a user-owned environment (and vice versa). When nothing is
+# available the failure is explicit: deployment must not silently skip
+# dependency installation.
+
+# Locate a usable uv binary. The server's uv is typically installed
+# per-user, which root's PATH does not include, so the venv owner's and
+# root's known install locations are probed as well. UV_CANDIDATES is
+# overridable (tests); UV_BIN (from /etc/fixhub/deploy.env) always wins.
+find_uv() { # $1 = venv owner -> prints the uv path or returns 1
+  local owner="$1" p candidates
+  if [ -n "${UV_BIN:-}" ]; then
+    if [ -x "$UV_BIN" ]; then
+      printf '%s\n' "$UV_BIN"
+      return 0
+    fi
+    log "UV_BIN=$UV_BIN is set but not executable; ignoring it"
+  fi
+  p="$(command -v uv 2>/dev/null || true)"
+  if [ -n "$p" ] && [ -x "$p" ]; then
+    printf '%s\n' "$p"
+    return 0
+  fi
+  # shellcheck disable=SC2086  # word splitting of the candidate list is intended
+  candidates="${UV_CANDIDATES-/home/$owner/.local/bin/uv /root/.local/bin/uv /usr/local/bin/uv /usr/bin/uv /snap/bin/uv}"
+  for p in $candidates; do
+    if [ -x "$p" ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Run a command as the given user (directly when already that user) so
+# package installation never creates root-owned files inside a user-owned
+# virtualenv, or user-owned files inside a root-owned one. -H sets HOME to
+# the target user's home so tool caches (uv) land in the right place.
+run_as() { # $1 = user, rest = command
+  local user="$1"; shift
+  if [ "$(id -un)" = "$user" ]; then
+    "$@"
+  else
+    sudo -H -u "$user" "$@"
+  fi
+}
+
+venv_has_pip() { "$1" -m pip --version >/dev/null 2>&1; }
+
+# Functional check: a Debian/Ubuntu system Python reports ensurepip as
+# disabled at run time even though the module imports, so probe it.
+venv_supports_ensurepip() { "$1" -m ensurepip --version >/dev/null 2>&1; }
+
+# Install pinned requirements into an EXISTING virtualenv without recreating
+# it and without assuming pip exists inside it. Fails (does not skip) when
+# no supported installer is available.
+venv_install() { # $1 = venv dir, $2 = venv python, $3 = requirements, $4 = label
+  local venv_dir="$1" venv_py="$2" reqs="$3" label="${4:-$1}"
+  local owner uv uv_note
+  if [ ! -x "$venv_py" ]; then
+    log "venv install [$label]: interpreter $venv_py is missing or not executable"
+    return 1
+  fi
+  owner="$(repo_owner "$venv_dir")" \
+    || { log "venv install [$label]: cannot determine owner of $venv_dir"; return 1; }
+  if uv="$(find_uv "$owner")"; then
+    log "venv install [$label]: uv at $uv (installing as $owner)"
+    run_as "$owner" "$uv" pip install --quiet --python "$venv_py" -r "$reqs" || return 1
+    return 0
+  fi
+  if venv_has_pip "$venv_py"; then
+    log "venv install [$label]: using the venv's own pip (installing as $owner)"
+    run_as "$owner" "$venv_py" -m pip install --quiet --disable-pip-version-check -r "$reqs" || return 1
+    return 0
+  fi
+  if venv_supports_ensurepip "$venv_py"; then
+    log "venv install [$label]: no uv and no pip; bootstrapping pip into this venv only via ensurepip (never system-wide), as $owner"
+    run_as "$owner" "$venv_py" -m ensurepip --upgrade || {
+      log "venv install [$label]: ensurepip could not provide pip"
+      return 1
+    }
+    if ! venv_has_pip "$venv_py"; then
+      log "venv install [$label]: ensurepip ran but pip is still unavailable"
+      return 1
+    fi
+    run_as "$owner" "$venv_py" -m pip install --quiet --disable-pip-version-check -r "$reqs" || return 1
+    return 0
+  fi
+  uv_note="unset"
+  if [ -n "${UV_BIN:-}" ]; then
+    uv_note="$UV_BIN (not executable)"
+  fi
+  log "venv install [$label]: no supported installer for $venv_py"
+  log "  uv: not found (checked UV_BIN=$uv_note, 'command -v uv', /home/$owner/.local/bin/uv, /root/.local/bin/uv, /usr/local/bin/uv, /usr/bin/uv, /snap/bin/uv)"
+  log "  pip: 'python -m pip' is unavailable inside this venv"
+  log "  ensurepip: unsupported by this interpreter (Debian/Ubuntu venvs need the python3-venv package)"
+  log "install uv (https://docs.astral.sh/uv/), seed pip into the venv, or set UV_BIN in $DEPLOY_ENV_FILE; this script never recreates the venv and never installs a system package manager"
+  return 1
+}
+
 sync_deps() {
   if [ "$SYNC_APP_DEPS" = "1" ]; then
     log "syncing app venv dependencies ($VENV_APP)"
-    "$VENV_APP_PY" -m pip install --quiet --disable-pip-version-check \
-      -r "$REPO_APP/backend/requirements.txt" \
+    venv_install "$VENV_APP" "$VENV_APP_PY" "$REPO_APP/backend/requirements.txt" "app" \
       || die "app venv dependency sync failed"
   fi
   if [ "$SYNC_NET_DEPS" = "1" ]; then
     log "syncing netd/egress venv dependencies ($REPO_NET/backend/.venv)"
-    "$VENV_NET_PY" -m pip install --quiet --disable-pip-version-check \
-      -r "$REPO_NET/backend/requirements.txt" \
+    venv_install "$REPO_NET/backend/.venv" "$VENV_NET_PY" "$REPO_NET/backend/requirements.txt" "net" \
       || die "net venv dependency sync failed"
   fi
 }
@@ -568,13 +685,11 @@ rollback() {
     return 1
   fi
   if [ "$SYNC_APP_DEPS" = "1" ]; then
-    "$VENV_APP_PY" -m pip install --quiet --disable-pip-version-check \
-      -r "$REPO_APP/backend/requirements.txt" \
+    venv_install "$VENV_APP" "$VENV_APP_PY" "$REPO_APP/backend/requirements.txt" "app" \
       || log "rollback dependency sync failed (continuing)"
   fi
   if [ "$SYNC_NET_DEPS" = "1" ]; then
-    "$VENV_NET_PY" -m pip install --quiet --disable-pip-version-check \
-      -r "$REPO_NET/backend/requirements.txt" \
+    venv_install "$REPO_NET/backend/.venv" "$VENV_NET_PY" "$REPO_NET/backend/requirements.txt" "net" \
       || log "rollback net dependency sync failed (continuing)"
   fi
   local unit

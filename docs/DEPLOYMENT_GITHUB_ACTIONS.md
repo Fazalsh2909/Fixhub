@@ -175,7 +175,9 @@ existing server layout:
 - `/home/ubuntu/Fixhub` — the **canonical Git checkout**. It is the only
   place on the server that needs `.git`; its `git fetch` already works for
   manual pulls. The api and worker services run from this tree with the
-  venv `/home/ubuntu/.venvs/fixhub312`.
+  venv `/home/ubuntu/.venvs/fixhub312`. Both venvs are uv-managed
+  (`uv venv` does not seed pip), which dependency installation accounts
+  for — see "What deploy.sh will and will not do".
 - `/opt/fixhub` — the **service-code tree** executed by the root-owned
   `fixhub-netd` and `fixhub-egress` services (with its own
   `backend/.venv`). It does **not** need to be a Git checkout and the
@@ -200,6 +202,10 @@ PUBLIC_HEALTH_URL=https://fz-dev.runs-on.dev/health
 PUBLIC_HEALTH_REQUIRED=1       # 0 = skip the public check (e.g. tunnel
                                # doesn't route /health yet)
 # FRONTEND_DIST_DIR=/var/www/fixhub   # uncomment to publish frontend builds
+# UV_BIN=/home/ubuntu/.local/bin/uv   # uncomment to pin the uv binary used
+                               # for dependency installation (auto-detected
+                               # from PATH and known install locations
+                               # otherwise)
 ```
 
 ### B. GitHub setup
@@ -256,6 +262,15 @@ job appears only after `backend` and `frontend` both pass.
   manual-recovery steps). The database is never downgraded automatically; if
   the previous code cannot serve the migrated schema, the log says exactly
   that and names the manual steps.
+- **Deployment fails at `FATAL: app venv dependency sync failed` (or the
+  net equivalent)**: dependency installation found no supported installer.
+  The log names exactly what was checked — uv locations (`UV_BIN`,
+  `command -v uv`, the owner's and system known install locations), the
+  venv's own pip, and ensurepip. Install uv for the venv owner (see
+  <https://docs.astral.sh/uv/>), seed pip into that venv, or set `UV_BIN`
+  in `/etc/fixhub/deploy.env`, then re-run. The historical
+  `No module named pip` failure is handled by the same resolver: the
+  venvs are never recreated and the system Python is never modified.
 - **First automated deployment fails**: with no previous successful
   deployment recorded there is nothing to roll back to, and the log says so
   explicitly (`no previously deployed SHA recorded; automatic rollback not
@@ -281,8 +296,13 @@ sync the canonical checkout `/home/ubuntu/Fixhub` (api/worker) to that exact
 SHA and synchronize the `/opt/fixhub` service tree (netd/egress — no `.git`
 required) from a validated `git archive` of the same commit, copying only
 tracked paths so untracked runtime state (`backend/.venv`, `backend/.env`,
-workspaces) is untouched by construction; pip-sync a venv only when
-`backend/requirements.txt` changed; reinstall tracked systemd drop-ins and
+workspaces) is untouched by construction; dependency-sync a venv only when
+`backend/requirements.txt` changed — preferring uv (`UV_BIN` in
+`/etc/fixhub/deploy.env`, then `command -v uv`, then known install
+locations), falling back to the venv's own pip, then to a strictly
+venv-local `ensurepip` bootstrap, always installing as the venv's owner
+and failing loudly when no installer exists; reinstall tracked systemd
+drop-ins and
 run `install_api_security.py` only when `infra/systemd/**` changed; run
 `alembic upgrade head` once before restarts; drain the worker; restart
 services in dependency order (egress -> netd -> worker -> api); verify the
@@ -295,6 +315,7 @@ workspaces; delete a directory during sync (an upstream directory removal
 fails the deploy instead of destroying possible runtime data); touch
 host-managed systemd units or server-specific drop-ins it does not own;
 restart netd/egress unless their code or configuration actually changed;
+recreate a virtualenv or modify the system Python to install dependencies;
 downgrade the database; interrupt active Firecracker sandboxes to make
 deployment easier; print secrets.
 
