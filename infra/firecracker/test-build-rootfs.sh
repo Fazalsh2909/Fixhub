@@ -13,6 +13,15 @@
 #               read-only mount (agent incl. manifest op, python3/git/rg,
 #               CA bundle, DNS stub) and the sidecar verifies
 #
+# Each builder invocation gets its OWN scratch log (builder-cleanup.log,
+# builder-preserve-fail.log, builder-preserve-success.log,
+# builder-success.log) and every failed scenario part prints that log's
+# tail to stderr (scratch — with the logs — is deleted on harness exit).
+# A forced failure only counts as the injected scenario when the builder
+# printed its "TEST-INJECTED FAILURE at stage=<stage>" marker; rc!=0
+# without the marker is reported as an UNRELATED build failure so the two
+# causes can never be conflated.
+#
 # The live /srv/firecracker/rootfs/base.ext4 is NEVER touched: the builder
 # is invoked against scratch paths only. Failure injection uses the
 # builder's test-only FIXHUB_ROOTFS_FAIL_AFTER hooks. A full run takes
@@ -72,17 +81,47 @@ no_leftover_work_dirs() {
     fi
 }
 
+# Print this part's builder log when the part added any failure — the
+# scratch (and the log with it) is deleted when the harness exits, so a
+# failing run MUST show the evidence while it still exists.
+dump_b_log() { # FAIL_BEFORE LABEL LOG_PATH
+    if (( TOTAL_FAIL > $1 )); then
+        echo "" >&2
+        echo "  ---- builder log, '$2' (last 150 lines of $3):" >&2
+        tail -n 150 -- "$3" >&2 2>/dev/null \
+            || echo "  (builder log not found: $3)" >&2
+    fi
+    return 0
+}
+
+# A forced failure only PASSES as the injected scenario when the builder
+# actually reported its injected stage. rc!=0 WITHOUT the marker is an
+# unrelated build failure (host packaging, debootstrap download, ... —
+# debootstrap exits 1 on download failure, as does every die() path) and
+# is failed separately so the two causes can never be conflated.
+assert_forced_failure() { # RC STAGE
+    local rc="$1" stage="$2"
+    if (( rc == 0 )); then
+        fail "forced-failure build unexpectedly succeeded"
+        return 1
+    fi
+    ok "forced failure exits non-zero (rc=$rc)"
+    if grep -q "TEST-INJECTED FAILURE at stage=$stage" "$B_LOG"; then
+        ok "injected hook confirmed: stage=$stage"
+    else
+        fail "rc=$rc WITHOUT the injected stage=$stage marker: unrelated build failure, not the injected hook"
+    fi
+    return 0
+}
+
 # --------------------------------------------------------------------------
 scenario_cleanup() {
     note "scenario: cleanup (forced failure at mount stage)"
-    local out="$SCRATCH/base-cleanup.ext4" rc=0
+    local out="$SCRATCH/base-cleanup.ext4" rc=0 before=$TOTAL_FAIL
+    B_LOG="$SCRATCH/builder-cleanup.log"
     sudo env FIXHUB_ROOTFS_FAIL_AFTER=mount \
         bash "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
-    if (( rc == 0 )); then
-        fail "forced-failure build unexpectedly succeeded"
-    else
-        ok "forced failure exits non-zero (rc=$rc)"
-    fi
+    assert_forced_failure "$rc" mount
     [[ -e "$out" ]] && fail "output image exists after a failed build: $out" \
         || ok "no output image written"
     [[ -e "$out.sha256" ]] && fail "$out.sha256 written by a failed build" \
@@ -95,26 +134,23 @@ scenario_cleanup() {
     fi
     no_leftover_mounts
     no_leftover_work_dirs
-    if grep -q "TEST-INJECTED FAILURE at stage=mount" "$B_LOG"; then
-        ok "builder reports the injected stage"
-    else
-        fail "builder did not report the injected failure stage"
-    fi
+    dump_b_log "$before" "cleanup (fail at mount)" "$B_LOG"
     return 0
 }
 
 # --------------------------------------------------------------------------
 scenario_preserve() {
     note "scenario: preserve (previous image survives failure, then is replaced)"
-    local out="$SCRATCH/base-preserve.ext4" rc=0
+    local out="$SCRATCH/base-preserve.ext4" rc=0 before=$TOTAL_FAIL
     # a known "previous" image (random bytes — never a real fs)
     sudo dd if=/dev/urandom of="$out" bs=1K count=64 status=none
     local pre_sha
     pre_sha="$(sudo sha256sum "$out" | cut -d' ' -f1)"
 
+    B_LOG="$SCRATCH/builder-preserve-fail.log"
     sudo env FIXHUB_ROOTFS_FAIL_AFTER=copy \
         bash "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
-    if (( rc == 0 )); then fail "forced-failure build unexpectedly succeeded"; else ok "forced failure exits non-zero (rc=$rc)"; fi
+    assert_forced_failure "$rc" copy
     local post_sha
     post_sha="$(sudo sha256sum "$out" | cut -d' ' -f1)"
     if [[ "$post_sha" == "$pre_sha" ]]; then
@@ -126,14 +162,18 @@ scenario_preserve() {
         || ok "no sidecar before success"
     no_leftover_mounts
     no_leftover_work_dirs
+    dump_b_log "$before" "preserve (fail at copy)" "$B_LOG"
 
     # success pass: the very same path must now be atomically replaced
-    rc=0
+    local mid=$TOTAL_FAIL
+    B_LOG="$SCRATCH/builder-preserve-success.log"
     sudo bash "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
     if (( rc == 0 )); then
         ok "successful build replaces the preserved image (rc=0)"
     else
-        fail "successful build failed (rc=$rc)"; tail -30 "$B_LOG" >&2; return 0
+        fail "successful build failed (rc=$rc)"
+        dump_b_log "$mid" "preserve (success run)" "$B_LOG"
+        return 0
     fi
     post_sha="$(sudo sha256sum "$out" | cut -d' ' -f1)"
     [[ "$post_sha" != "$pre_sha" ]] && ok "image content replaced" \
@@ -143,16 +183,20 @@ scenario_preserve() {
     else
         fail "sidecar does not match the promoted image"
     fi
+    dump_b_log "$mid" "preserve (success run)" "$B_LOG"
     return 0
 }
 
 # --------------------------------------------------------------------------
 scenario_success() {
     note "scenario: success (real build, full validation battery)"
-    local out="$SCRATCH/base-success.ext4" rc=0
+    local out="$SCRATCH/base-success.ext4" rc=0 before=$TOTAL_FAIL
+    B_LOG="$SCRATCH/builder-success.log"
     sudo bash "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
     if (( rc != 0 )); then
-        fail "real build failed (rc=$rc)"; tail -40 "$B_LOG" >&2; return 0
+        fail "real build failed (rc=$rc)"
+        dump_b_log "$before" "success (real build)" "$B_LOG"
+        return 0
     fi
     ok "builder exit 0"
     [[ -s "$out" ]] && ok "image present ($(du -m "$out" | cut -f1) MB)" \
@@ -201,6 +245,7 @@ scenario_success() {
     fi
     no_leftover_mounts
     no_leftover_work_dirs
+    dump_b_log "$before" "success (real build)" "$B_LOG"
     return 0
 }
 

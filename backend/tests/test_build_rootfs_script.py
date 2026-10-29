@@ -180,6 +180,49 @@ def test_kvm_harness_proves_failures_nonzero_and_image_preserved() -> None:
     assert 'sha256sum "$out"' in text, "preservation must be checked by checksum"
 
 
+def test_kvm_harness_distinguishes_injected_failures_and_prints_log() -> None:
+    """Regression: 'rc=1 but no TEST-INJECTED FAILURE at stage=mount'.
+
+    A forced failure is only meaningful when the builder REACHED its
+    injected hook. Everything before the hook (host apt-get, debootstrap —
+    which exits 1 on download failure — and die paths) can fail with rc=1
+    too; the harness previously treated "rc!=0" as done and never printed
+    the log, so an unrelated host failure masqueraded as a hook abort.
+    The harness must reject marker-less rc!=0 runs as UNRELATED failures
+    (never weaken the marker requirement) and must print the exact
+    builder log of the failing run for diagnosis.
+    """
+    harness = ROOT / "infra" / "firecracker" / "test-build-rootfs.sh"
+    assert harness.is_file(), f"missing KVM harness: {harness}"
+    text = harness.read_text(encoding="utf-8")
+    # helper enforcing BOTH conditions, used by both forced scenarios
+    helper = text.find("assert_forced_failure() {")
+    assert helper >= 0, "assert_forced_failure helper must exist"
+    assert "TEST-INJECTED FAILURE at stage=$stage" in text, (
+        "the injected-stage marker must still be REQUIRED"
+    )
+    assert text.count('assert_forced_failure "$rc" mount') == 1
+    assert text.count('assert_forced_failure "$rc" copy') == 1, (
+        "preserve must also assert its expected stage=copy marker"
+    )
+    # unrelated failures are failed under their own name, not conflated
+    assert "unrelated build failure" in text
+    # the failing run's builder log is printed for diagnosis
+    assert text.count("dump_b_log() {") == 1
+    # per-invocation logs so a dump points at the exact run (the old
+    # single shared B_LOG was truncated by the next invocation)
+    for log in (
+        "builder-cleanup.log",
+        "builder-preserve-fail.log",
+        "builder-preserve-success.log",
+        "builder-success.log",
+    ):
+        assert log in text
+    # left-behind-state checks stay mandatory in every scenario
+    assert text.count("no_leftover_mounts") >= 3
+    assert text.count("no_leftover_work_dirs") >= 3
+
+
 def test_unmount_before_image_copy_and_leak_guard() -> None:
     code = _code()
     unmount = _pos(code, "unmount_all || die")
