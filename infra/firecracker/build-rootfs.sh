@@ -112,7 +112,17 @@ unmount_all() {
 }
 
 cleanup() {
-    local rc=${_RC:-$?}
+    # Capture the natural exit status FIRST: nothing may run before this,
+    # or $? is already clobbered. The old handler consulted _RC (always
+    # initialized to 0) BEFORE the natural status, which downgraded every
+    # failure to a silent exit 0.
+    local rc=$?
+    # The INT/TERM traps have recorded the signal status (130/143) in
+    # _RC; a nonzero _RC is the more specific truth and overrides the
+    # natural one. A zero _RC must never override a nonzero status.
+    if (( ${_RC:-0} != 0 )); then
+        rc="$_RC"
+    fi
     trap - EXIT INT TERM
     set +e
     unmount_all || echo "[rootfs] WARN: could not unmount every mount cleanly" >&2

@@ -130,6 +130,56 @@ def test_trap_cleanup_unwinds_reverse_and_removes_temp_state() -> None:
     assert 'sudo rm -rf -- "$WORK" "$IMG"' in code
 
 
+def test_cleanup_exit_status_not_masked() -> None:
+    """Regression: cleanup() must not mask a failing run's exit status.
+
+    The broken handler was `local rc=${_RC:-$?}` with _RC initialized to
+    0: since the variable is set and non-empty, it always won the
+    expansion, so every failure (die, set -e, the FIXHUB_ROOTFS_FAIL_AFTER
+    injected-failure hooks) exited 0 and looked like success.
+    Contract: capture $? first; only a nonzero _RC (the INT/TERM traps
+    record 130/143) may override it, and cleanup must finally exit "$rc".
+    """
+    code = _code()
+    assert "${_RC:-$?}" not in code, "the status-masking pattern is back"
+    head = _pos(code, "cleanup() {")
+    capture = _pos(code, "local rc=$?")
+    disarm = code.find("trap - EXIT INT TERM")
+    assert disarm >= 0, "cleanup() must disarm the signal handlers before unwinding"
+    override = code.find('rc="$_RC"')
+    assert override >= 0, "nonzero _RC (INT/TERM 130/143) must override the natural status"
+    int_trap = _pos(code, "trap '_RC=130; cleanup' INT")
+    term_trap = _pos(code, "trap '_RC=143; cleanup' TERM")
+    final = _pos(code, 'exit "$rc"')
+    assert head < capture, "$? must be captured first inside cleanup()"
+    assert capture < disarm, "$? must be captured before any cleanup command runs"
+    assert capture < override < disarm, (
+        "the nonzero-_RC override must come after the capture, before unwinding"
+    )
+    assert capture < int_trap < term_trap, "INT/TERM handlers must still record their codes"
+    assert disarm < final, 'cleanup() must end with exit "$rc"'
+
+
+def test_kvm_harness_proves_failures_nonzero_and_image_preserved() -> None:
+    """Injected-failure semantics are pinned where they can only be
+    PROVEN: the KVM harness (CI cannot build images). Locked so the
+    coverage cannot be gutted silently:
+    - a forced-failure build MUST be required to exit nonzero
+    - the preserve scenario must checksum-compare the previous image
+      before/after the failure and reject any modification.
+    """
+    harness = ROOT / "infra" / "firecracker" / "test-build-rootfs.sh"
+    assert harness.is_file(), f"missing KVM harness: {harness}"
+    text = harness.read_text(encoding="utf-8")
+    assert 'fail "forced-failure build unexpectedly succeeded"' in text, (
+        "injected failures must be REQUIRED to exit nonzero"
+    )
+    assert "forced failure exits non-zero" in text
+    assert "previous image preserved byte-identical after failure" in text
+    assert "previous image was MODIFIED by a failed build" in text
+    assert 'sha256sum "$out"' in text, "preservation must be checked by checksum"
+
+
 def test_unmount_before_image_copy_and_leak_guard() -> None:
     code = _code()
     unmount = _pos(code, "unmount_all || die")
