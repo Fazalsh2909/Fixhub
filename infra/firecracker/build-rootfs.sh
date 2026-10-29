@@ -56,6 +56,19 @@ _fail_after() {
     fi
 }
 
+# --- TEMP-DIAG breadcrumbs (Phase C removal candidate) ---------------------
+# The forced stage=copy run died with rc=1 writing NOTHING after the
+# chroot apt triggers — not even the cleanup trap's "[rootfs] FAILED"
+# banner — so the last executed command was unlinkable from any output.
+# Each breadcrumb names the command that runs NEXT: the last breadcrumb
+# in a truncated log marks the dying command even when the process died
+# with zero output. _DIAG_N increments per step and is echoed by the
+# cleanup() exit record.
+_diag() {
+    _DIAG_N=$((_DIAG_N + 1))
+    note "diag: step=${_DIAG_N} next: $*"
+}
+
 # --- Paths: always absolute, never caller-cwd relative --------------------
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd -P)"
@@ -84,6 +97,11 @@ ROOT="$WORK/root"
 MNT="$WORK/mnt"
 mkdir -p "$ROOT" "$MNT"
 note "work=$WORK out=$OUT size=${SIZE_MB}M img=$IMG"
+# Traceability (keeper): every log answers whether the test-only fail
+# hook actually reached this build — sudo's env_reset strips caller
+# exports, so an unset value here is direct evidence the var never
+# arrived (the harness must then pass it as an explicit `env` argument).
+note "fail-hook: FIXHUB_ROOTFS_FAIL_AFTER='${FIXHUB_ROOTFS_FAIL_AFTER:-}'"
 
 # --- Single-writer lock (best effort: a permission failure only warns) ----
 LOCK="$OUT_DIR/.base.lock"
@@ -94,6 +112,7 @@ fi
 
 # --- Cleanup contract: unwind mounts in REVERSE order, remove temp state --
 _RC=0
+_DIAG_N=0   # TEMP-DIAG breadcrumb counter, echoed by the cleanup exit record
 MOUNTS=()
 
 unmount_all() {
@@ -125,6 +144,12 @@ cleanup() {
     fi
     trap - EXIT INT TERM
     set +e
+    # Exit record (keeper): the trap's OWN resolved status — plus, while
+    # the TEMP-DIAG breadcrumbs live, the last breadcrumb step — so a
+    # trap that dies mid-unwind still tells the log what cleanup believed
+    # the status to be (host-observed: the "[rootfs] FAILED" banner was
+    # absent while the chroot mounts were cleanly unmounted).
+    note "diag: exit-recorder rc=$rc _RC=${_RC:-0} step=${_DIAG_N:-0}"
     unmount_all || echo "[rootfs] WARN: could not unmount every mount cleanly" >&2
     local i
     for (( i=${#MOUNTS[@]}-1; i>=0; i-- )); do
@@ -174,6 +199,7 @@ sudo mount --bind /dev     "$ROOT/dev";     MOUNTS+=("$ROOT/dev")
 sudo mount --bind /dev/pts "$ROOT/dev/pts"; MOUNTS+=("$ROOT/dev/pts")
 sudo mount -t proc  proc   "$ROOT/proc";    MOUNTS+=("$ROOT/proc")
 sudo mount -t sysfs sysfs  "$ROOT/sys";     MOUNTS+=("$ROOT/sys")
+_diag "before-hook=mount"
 _fail_after mount
 
 # --- Build-time DNS: the chroot apt uses the HOST resolver (devpkg networking
@@ -191,6 +217,7 @@ fi
 if ! sudo chroot "$ROOT" sh -c 'echo probe > /dev/null' 2>/dev/null; then
     die "/dev/null inside the chroot is not a writable character device for this identity"
 fi
+_diag "before-hook=verify"
 _fail_after verify
 
 # --- Packages (same set as before, now able to actually configure) --------
@@ -198,17 +225,28 @@ sudo chroot "$ROOT" env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SE
     apt-get update
 sudo chroot "$ROOT" env DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true \
     apt-get install -y --no-install-recommends python3 git ripgrep ca-certificates
+_diag "before-hook=apt"
 _fail_after apt
 
 # --- Guest agent + workspace dir (explicit final mode, no temp-file fudge) -
+# TEMP-DIAG breadcrumbs bracket each SILENT command in this pre-hook
+# stretch: the last breadcrumb printed names the victim when the process
+# dies without any error output.
+_diag "install -d opt/fixhub + workspace"
 sudo install -d -m 755 -- "$ROOT/opt/fixhub" "$ROOT/workspace"
+_diag "install agent.py"
 sudo install -m 644 -- "$AGENT_SRC" "$ROOT/opt/fixhub/agent.py"
 
 # Guest runtime DNS (unchanged contract: kernel cmdline configures eth0;
 # 10.200.0.1 is the host-resolver stub on the Firecracker tap subnet).
+_diag "tee guest resolv.conf stub"
 printf 'nameserver 10.200.0.1\n' | sudo tee "$ROOT/etc/resolv.conf" >/dev/null
+_diag "chmod guest resolv.conf"
 sudo chmod 644 "$ROOT/etc/resolv.conf"
+_diag "stage=copy hook"
 _fail_after copy
+# TEMP-DIAG: reaching this breadcrumb proves the copy stopover fully passed.
+_diag "next: unmount chroot before the image copy"
 
 # --- Unmount EVERYTHING before the image copy ------------------------------
 unmount_all || die "could not unmount the chroot filesystems cleanly"

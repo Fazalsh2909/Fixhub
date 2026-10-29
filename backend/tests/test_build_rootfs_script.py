@@ -247,13 +247,128 @@ def test_preserve_success_run_does_not_inherit_injected_rc_and_is_traced() -> No
     # preserve-success invocation (never re-dropped)
     reset = text.find('    rc=0\n    B_LOG="$SCRATCH/builder-preserve-success.log"')
     assert -1 not in (forced, mid, reset), "preserve stale-rc structure broken"
-    assert mid < reset < text.find("sudo bash -x", reset), (
+    assert mid < reset < text.find('bash -x "$BUILDER"', reset), (
         "rc=0 must be reset AFTER the injected run and BEFORE the success run"
     )
     # all four builder invocations are command-traced
     assert text.count('bash -x "$BUILDER"') == 4
-    assert text.count("export PS4=") == 1
+    # the trace format must be passed EXPLICITLY through sudo env args
+    # (env_reset strips exported PS4 — see the dedicated Phase A pin)
+    assert text.count('PS4="$XPS4"') == 4
     assert "${BASH_SOURCE##*/}:${LINENO}: " in text, "PS4 must carry file:line"
+
+
+# The TEMP-DIAG breadcrumbs in build-rootfs.sh (the _diag calls bracketing
+# the post-apt stretch and each _fail_after) are DELIBERATELY NOT pinned:
+# they are Phase A diagnostics and must be removable in Phase C without
+# breaking any pin. The pins below cover only the permanent keepers.
+
+
+def test_builder_announces_fail_after_env_reach_on_startup() -> None:
+    """Phase A keeper: every builder log DIRECTLY answers whether the
+    test-only fail-hook env var reached the build.
+
+    sudo's env_reset strips caller exports, so "did
+    FIXHUB_ROOTFS_FAIL_AFTER arrive?" was previously unanswerable from
+    the log. The startup note prints the value (empty = never arrived)
+    and must appear BEFORE any state-changing command, so even a very
+    early death carries the answer.
+    """
+    code = _code()
+    announce = _pos(code, 'note "fail-hook: FIXHUB_ROOTFS_FAIL_AFTER=')
+    first_state_change = _pos(code, "sudo apt-get update")
+    assert announce < first_state_change, (
+        "the env-reach note must print before the build work begins"
+    )
+    assert "FIXHUB_ROOTFS_FAIL_AFTER:-}" in code, "the note must tolerate an unset var"
+
+
+def test_builder_cleanup_logs_resolved_exit_status() -> None:
+    """Phase A keeper: cleanup() writes an exit-record line with its
+    RESOLVED status (natural rc after the nonzero-_RC override) — plus,
+    while the TEMP-DIAG breadcrumbs live, the last breadcrumb step.
+
+    Host evidence: a forced stage=copy run exited rc=1 WITHOUT the trap's
+    "[rootfs] FAILED (exit 1)" banner, while "no leftover mounts" passed
+    — i.e. the cleanup trap demonstrably ran yet produced no visible
+    output. The exit record, printed FIRST in the unwind (after disarm),
+    is the earliest presence marker of the trap in such a truncated run
+    and distinguishes sudo-death from builder-death.
+    Contract: the record sits INSIDE the existing cleanup() after the
+    $? capture / _RC override / trap-disarm sequence it must not replace.
+    """
+    code = _code()
+    head = _pos(code, "cleanup() {")
+    disarm = code.find("trap - EXIT INT TERM")
+    final = _pos(code, 'exit "$rc"')
+    assert "trap cleanup EXIT" in code, "the EXIT trap contract must be untouched"
+    record = _pos(code, 'note "diag: exit-recorder rc=$rc _RC=${_RC:-0} step=${_DIAG_N:-0}"')
+    assert disarm < record < final, (
+        "exit record must come after trap disarm (nothing may run before the "
+        "$? capture) and before cleanup ends"
+    )
+    assert head < disarm, "cleanup() structurally intact"
+
+
+def test_harness_passes_tracing_ps4_through_sudo_env() -> None:
+    """Phase A keeper: the line-numbered PS4 must survive sudo env_reset.
+
+    sudo strips exported environment variables (env_reset); an `export
+    PS4` in the harness never reached the builder bash, so the archived
+    logs carried NO `+` trace lines despite f7a63cf's export. PS4 must be
+    passed as an explicit `env PS4=...` argument on EVERY invocation —
+    explicit env arguments survive.
+    """
+    harness = ROOT / "infra" / "firecracker" / "test-build-rootfs.sh"
+    assert harness.is_file(), f"missing KVM harness: {harness}"
+    text = harness.read_text(encoding="utf-8")
+    assert "XPS4='+ ${BASH_SOURCE##*/}:${LINENO}: '" in text, (
+        "the trace format must carry file:line"
+    )
+    assert text.count('PS4="$XPS4"') == 4, "every invocation passes PS4 explicitly"
+    assert text.count("sudo bash -x") == 0, "no invocation may skip the env args"
+    assert text.count('bash -x "$BUILDER"') == 4
+
+
+def test_harness_persists_full_builder_logs_restricted() -> None:
+    """Phase A keeper: full builder logs survive the harness exit.
+
+    Scratch — with its logs — is deleted on harness exit, and dump_b_log
+    prints only a 150-line tail: past host evidence has been cut off
+    above the interesting part. Every COMPLETED log must be archived
+    WHOLE under /var/tmp/fixhub-rootfs-logs BEFORE the scratch dies, with
+    restricted permissions (dir 0700, files 600: root-owned host
+    diagnostics, command traces, never world-readable), and the archive
+    path must be printed by dump_b_log so a host paste can include it.
+    """
+    harness = ROOT / "infra" / "firecracker" / "test-build-rootfs.sh"
+    assert harness.is_file(), f"missing KVM harness: {harness}"
+    text = harness.read_text(encoding="utf-8")
+    assert 'PERSIST_DIR="/var/tmp/fixhub-rootfs-logs"' in text
+    assert text.count("install -d -m 700") == 1
+    assert text.count("install -m 600") == 1
+    # one archive per invocation: 4 builder runs across the scenarios
+    assert text.count('persist_b_log "') == 4
+    # the dump names the persisted full copy
+    assert "persisted full copy" in text
+
+
+def test_harness_records_outer_sudo_status_in_every_archived_log() -> None:
+    """Phase A keeper: the OUTER sudo's exit status is recorded in the
+    archived log.
+
+    sudo normally forwards the child builder's status, but returns 1 on
+    sudo's OWN errors (auth, I/O, signal handling). The appended
+    "outer sudo exit status: N" line — written after each invocation,
+    BEFORE the archive — makes a confusing rc=1 with a healthy-looking
+    builder tail decidable from the archived log alone.
+    """
+    harness = ROOT / "infra" / "firecracker" / "test-build-rootfs.sh"
+    assert harness.is_file(), f"missing KVM harness: {harness}"
+    text = harness.read_text(encoding="utf-8")
+    assert "record_sudo_rc() {" in text
+    assert "outer sudo exit status" in text
+    assert text.count('record_sudo_rc "$rc"') == 4
 
 
 def test_unmount_before_image_copy_and_leak_guard() -> None:

@@ -17,6 +17,10 @@
 # builder-preserve-fail.log, builder-preserve-success.log,
 # builder-success.log) and every failed scenario part prints that log's
 # tail to stderr (scratch — with the logs — is deleted on harness exit).
+# Every COMPLETED log is also archived WHOLE under /var/tmp/fixhub-rootfs-logs
+# (dir 0700, files 600) BEFORE the scratch dies — the dump shows only 150
+# lines, and the line-numbered command trace makes the full archive the
+# diagnostic evidence. dump_b_log prints the archive path when available.
 # A forced failure only counts as the injected scenario when the builder
 # printed its "TEST-INJECTED FAILURE at stage=<stage>" marker; rc!=0
 # without the marker is reported as an UNRELATED build failure so the two
@@ -58,11 +62,41 @@ trap 'sudo rm -rf -- "$SCRATCH"' EXIT INT TERM
 
 # Builder logs land here; every scenario asserts on its content below.
 B_LOG="$SCRATCH/builder.log"
+# Archive location for the FULL completed builder logs (kept after the
+# scratch is deleted — the dump is only a 150-line tail) + the persisted
+# path of the most recently archived log, printed by dump_b_log.
+PERSIST_DIR="/var/tmp/fixhub-rootfs-logs"
+B_LOG_PERSIST=""
 
-# Command-level tracing for every builder invocation (bash -x below): a
-# marker-less rc!=0 death — which produced no output at all until now —
-# names its exact failing command + builder line in the dumped log tail.
-export PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+# Line-numbered command-trace format for the builder's `bash -x` runs.
+# Passed as an explicit `env PS4=...` argument on EVERY invocation: sudo's
+# env_reset strips exported environment variables, so an `export PS4` in
+# this harness NEVER reached the builder bash (observed: archived logs
+# carried no `+` trace lines despite the export). Arguments to `env`
+# survive.
+XPS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+
+persist_b_log() { # LABEL — archive $B_LOG whole, restricted permissions
+    local label="$1" stamp dest
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    sudo install -d -m 700 -- "$PERSIST_DIR" 2>/dev/null || true
+    sudo chmod 700 -- "$PERSIST_DIR" 2>/dev/null || true
+    dest="$PERSIST_DIR/${stamp}-$$-${label}.log"
+    if sudo install -m 600 -- "$B_LOG" "$dest" 2>/dev/null; then
+        B_LOG_PERSIST="$dest"
+    else
+        B_LOG_PERSIST=""
+        note "persist: could not archive $B_LOG (label: $label)"
+    fi
+}
+
+# Record the OUTER sudo exit status in the log itself: sudo normally
+# forwards the child builder's status, but returns 1 on sudo's OWN errors
+# (auth, I/O, signal handling). A confusing rc=1 with a healthy builder
+# tail is decidable from the archived log alone.
+record_sudo_rc() { # RC
+    printf '[rootfs-test] outer sudo exit status: %s\n' "$1" >> "$B_LOG"
+}
 
 fail() { TOTAL_FAIL=$((TOTAL_FAIL + 1)); echo "  FAIL: $*" >&2; }
 
@@ -93,6 +127,9 @@ dump_b_log() { # FAIL_BEFORE LABEL LOG_PATH
     if (( TOTAL_FAIL > $1 )); then
         echo "" >&2
         echo "  ---- builder log, '$2' (last 150 lines of $3):" >&2
+        if [[ -n "$B_LOG_PERSIST" ]]; then
+            echo "  ---- persisted full copy: $B_LOG_PERSIST (complete run incl. sudo status + trace)" >&2
+        fi
         tail -n 150 -- "$3" >&2 2>/dev/null \
             || echo "  (builder log not found: $3)" >&2
     fi
@@ -124,8 +161,10 @@ scenario_cleanup() {
     note "scenario: cleanup (forced failure at mount stage)"
     local out="$SCRATCH/base-cleanup.ext4" rc=0 before=$TOTAL_FAIL
     B_LOG="$SCRATCH/builder-cleanup.log"
-    sudo env FIXHUB_ROOTFS_FAIL_AFTER=mount \
+    sudo env FIXHUB_ROOTFS_FAIL_AFTER=mount PS4="$XPS4" \
         bash -x "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
+    record_sudo_rc "$rc"
+    persist_b_log "cleanup-mount"
     assert_forced_failure "$rc" mount
     [[ -e "$out" ]] && fail "output image exists after a failed build: $out" \
         || ok "no output image written"
@@ -153,8 +192,10 @@ scenario_preserve() {
     pre_sha="$(sudo sha256sum "$out" | cut -d' ' -f1)"
 
     B_LOG="$SCRATCH/builder-preserve-fail.log"
-    sudo env FIXHUB_ROOTFS_FAIL_AFTER=copy \
+    sudo env FIXHUB_ROOTFS_FAIL_AFTER=copy PS4="$XPS4" \
         bash -x "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
+    record_sudo_rc "$rc"
+    persist_b_log "preserve-fail-copy"
     assert_forced_failure "$rc" copy
     local post_sha
     post_sha="$(sudo sha256sum "$out" | cut -d' ' -f1)"
@@ -177,7 +218,9 @@ scenario_preserve() {
     local mid=$TOTAL_FAIL
     rc=0
     B_LOG="$SCRATCH/builder-preserve-success.log"
-    sudo bash -x "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
+    sudo env PS4="$XPS4" bash -x "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
+    record_sudo_rc "$rc"
+    persist_b_log "preserve-success"
     if (( rc == 0 )); then
         ok "successful build replaces the preserved image (rc=0)"
     else
@@ -202,7 +245,9 @@ scenario_success() {
     note "scenario: success (real build, full validation battery)"
     local out="$SCRATCH/base-success.ext4" rc=0 before=$TOTAL_FAIL
     B_LOG="$SCRATCH/builder-success.log"
-    sudo bash -x "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
+    sudo env PS4="$XPS4" bash -x "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
+    record_sudo_rc "$rc"
+    persist_b_log "success-real"
     if (( rc != 0 )); then
         fail "real build failed (rc=$rc)"
         dump_b_log "$before" "success (real build)" "$B_LOG"
