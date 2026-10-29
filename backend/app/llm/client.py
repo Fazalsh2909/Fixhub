@@ -182,16 +182,21 @@ def chat_completion(
     messages: list[dict],
     tools: list[dict] | None = None,
     *,
-    max_tokens: int = 2048,
+    max_tokens: int | None = None,
     temperature: float = 0.2,
 ) -> AssistantMessage:
     """One non-streaming chat call. Raises LLMBlockedError or LLMError."""
     base_url, _, model = _active()
     url = base_url.rstrip("/") + "/chat/completions"
+    requested = (
+        max_tokens
+        if max_tokens is not None
+        else int(getattr(settings, "LLM_MAX_TOKENS", 4096) or 4096)
+    )
     payload: dict = {
         "model": model,
         "messages": messages,
-        "max_tokens": max_tokens,
+        "max_tokens": max(1, requested),
         "temperature": temperature,
     }
     if tools:

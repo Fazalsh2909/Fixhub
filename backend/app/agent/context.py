@@ -230,6 +230,20 @@ def build_task_message(ctx: TaskContext) -> str:
             if ci.workflow_content else ""
         )
         base = f"{head}\n{wf}\n{block}\n"
+        # Harness-level repair sequencing: production runs skipped from
+        # evidence to broad exploration and burned their request budget
+        # without a single edit. Say the expected order once, deterministically.
+        base += (
+            "\nRepair protocol:\n"
+            "- Read the failing file FIRST with read_file on the path named "
+            "by the failure (offset/limit paging is allowed): act on what you "
+            "read instead of surveying more paths.\n"
+            "- Then apply the smallest edit_file that fixes the failure "
+            "signal. Re-reading a path after a successful edit is allowed — "
+            "the workspace changed.\n"
+            "- Verify once with git_diff, then finish with the root cause, "
+            "the fix, and its evidence.\n"
+        )
         if ctx.skill_instructions:
             base += f"\nActive skill ({ctx.skill or 'fix-ci-cd'}):\n{_bounded(ctx.skill_instructions, 1800)}\n"
         return base

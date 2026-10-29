@@ -59,14 +59,28 @@ class Settings(BaseSettings):
     # Conversation compaction. Provider input usage is cumulative across calls,
     # so large tool outputs and write payloads must not be replayed indefinitely.
     LLM_HISTORY_GROUPS: int = 4
-    LLM_CONTEXT_MAX_CHARS: int = 16000
+    LLM_CONTEXT_MAX_CHARS: int = 32768
     LLM_TOOL_RESULT_MAX_CHARS: int = 3000
+    # Larger cap for one targeted read (read_file/git_diff). The generic
+    # 3000-char clip cut off the exact lines named by a failure signal, so
+    # the model edited blind from stale context (production CI run, Oct 2026).
+    LLM_READ_RESULT_MAX_CHARS: int = 10000
+    # Completion cap per chat call. Was hard-coded 2048, which truncated long
+    # edit_file payloads (old/new fields over ~1.8k chars arrived as cut-off
+    # JSON and parsed into a "_raw" passthrough instead of a real edit).
+    LLM_MAX_TOKENS: int = 4096
     # CI fixes should converge quickly; this is the iteration backstop.
     LLM_CI_MAX_ITERATIONS: int = 100
     # Task-wide request cap for one CI task. 30 (was 1000): a stateless
     # provider re-charges the whole context on every call, and the old
     # 16-request default was exhausted by investigation alone.
     LLM_CI_MAX_REQUESTS_PER_TASK: int = 30
+    # Convergence pacing for CI tasks: after this many consecutive LLM
+    # requests without a successful workspace mutation, inject one user note
+    # (AFTER = act now, FINAL = last push before the useful budget is spent).
+    # At most two notes per run; a successful edit resets the counter.
+    LLM_CI_DIRECTIVE_AFTER: int = 6
+    LLM_CI_DIRECTIVE_FINAL: int = 12
     LLM_MAX_RUNTIME_S: int = 3600
     LLM_MAX_OUTPUT_BYTES: int = 200_000
 

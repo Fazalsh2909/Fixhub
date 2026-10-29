@@ -111,8 +111,9 @@ def test_ci_task_context_bounds_logs_and_keeps_workflow_visible():
     # Bound = head + workflow 6000 + failure logs 3500 + three 250-char fields
     # + skill 1800, plus labels/markers. The workflow was raised from 1000 to
     # 6000 so the model can trust the YAML it is shown instead of re-reading
-    # it; a truncated workflow caused exactly that re-read loop.
-    assert len(message) <= 12500
+    # it; a truncated workflow caused exactly that re-read loop. The repair
+    # protocol block (A5) adds ~450 more characters.
+    assert len(message) <= 13000
     assert "Workflow content:" in message
     assert "UNIQUE_FAILURE_TAIL" in message
     assert "src/failing_module.py" in message

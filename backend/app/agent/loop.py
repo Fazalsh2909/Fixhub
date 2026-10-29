@@ -192,6 +192,17 @@ def run_agent(
         )
 
     governor = _Governor()
+    is_ci = (ctx.trigger_type or trigger_type) == "ci"
+    # Convergence pacing (CI): counts LLM requests since the last successful
+    # workspace mutation. The observed production failure is a run that
+    # spends its whole request budget investigating and finishes with no fix.
+    _after_raw = max(0, int(getattr(settings, "LLM_CI_DIRECTIVE_AFTER", 6) or 0))
+    _final_raw = max(0, int(getattr(settings, "LLM_CI_DIRECTIVE_FINAL", 12) or 0))
+    converge_after = _after_raw
+    converge_final = max(_final_raw, converge_after + 1)
+    requests_since_edit = 0
+    directives_used = 0
+    finish_guarded = False
     for i in range(iteration_limit):
         iterations = i + 1
         if _cancelled():
@@ -255,9 +266,46 @@ def run_agent(
             )
         outbound = _window(messages, events, diagnosis)
         assistant = _llm.chat_completion(outbound, tools=_tools.TOOL_SCHEMAS)
+        # Convergence accounting: every request counts, and a successful
+        # mutation (below) resets the counter. A pending directive is only
+        # delivered at the end of a tool-cycle iteration; a content-only
+        # reply already ends the loop (guarded below).
+        requests_since_edit += 1
+        directive = None
+        if is_ci and directives_used < 2:
+            threshold = converge_final if directives_used else converge_after
+            if threshold > 0 and requests_since_edit >= threshold:
+                directive = CONVERGE_DIRECTIVES[directives_used]
         if not assistant.tool_calls:
             summary = (assistant.content or "").strip()[: settings.LLM_MAX_OUTPUT_BYTES]
             messages.append({"role": "assistant", "content": assistant.content or ""})
+            if is_ci and not state.changed_files:
+                if not finish_guarded:
+                    # First content-only end on a CI task with zero edits:
+                    # refuse the false COMPLETED once and demand the edit.
+                    finish_guarded = True
+                    _emit(
+                        {
+                            "tool": "finish_guard",
+                            "args": {},
+                            "ok": True,
+                            "guarded": True,
+                            "step": tool_calls,
+                        }
+                    )
+                    messages.append({"role": "user", "content": FINISH_GUARD_TEXT})
+                    continue
+                # Guard was already given and the model still produced no
+                # workspace change: end honestly as NOT finished (never a
+                # fake success); partial work is preserved by the service.
+                return LoopResult(
+                    False,
+                    "no fix applied: the agent investigated but made no "
+                    "workspace changes",
+                    iterations,
+                    tool_calls,
+                    events,
+                )
             return LoopResult(True, summary or "done", iterations, tool_calls, events)
         # execute tools
         messages.append(
@@ -323,6 +371,9 @@ def run_agent(
                     p = str(args.get("path", ""))
                     if p and p not in state.changed_files:
                         state.changed_files.append(p)
+                    # Real progress was produced by this request: the
+                    # convergence counter starts over.
+                    requests_since_edit = 0
                 if tc.name == "run_command":
                     state.commands_run += 1
             else:
@@ -384,6 +435,11 @@ def run_agent(
                     events,
                     lease_lost=True,
                 )
+        # Convergence: deliver the pending directive after this request's
+        # results are in the window, so the next request starts informed.
+        if directive:
+            directives_used += 1
+            messages.append({"role": "user", "content": directive})
     return LoopResult(
         False, "agent stopped: max iterations exceeded", iterations, tool_calls, events
     )
@@ -415,21 +471,35 @@ def _message_size(message: dict) -> int:
 def _compact_tool_result(name: str, result: str) -> str:
     """Keep tool output useful, but prevent one log/diff from dominating context."""
     base = max(1000, int(getattr(settings, "LLM_TOOL_RESULT_MAX_CHARS", 3000) or 3000))
+    # A targeted read of the file the failure points to must survive the
+    # generic clip: a 3000-char read_file cut off the exact lines the model
+    # had to edit, forcing blind edits or re-read loops (production CI run).
+    read_cap = max(
+        base, int(getattr(settings, "LLM_READ_RESULT_MAX_CHARS", 10000) or 10000)
+    )
     limits = {
         "list_directory": min(base, 1800),
-        "read_file": min(base, 3500),
+        "read_file": read_cap,
         "search_code": min(base, 3000),
         "write_file": min(base, 500),
         "edit_file": min(base, 500),
         "run_command": min(base, 4000),
         "git_status": min(base, 1800),
-        "git_diff": min(base, 3500),
+        "git_diff": read_cap,
     }
     return _clip_middle(result, limits.get(name, base))
 
 
-def _compact_history_message(message: dict) -> dict:
-    """Copy a historical message, omitting bulky payloads already applied to disk."""
+def _compact_history_message(
+    message: dict, call_names: dict[str, str] | None = None
+) -> dict:
+    """Copy a historical message, omitting bulky payloads already applied to disk.
+
+    `call_names` maps tool_call_id -> tool name so historical role "tool"
+    results are compacted with the cap of the tool that produced them (a
+    historical read_file keeps its larger read allowance instead of the
+    generic baseline).
+    """
     import copy as _copy
 
     out = _copy.deepcopy(message)
@@ -461,7 +531,8 @@ def _compact_history_message(message: dict) -> dict:
             args["pattern"] = _clip_middle(args["pattern"], 240)
         fn["arguments"] = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
     if out.get("role") == "tool" and isinstance(out.get("content"), str):
-        out["content"] = _compact_tool_result("tool", out["content"])
+        name = (call_names or {}).get(str(out.get("tool_call_id") or ""))
+        out["content"] = _compact_tool_result(name, out["content"])
     return out
 
 
@@ -494,6 +565,30 @@ REPEAT_NUDGE_WINDOW = 12
 REPEAT_NUDGE_LIMIT = 8
 REPEAT_STOP_WINDOW = 20
 REPEAT_STOP_LIMIT = 13
+
+# Convergence pacing (CI tasks): two deterministic user notes, injected when
+# the model keeps requesting without producing a single successful workspace
+# mutation. Both say the same operationally: stop investigating, edit now.
+CONVERGE_DIRECTIVES = (
+    "Runtime note: you have not produced any workspace change for the last "
+    "several requests, and you already have enough evidence to act. Make the "
+    "concrete edit now with edit_file or write_file — further reads and "
+    "commands are waste. Verify with git_diff, then finish.",
+    "Runtime note: final phase — with no edit, this task ends with no fix. "
+    "Change the file the failure evidence named NOW with the smallest "
+    "edit_file that addresses the error, verify once with git_diff, and "
+    "finish.",
+)
+
+# Refusal note for the first content-only end of a CI task with zero
+# successful edits: investigating without fixing is never task completion.
+FINISH_GUARD_TEXT = (
+    "Finish guard: a CI repair ends only after a workspace change, and you "
+    "have made no edits yet. Apply the smallest edit_file that fixes the "
+    "failure evidence now — do not repeat an investigation you have already "
+    "completed — verify once with git_diff, and finish with the root cause "
+    "and the fix."
+)
 
 
 def _read_digest(content: str, head: int = 10, tail: int = 8, cap: int = 1400) -> str:
@@ -634,6 +729,11 @@ class _Governor:
                 self.read_cache.clear()
                 self.read_hits.clear()
                 self.failed_edits.pop(key, None)
+                # The workspace changed, so per-path read counts no longer
+                # describe what the model has seen: fresh reads of the NEW
+                # content (paging the file it just fixed) are legitimate
+                # work, not the chunked-paging loop this cap was built for.
+                self.path_reads.clear()
                 evidence = True
             else:
                 if name == "edit_file":
@@ -836,6 +936,10 @@ def _window(messages: list[dict], events: list[dict], brief: str = "") -> list[d
         m = rest[j]
         if m.get("role") == "assistant" and m.get("tool_calls"):
             ids = {tc.get("id") for tc in m["tool_calls"]}
+            names = {
+                str(tc.get("id")): str((tc.get("function") or {}).get("name") or "")
+                for tc in m["tool_calls"]
+            }
             k = j + 1
             while (
                 k < len(rest)
@@ -843,7 +947,9 @@ def _window(messages: list[dict], events: list[dict], brief: str = "") -> list[d
                 and rest[k].get("tool_call_id") in ids
             ):
                 k += 1
-            spans.append([_compact_history_message(x) for x in rest[j:k]])
+            spans.append(
+                [_compact_history_message(x, call_names=names) for x in rest[j:k]]
+            )
             j = k
         else:
             spans.append([_compact_history_message(m)])

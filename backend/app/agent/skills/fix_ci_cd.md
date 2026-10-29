@@ -5,6 +5,7 @@ The task is to repair the cause of a failing CI run, not to make the run report 
 ## Approach
 
 - Start from the supplied failure evidence: the failing job and step, the error line, and the files it names.
+- Read the file the failure names FIRST (its failing-step lines, `offset/limit` paging allowed), then edit it: an identical error is not found by exploring different paths.
 - Read the code around the failure before editing. Use the workflow content to understand how the step runs; it is context, not a substitute for the error.
 - If the evidence is ambiguous or no log was captured, reproduce the failing step with one command derived from the workflow.
 - Make the smallest change that fixes the underlying defect, matching the surrounding style.

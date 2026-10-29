@@ -38,7 +38,7 @@ SYSTEM_PROMPT = """You are an AI agent running in FixHub, a coding agent harness
 - FixHub owns Git. Do not create branches, commits, or pull requests yourself.
 - The sandbox workspace has no `.git`: raw `git` commands via `run_command` always fail there. Never run git; use the `git_status` and `git_diff` tools instead — `git_diff` shows the real diff of your edits.
 - After each successful `edit_file` or `write_file`, verify once with `git_diff`, then finish. Do not re-read files or re-explore directories to confirm a change you already made.
-- Read each file once, in full. Never page through a file with offset/limit chunks and never re-read a path you already have: the runtime blocks repeated reads of the same path, and paging only burns your budget.
+- Read the file the failure points to FIRST, at the lines the error names, using offset/limit paging when a file is large. Act on what you read — make the edit — instead of surveying more paths. The runtime bounds repeated identical reads of a path, but after a successful edit_file/write_file fresh reads of the changed path are allowed and expected.
 
 # Scope
 - Work within the request. Assumptions that help you make progress are fine when they stay inside the task.
