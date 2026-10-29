@@ -59,6 +59,11 @@ trap 'sudo rm -rf -- "$SCRATCH"' EXIT INT TERM
 # Builder logs land here; every scenario asserts on its content below.
 B_LOG="$SCRATCH/builder.log"
 
+# Command-level tracing for every builder invocation (bash -x below): a
+# marker-less rc!=0 death — which produced no output at all until now —
+# names its exact failing command + builder line in the dumped log tail.
+export PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+
 fail() { TOTAL_FAIL=$((TOTAL_FAIL + 1)); echo "  FAIL: $*" >&2; }
 
 no_leftover_mounts() {
@@ -120,7 +125,7 @@ scenario_cleanup() {
     local out="$SCRATCH/base-cleanup.ext4" rc=0 before=$TOTAL_FAIL
     B_LOG="$SCRATCH/builder-cleanup.log"
     sudo env FIXHUB_ROOTFS_FAIL_AFTER=mount \
-        bash "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
+        bash -x "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
     assert_forced_failure "$rc" mount
     [[ -e "$out" ]] && fail "output image exists after a failed build: $out" \
         || ok "no output image written"
@@ -149,7 +154,7 @@ scenario_preserve() {
 
     B_LOG="$SCRATCH/builder-preserve-fail.log"
     sudo env FIXHUB_ROOTFS_FAIL_AFTER=copy \
-        bash "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
+        bash -x "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
     assert_forced_failure "$rc" copy
     local post_sha
     post_sha="$(sudo sha256sum "$out" | cut -d' ' -f1)"
@@ -164,10 +169,15 @@ scenario_preserve() {
     no_leftover_work_dirs
     dump_b_log "$before" "preserve (fail at copy)" "$B_LOG"
 
-    # success pass: the very same path must now be atomically replaced
+    # success pass: the very same path must now be atomically replaced.
+    # `cmd > log 2>&1 || rc=$?` assigns rc ONLY when the command fails:
+    # without this reset a SUCCESSFUL success run inherits the injected
+    # run's nonzero rc and false-fails right after the builder itself
+    # logged promoted/done (observed on the host).
     local mid=$TOTAL_FAIL
+    rc=0
     B_LOG="$SCRATCH/builder-preserve-success.log"
-    sudo bash "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
+    sudo bash -x "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
     if (( rc == 0 )); then
         ok "successful build replaces the preserved image (rc=0)"
     else
@@ -192,7 +202,7 @@ scenario_success() {
     note "scenario: success (real build, full validation battery)"
     local out="$SCRATCH/base-success.ext4" rc=0 before=$TOTAL_FAIL
     B_LOG="$SCRATCH/builder-success.log"
-    sudo bash "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
+    sudo bash -x "$BUILDER" "$out" 1024 > "$B_LOG" 2>&1 || rc=$?
     if (( rc != 0 )); then
         fail "real build failed (rc=$rc)"
         dump_b_log "$before" "success (real build)" "$B_LOG"

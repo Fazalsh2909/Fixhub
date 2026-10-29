@@ -223,6 +223,39 @@ def test_kvm_harness_distinguishes_injected_failures_and_prints_log() -> None:
     assert text.count("no_leftover_work_dirs") >= 3
 
 
+def test_preserve_success_run_does_not_inherit_injected_rc_and_is_traced() -> None:
+    """Regression (host-observed on d326330): two silent failures.
+
+    (1) The preserve success-run false-failed: `cmd > log 2>&1 || rc=$?`
+    assigns rc ONLY on failure, so a SUCCESSFUL success run inherited the
+    injected run's nonzero rc and the scenario printed "successful build
+    failed (rc=1)" while the builder's own log ended with promoted/done.
+    The rc reset must sit between the two preserve invocations.
+    (2) The forced stage=copy run died with rc=1 and NO output at all —
+    not even the builder's cleanup-trap "FAILED" line — so static reading
+    cannot name which of the silent pre-hook commands (install -d, agent
+    install, resolv tee, chmod) was the last one executed. Every builder
+    invocation therefore runs under `bash -x` with a file:line PS4 so the
+    dumped log tail names the exact failing command + line.
+    """
+    harness = ROOT / "infra" / "firecracker" / "test-build-rootfs.sh"
+    assert harness.is_file(), f"missing KVM harness: {harness}"
+    text = harness.read_text(encoding="utf-8")
+    forced = text.find('sudo env FIXHUB_ROOTFS_FAIL_AFTER=copy')
+    mid = text.find("local mid=$TOTAL_FAIL")
+    # the rc reset must exist and must be immediately before the
+    # preserve-success invocation (never re-dropped)
+    reset = text.find('    rc=0\n    B_LOG="$SCRATCH/builder-preserve-success.log"')
+    assert -1 not in (forced, mid, reset), "preserve stale-rc structure broken"
+    assert mid < reset < text.find("sudo bash -x", reset), (
+        "rc=0 must be reset AFTER the injected run and BEFORE the success run"
+    )
+    # all four builder invocations are command-traced
+    assert text.count('bash -x "$BUILDER"') == 4
+    assert text.count("export PS4=") == 1
+    assert "${BASH_SOURCE##*/}:${LINENO}: " in text, "PS4 must carry file:line"
+
+
 def test_unmount_before_image_copy_and_leak_guard() -> None:
     code = _code()
     unmount = _pos(code, "unmount_all || die")
