@@ -72,6 +72,25 @@ def _create_tables() -> None:
     if _env_name() == "dev":
         Base.metadata.create_all(bind=engine)
         ensure_columns()
+    # Production incident fix (#70/#71): a deployed boot whose workspace
+    # root this process identity cannot use MUST fail here — the failure
+    # mode if allowed to proceed is a publish-time `git add` Permission
+    # denied half-way through staging a task's fix. Dev logs a warning.
+    try:
+        from app.repo import workspace_preflight as _preflight
+
+        _ws_failures = _preflight.preflight_workspace_root()
+    except Exception as exc:  # preflight must never crash the boot itself
+        _ws_failures = [f"<preflight-error: {str(exc)[:120]}>"]
+    if _ws_failures:
+        if _env_name() in {"staging", "prod"}:
+            raise RuntimeError(
+                "refusing startup: workspace root unusable: "
+                + "; ".join(_ws_failures[:3])
+            )
+        logging.getLogger("fixhub.workspace").warning(
+            "workspace root unusable in dev: %s", "; ".join(_ws_failures[:3])
+        )
     _promote_admins()
     _sweep_stale_running_tasks()
     _start_ci_watcher()

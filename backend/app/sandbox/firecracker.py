@@ -35,6 +35,8 @@ message (no KVM on Windows by design). Real-VM tests gate on this.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import shutil
@@ -47,6 +49,7 @@ import time
 
 from app.sandbox import guest_agent as _guest
 from app.sandbox import images as _images
+from app.sandbox import manifest as _manifest
 from app.sandbox import net as _net
 from app.sandbox import sandbox as _host
 
@@ -1224,15 +1227,36 @@ def _safe_host_dest(workspace: str, rel: str) -> str:
     return dest
 
 
-def _atomic_write_text(dest: str, content: str, *, stop_at: str = "") -> None:
-    """Write text to `dest` atomically via temp-file + rename.
+def _atomic_write_bytes(
+    dest: str,
+    data: bytes,
+    *,
+    stop_at: str = "",
+    mode: int | None = None,
+    expected_digest: str = "",
+) -> bool:
+    """Write BYTES to `dest` atomically with explicit permission discipline.
 
-    Parents are re-validated symlink-free AFTER creation (a concurrent
-    symlink plant between check and write is rejected instead of followed).
-    The upward walk STOPS at `stop_at` (the workspace root): symlinked
-    ancestors ABOVE the workspace (e.g. /tmp -> /private/tmp on macOS) are
-    the operator's environment, not an attack, and must not refuse writes.
-    Raises OSError/ValueError on failure.
+    Production fix for tasks #70/#71 (the previous `_atomic_write_text`
+    created `mkstemp` temp files with mode 0600 and installed them via
+    `os.replace` with no chmod, leaving EVERY synced file mode 0600 owned by
+    the syncing worker — the approving publisher process (a different service
+    identity) then failed `git add` with `open("CONTRIBUTING.md"):
+    Permission denied`).
+
+    Contract:
+    - Identical containment semantics as before: symlinked parent walks are
+      rejected, escapes above `stop_at` are detected post-rename and removed,
+      and a concurrent symlink plant is refused instead of followed.
+    - An EXISTING regular file keeps its permission bits exactly (executable
+      bit included) — a sync must never strip a repo script's executable bit.
+    - A NEW file receives an explicit safe host mode (`mode`, defaulting to
+      the configured `WORKSPACE_FILE_MODE`); neither the temp file's 0600
+      default nor any guest-supplied uid/gid is ever applied.
+    - `expected_digest`: when `dest` already contains exactly these bytes
+      (sha256 match), the write is SKIPPED entirely (mtime/ownership/mode
+      untouched) and the function returns False; a real write returns True.
+    - Raises OSError/ValueError — refusals are visible, never swallowed.
     """
     import os as _os
 
@@ -1256,12 +1280,36 @@ def _atomic_write_text(dest: str, content: str, *, stop_at: str = "") -> None:
             if parent_of == node:
                 break
             node = parent_of
+    if expected_digest:
+        # Digest-equal destination: no rewrite at all (the containing parents
+        # above are already containment-validated; reading dest in place is
+        # safe and keeps ownership/mode/mtime stable).
+        try:
+            with open(dest, "rb") as fh:
+                if hashlib.sha256(fh.read()).hexdigest() == expected_digest:
+                    return False
+        except OSError:
+            pass  # unreadable/missing: fall through to the normal write path
+    final_mode = mode
+    try:
+        st = _os.lstat(dest)
+        if _stat.S_ISREG(st.st_mode):
+            # Preserve the existing repository file's permission bits (the
+            # rename replaces the inode; without this the new inode carries
+            # the temp-file default instead of the repo file's mode).
+            final_mode = _stat.S_IMODE(st.st_mode)
+    except OSError:
+        pass  # missing destination: new-file mode applies
+    from app.config import settings as _settings
+
+    safe_default = int(getattr(_settings, "WORKSPACE_FILE_MODE", 0o644))
     fd, tmp = _tempfile.mkstemp(
         dir=parent or ".", prefix=".fixhub-", suffix=".tmp"
     )
     try:
-        with _os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
+        with _os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        _os.chmod(tmp, final_mode if final_mode is not None else safe_default)
         _os.replace(tmp, dest)
         # Post-write containment: a symlink planted in a parent between the
         # pre-write walk and the rename would have redirected `dest` outside
@@ -1291,13 +1339,33 @@ def _atomic_write_text(dest: str, content: str, *, stop_at: str = "") -> None:
         except OSError:
             pass
         raise
+    return True
 
 
-def write_host_result(workspace: str, rel: str, content: str) -> str:
+def _atomic_write_text(
+    dest: str, content: str, *, stop_at: str = "", mode: int | None = None
+) -> None:
+    """Write UTF-8 text to `dest` atomically (thin wrapper over
+    `_atomic_write_bytes`). Raises OSError/ValueError on failure."""
+    _atomic_write_bytes(
+        dest, str(content).encode("utf-8"), stop_at=stop_at, mode=mode
+    )
+
+
+def write_host_result(
+    workspace: str,
+    rel: str,
+    content: str,
+    *,
+    mode: int | None = None,
+    expected_digest: str = "",
+) -> str:
     """Store one guest file into the host workspace (symlink-safe).
 
     Returns the host destination path. Raises ValueError (unsafe path) or
-    OSError (I/O failure); callers treat refusal as skip, never as fallback.
+    OSError (I/O failure); callers treat refusal as failure, never as
+    fallback. When `expected_digest` is supplied and the destination already
+    holds exactly those bytes, nothing is rewritten (skip-unchanged).
     """
     from app.agent.paths import is_sensitive as _is_sensitive
 
@@ -1312,26 +1380,101 @@ def write_host_result(workspace: str, rel: str, content: str) -> str:
     dest = _safe_host_dest(workspace, rel)
     import os as _os
 
-    _atomic_write_text(dest, content, stop_at=_os.path.abspath(workspace))
+    _atomic_write_bytes(
+        dest,
+        str(content).encode("utf-8"),
+        stop_at=_os.path.abspath(workspace),
+        mode=mode,
+        expected_digest=expected_digest,
+    )
     return dest
 
 
-def sync_guest_to_host(*, task_id: int, workspace: str) -> dict:
-    """Copy guest working-tree changes back to the host workspace for publish.
+def write_host_result_bytes(
+    workspace: str, rel: str, data: bytes, *, mode: int | None = None
+) -> str:
+    """BYTE-EXACT result write for the manifest sync.
 
-    Runs on the TRUSTED host after the agent loop and gates complete. Reads
-    guest files over vsock and writes them to the host workspace through the
-    symlink-aware jail (symlinked parents/destinations rejected, sensitive
-    names blocked, atomic writes). `.git` internals are NOT copied (host git
-    state stays authoritative; publish uses host git).
-    Returns {files, bytes, truncated}: truncated is True when the transfer
-    caps (10 MB / 2000 files) cut the listing short — callers must surface
-    that instead of presenting a partial tree as complete.
-    Raises SandboxBlockedError on transport failure
-    (caller fails the task; never publishes stale state silently).
+    Same path-safety checks as `write_host_result` (sensitive-name guard,
+    symlink-aware destination validation, atomic replace with mode
+    discipline); no text encoding is involved, so post-write digest
+    verification against the manifest is meaningful. Raises ValueError /
+    OSError — sync callers must surface failures, never swallow them.
+    """
+    from app.agent.paths import is_sensitive as _is_sensitive
+
+    rel_s = str(rel)
+    if _is_sensitive(rel_s) or _is_sensitive(rel_s.split(":")[0]):
+        raise ValueError("sensitive file is blocked")
+    dest = _safe_host_dest(workspace, rel)
+    import os as _os
+
+    _atomic_write_bytes(
+        dest,
+        bytes(data),
+        stop_at=_os.path.abspath(workspace),
+        mode=mode,
+    )
+    return dest
+
+
+def path_short(rel: str) -> str:
+    """Bounded display name for diagnostics (never whole content)."""
+    text = str(rel).replace("\\", "/")
+    return text if len(text) <= 120 else text[:117] + "..."
+
+
+def _sync_limits() -> dict:
+    """Configured caps for the reconciliation (decimal ints in config — env
+    override foot-gun: values arrive via Settings as plain integers)."""
+    from app.config import settings as _settings
+
+    return {
+        "manifest_max_files": int(
+            getattr(_settings, "FC_SYNC_MANIFEST_MAX_FILES", 8000)
+        ),
+        "max_files": int(getattr(_settings, "FC_SYNC_MAX_FILES", 2000)),
+        "max_bytes": int(getattr(_settings, "FC_SYNC_MAX_BYTES", 10_485_760)),
+        "file_max_bytes": int(
+            getattr(_settings, "FC_SYNC_FILE_MAX_BYTES", 2_000_000)
+        ),
+    }
+
+
+def sync_guest_to_host(*, task_id: int, workspace: str) -> dict:
+    """Reconcile the guest working tree onto the trusted host workspace.
+
+    Production fix for tasks #70/#71: the previous best-effort loop listed the
+    guest tree, read every file, and silently CONTINUED on any read error,
+    guest error response, host write refusal, or budget cut-off — so an agent
+    edit (e.g. `.github/workflows/ci.yml`) could vanish between guest and host
+    while the run still logged `VM_SYNCED` and a later `git add` operated on a
+    workspace missing the change.
+
+    Replacement contract (never relax):
+    - One `manifest` round-trip: the guest agent enumerates regular files
+      (hidden dirs INCLUDED; `.git`/`__pycache__`/symlinks/sensitive names
+      excluded) with per-file size + sha256.
+    - Digest-driven transfer: only files whose host bytes differ (or which do
+      not exist on the host) are fetched (raw mode = byte-exact base64) and
+      written through `write_host_result_bytes`; existing file modes are
+      preserved, new files get the configured safe mode.
+    - Every transferred file is re-read after the write and digest-verified.
+    - Deletions run ONLY against the last FULLY-verified sync snapshot (a
+      sibling JSON outside the git tree) and ONLY from an UNTRUNCATED
+      manifest — truncation can never masquerade as "guest deleted a file".
+    - ANY inconsistency (guest error, transport failure, malformed manifest,
+      digest mismatch, post-write mismatch, cap exceeded) raises
+      SandboxBlockedError naming the path and stage. There is no catch-and-
+      continue and no partial success: callers fail the task and the
+      workspace stays as-is for review.
+
+    Returns {ok, files, bytes, added, changed, deleted, truncated: False}
+    where `files` counts transferred (added+changed) entries.
     """
     import os as _os
 
+    limits = _sync_limits()
     with _REG_LOCK:
         vm = _REG.get(int(task_id))
     if vm is None or not vm.ready:
@@ -1339,42 +1482,196 @@ def sync_guest_to_host(*, task_id: int, workspace: str) -> dict:
     if not workspace or not _os.path.isdir(workspace):
         raise _host.SandboxBlockedError("host workspace missing for result sync")
 
-    client = _guest.VsockClient(uds_path=os.path.join(vm.chroot_dir, "v.sock"), port=_GUEST_AGENT_PORT)
-    # 1. List guest tree (guest agent returns repo-relative paths).
+    client = _guest.VsockClient(
+        uds_path=os.path.join(vm.chroot_dir, "v.sock"), port=_GUEST_AGENT_PORT
+    )
+
+    # 1. Manifest: authoritative guest listing (path/size/sha256 per file).
     try:
-        resp = client.call(
-            {**_guest.build_request(op="list", cwd=".", timeout_s=15), "path": ".", "recursive": True},
-            timeout_s=20,
-        )
+        mreq = {
+            **_guest.build_request(op="manifest", cwd=".", timeout_s=60),
+            "path": ".",
+            "max_entries": limits["manifest_max_files"],
+        }
+        mresp = client.call(mreq, timeout_s=90)
     except Exception as exc:
-        raise _host.SandboxBlockedError(f"guest result listing failed: {exc}")
-    entries = resp.get("entries", []) or []
+        raise _host.SandboxBlockedError(f"sync manifest request failed: {exc}")
+    merr = mresp.get("error")
+    if merr and "unknown op" in str(merr):
+        raise _host.SandboxBlockedError(
+            "guest agent does not support the 'manifest' op — the rootfs "
+            "baked before this fix is outdated. Rebuild the guest image "
+            "(infra/firecracker/build-rootfs.sh) so the updated agent.py is "
+            "baked in, then retry the task. Refusing to sync blind."
+        )
+    try:
+        entries, truncated = _manifest.parse_manifest(mresp)
+    except _manifest.ManifestInvalid as exc:
+        raise _host.SandboxBlockedError(
+            f"sync manifest invalid (stage=parse): {exc}"
+        )
+    if truncated:
+        # Explicit truncation: an incomplete listing cannot be reconciled as
+        # if it were the whole guest tree (and must not drive deletions).
+        raise _host.SandboxBlockedError(
+            f"sync manifest truncated at {len(entries)} entries "
+            f"(cap={limits['manifest_max_files']}) — guest tree exceeds the "
+            "manifest cap (stage=manifest)"
+        )
+
+    # 2. Diff host-vs-manifest, transfer only changed/new files.
     files = 0
+    added = 0
+    changed = 0
     total_bytes = 0
-    for rel in entries:
-        rel = str(rel).replace("\\", "/")
-        if not rel or rel.startswith(".git/") or rel == ".git":
-            continue
-        if "__pycache__" in rel:
-            continue
-        # 2. Read from guest, write to host (refusals skip the file).
+    errors: list[str] = []
+
+    def _fail(path: str, stage: str, detail: str) -> None:
+        errors.append(f"{path!r} (stage={stage}): {detail}")
+
+    for entry in entries:
+        rel = entry.path
+        dest = _os.path.join(_os.path.abspath(workspace), *rel.split("/"))
         try:
-            rreq = _guest.build_request(op="read", cwd=".", timeout_s=15)
-            rreq["path"] = rel
-            rresp = client.call(rreq, timeout_s=20)
-        except Exception:
+            with open(dest, "rb") as fh:
+                host_bytes = fh.read()
+        except FileNotFoundError:
+            host_bytes = None
+        except OSError as exc:
+            _fail(rel, "read_host", f"host file unreadable: {exc}")
             continue
-        if rresp.get("error"):
+        if host_bytes is not None and _manifest.sha256_bytes(host_bytes) == entry.sha256:
+            continue  # unchanged: do not rewrite, do not re-chmod
+        # Size/caps guards BEFORE transferring anything.
+        if entry.size > limits["file_max_bytes"]:
+            _fail(
+                rel,
+                "cap",
+                f"guest file is {entry.size} bytes > FC_SYNC_FILE_MAX_BYTES="
+                f"{limits['file_max_bytes']}",
+            )
+            continue
+        if total_bytes + entry.size > limits["max_bytes"]:
+            _fail(
+                rel,
+                "cap",
+                f"transfer would exceed FC_SYNC_MAX_BYTES="
+                f"{limits['max_bytes']} at {path_short(rel)}",
+            )
+            continue
+        if files >= limits["max_files"]:
+            _fail(
+                rel,
+                "cap",
+                f"transfer would exceed FC_SYNC_MAX_FILES="
+                f"{limits['max_files']} files",
+            )
+            continue
+        # 3. Raw byte-exact fetch.
+        try:
+            rreq = {
+                **_guest.build_request(op="read", cwd=".", timeout_s=30),
+                "path": rel,
+                "mode": "raw",
+            }
+            rresp = client.call(rreq, timeout_s=45)
+        except Exception as exc:
+            _fail(rel, "read_guest", f"raw read failed: {exc}")
+            continue
+        rerr = rresp.get("error")
+        if rerr:
+            _fail(rel, "read_guest", f"guest refused: {str(rerr)[:200]}")
             continue
         try:
-            write_host_result(workspace, rel, str(rresp.get("content", "")))
-        except (ValueError, OSError):
+            data = base64.b64decode(str(rresp.get("content_b64", "")))
+        except (ValueError, TypeError) as exc:
+            _fail(rel, "decode", f"base64 payload invalid: {exc}")
+            continue
+        # 4. Content verification against the manifest BEFORE touching disk.
+        if len(data) != entry.size:
+            _fail(
+                rel,
+                "verify",
+                f"size mismatch: manifest says {entry.size}, guest sent {len(data)}",
+            )
+            continue
+        got = _manifest.sha256_bytes(data)
+        if got != entry.sha256:
+            _fail(
+                rel,
+                "verify",
+                f"digest mismatch: manifest={entry.sha256[:12]} guest={got[:12]}",
+            )
+            continue
+        # 5. Write + post-write re-read verification.
+        try:
+            write_host_result_bytes(workspace, rel, data)
+        except (ValueError, OSError) as exc:
+            _fail(rel, "write_host", f"host refused write: {str(exc)[:200]}")
+            continue
+        try:
+            with open(dest, "rb") as fh:
+                after = fh.read()
+        except OSError as exc:
+            _fail(rel, "post_verify", f"post-write read failed: {exc}")
+            continue
+        after_digest = _manifest.sha256_bytes(after)
+        if after_digest != entry.sha256:
+            _fail(
+                rel,
+                "post_verify",
+                f"post-write digest mismatch "
+                f"(expected {entry.sha256[:12]}, got {after_digest[:12]})",
+            )
             continue
         files += 1
-        total_bytes += len(str(rresp.get("content", "")))
-        if total_bytes > 10 * 1024 * 1024 or files > 2000:
-            return {"files": files, "bytes": total_bytes, "truncated": True}
-    return {"files": files, "bytes": total_bytes, "truncated": False}
+        total_bytes += len(data)
+        if host_bytes is None:
+            added += 1
+        else:
+            changed += 1
+
+    # 6. Deletions: only full manifests, only vs the last verified snapshot.
+    deleted = 0
+    state_path = _manifest.sync_state_path(workspace, task_id)
+    state = _manifest.load_sync_state(state_path)
+    if not truncated and state:
+        for rel in _manifest.compute_deletions(entries, state):
+            try:
+                dest = _safe_host_dest(workspace, rel)
+            except ValueError as exc:
+                _fail(rel, "delete_validate", f"refused: {str(exc)[:200]}")
+                continue
+            if not _os.path.lexists(dest):
+                deleted += 1  # already gone; manifests agree
+                continue
+            try:
+                _os.unlink(dest)
+            except FileNotFoundError:
+                deleted += 1
+            except OSError as exc:
+                _fail(rel, "delete", f"delete failed: {exc}")
+                continue
+            deleted += 1
+
+    if errors:
+        head = "; ".join(errors[:5])
+        raise _host.SandboxBlockedError(
+            f"workspace sync failed: {len(errors)} error(s) — first: {head}"
+            + (f" (+{len(errors) - 5} more)" if len(errors) > 5 else "")
+        )
+
+    # 7. Persist the verified snapshot ONLY on full success.
+    _manifest.save_sync_state(state_path, entries)
+    return {
+        "ok": True,
+        "files": files,
+        "bytes": total_bytes,
+        "added": added,
+        "changed": changed,
+        "deleted": deleted,
+        "truncated": False,
+    }
 
 
 def _remove_jail_tree(task_id: int, jail_id: str) -> None:

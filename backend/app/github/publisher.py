@@ -20,6 +20,49 @@ class PublishError(RuntimeError):
     pass
 
 
+def _preflight_stage(path: str, files: "list[str]" = None) -> None:
+    """Staging-eligibility gate BEFORE `git add` (production tasks #70/#71).
+
+    `git add -A` used to fail with only git's own stderr as explanation
+    (`open("CONTRIBUTING.md"): Permission denied`) because workspace files/
+    dirs had 0600/0700 bits from the sync writer's temp files. This gate
+    re-checks in-process, before touching git, that THIS process identity
+    can read everything to stage and write the git bookkeeping, and turns
+    any gap into a PublishError naming path + mode/owner (no content).
+    `safe.directory` is deliberately never consulted here: these
+    workspaces are created by this service's own identity stack, so an
+    unreadable file is a real misconfiguration, not a dubious-ownership
+    case.
+    """
+    from app.repo.workspace_preflight import preflight_staging
+
+    failures = preflight_staging(path, files or ())
+    if not failures:
+        return
+    head = "; ".join(failures[:6])
+    extra = f" (+{len(failures) - 6} more)" if len(failures) > 6 else ""
+    raise PublishError(
+        f"staging preflight failed before `git add`: {head}{extra}"
+    )
+
+
+def _enriched_stage_error(base: str, path: str) -> str:
+    """One git-side failure for `add` -> attach the same non-secret
+    permission diagnostics (behind a gate: diagnostics never fail a
+    publish on their own)."""
+    try:
+        from app.repo.workspace_preflight import preflight_staging
+
+        failures = preflight_staging(path)
+        if not failures:
+            return base
+        head = "; ".join(failures[:6])
+        extra = f" (+{len(failures) - 6} more)" if len(failures) > 6 else ""
+        return f"{base}; staging diagnostics: {head}{extra}"
+    except Exception:
+        return base
+
+
 def _git(path: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git", *args], cwd=path, capture_output=True, text=True, timeout=60
@@ -147,7 +190,11 @@ def publish(
                 f"git {step} failed: {(proc.stderr or proc.stdout)[-500:]}"
             )
 
-    _run("add", ["add", "-A"])
+    _preflight_stage(path, changed_files(path))
+    try:
+        _run("add", ["add", "-A"])
+    except PublishError as exc:
+        raise PublishError(_enriched_stage_error(str(exc), path)) from exc
     _unstage_bytecode(path)
     # FixHub bot identity: never depend on host gitconfig (fresh workers have none).
     _run(
@@ -277,7 +324,11 @@ def publish_to_existing_branch(
                 f"git {step} failed: {(proc.stderr or proc.stdout)[-500:]}"
             )
 
-    _run("add", ["add", "-A"])
+    _preflight_stage(path, changed_files(path))
+    try:
+        _run("add", ["add", "-A"])
+    except PublishError as exc:
+        raise PublishError(_enriched_stage_error(str(exc), path)) from exc
     _unstage_bytecode(path)
     _run(
         "commit",

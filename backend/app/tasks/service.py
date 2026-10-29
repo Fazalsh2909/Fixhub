@@ -1507,6 +1507,120 @@ def _preserve_partial_work(db, task: Task, path: str, reason: str) -> dict | Non
     return {"status": "NEEDS_REVIEW", "branch": branch}
 
 
+class _DeclaredEditMissing(RuntimeError):
+    """Pipeline verification found a declared edit absent from host git-state."""
+
+    def __init__(self, missing: list[str]) -> None:
+        self.missing = list(missing)
+        super().__init__(
+            "workspace_sync_incomplete: declared edits "
+            + ", ".join(self.missing[:3])
+            + ("..." if len(self.missing) > 3 else "")
+            + " never appeared in the host workspace git state"
+        )
+
+
+def _norm_repo_name(name: str) -> str:
+    """Normalize one git-status/`changed_files` name for declared-edit
+    matching (quote strip, rename `old -> new` -> new, separators)."""
+    name = str(name).strip().strip('"')
+    if " -> " in name:  # renames: the agent declared the new path
+        name = name.split(" -> ", 1)[1]
+    name = name.replace("\\", "/").strip().strip('"')
+    return name[2:] if name.startswith("./") else name
+
+
+def _declared_edit_paths(events) -> list[str]:
+    """Repo-relative paths the agent SUCCESSFULLY edited this run.
+
+    `events` are the LoopResult TOOL_CALL metadata dicts ({tool, args, ok}).
+    Only ok=True write_file/edit_file calls count — a failed edit attempt is
+    not a claim that a file changed. This is the contract _verify_declared_edits
+    enforces: an agent-declared edit must be visible to host git, or the sync
+    broke and publish must not proceed.
+    """
+    seen: list[str] = []
+    for ev in events or ():
+        if not isinstance(ev, dict) or not ev.get("ok"):
+            continue
+        if ev.get("tool") not in ("write_file", "edit_file"):
+            continue
+        args = ev.get("args") or {}
+        rel = str(args.get("path", "")).replace("\\", "/").strip()
+        rel = rel[2:] if rel.startswith("./") else rel
+        if rel and rel not in seen:
+            seen.append(rel)
+    return seen
+
+
+def _workspace_sync_incomplete(db, task: Task, missing: list[str]) -> dict:
+    """NEEDS_REVIEW with the workspace PRESERVED (never wiped).
+
+    The workspace may still hold the agent's other correct work; the missing
+    list tells the reviewer exactly which claim could not be trusted. A new
+    run or approve-publish re-syncs from the VM; nothing unpublished of the
+    declared set can reach GitHub.
+    """
+    branch, _, _ = _pending_title_body(task, "")
+    reason = (
+        "workspace_sync_incomplete: declared agent edits missing from host "
+        "workspace git state: "
+        + ", ".join(missing[:5])
+        + (f" (+{len(missing) - 5} more)" if len(missing) > 5 else "")
+    )
+    _set(db, task, status="NEEDS_REVIEW", branch=branch, error=reason[:1000])
+    _event(
+        db,
+        task.id,
+        "WORKSPACE_SYNC_INCOMPLETE",
+        {"missing": missing[:20], "count": len(missing), "branch": branch},
+    )
+    db.commit()
+    return {"status": "NEEDS_REVIEW", "branch": branch, "missing_files": missing}
+
+
+def _verify_declared_edits(
+    db, task: Task, path: str, events, *, summary: str = ""
+) -> dict | None:
+    """Gate: every declared agent edit must appear in the HOST git state.
+
+    Tasks #70/#71: the guest reported success editing `.github/workflows/
+    ci.yml`, the buggy sync silently dropped the file, and `git add` happily
+    published everything EXCEPT the fix. After a full (non-truncated)
+    manifest sync, any declared edit still absent from `git status` is a
+    broken transfer — NEEDS_REVIEW, workspace preserved, publish blocked.
+    Extra host changes the agent never declared are only reported as a
+    SYNC_ANOMALY event (guests can also produce artifacts via commands);
+    they never block a run.
+
+    Returns None when staging may proceed; an outcome dict otherwise.
+    """
+    from app.github import publisher as _pubmod
+    from app.sandbox.backend import active_backend_name as _active_backend
+
+    if _active_backend() != "firecracker":
+        return None  # host backend edits land directly; nothing crosses vsock
+    declared = _declared_edit_paths(events)
+    proc = _pubmod._git(path, "status", "--porcelain=v1", "-uall")
+    if proc.returncode != 0:
+        return None  # status-verified failures handled by the git gate below
+    present = {
+        _norm_repo_name(ln[3:]) for ln in proc.stdout.splitlines() if len(ln) >= 4
+    }
+    missing = [rel for rel in declared if rel and rel not in present]
+    if missing:
+        raise _DeclaredEditMissing(missing)
+    undeclared = sorted(rel for rel in present if rel and rel not in declared)
+    if undeclared:
+        _event(
+            db,
+            task.id,
+            "SYNC_ANOMALY",
+            {"extra": undeclared[:20], "declared": len(declared)},
+        )
+    return None
+
+
 def _fail_usage_limit(db, task: Task, reason: str) -> dict:
     """Final hardening: terminal failure on budget exhaustion. Records a safe
     usage/limit event (owner + reason only, never secrets) and makes no
@@ -1602,6 +1716,35 @@ def run_task_inline(
 
         _event(db, task.id, "AGENT_STARTED", {"trigger": task.trigger_type})
         db.commit()
+
+        # Production incident fix (#70/#71): the workspace root must be
+        # usable by THIS process identity before any repo is cloned or a
+        # VM booted into it. Fail BLOCKED with a pointed message here
+        # instead of a publish-time `git add` Permission denied later.
+        _root_failures: list[str] = []
+        try:
+            from app.repo import workspace_preflight as _preflight
+
+            _root_failures = _preflight.preflight_workspace_root()
+        except Exception as exc:  # preflight must not crash the pipeline
+            _root_failures = [f"<preflight-error: {str(exc)[:120]}>"]
+        if _root_failures:
+            _set(
+                db,
+                task,
+                status="BLOCKED",
+                error=(
+                    "workspace root unusable: " + "; ".join(_root_failures[:3])
+                )[:1000],
+            )
+            _event(
+                db,
+                task.id,
+                "BLOCKED",
+                {"reason": "workspace_root_preflight"},
+            )
+            db.commit()
+            return {"status": "BLOCKED", "error": task.error}
 
         # --- workspace ---
         try:
@@ -1985,6 +2128,23 @@ def run_task_inline(
             db.commit()
             _cleanup(task.id)
             return {"status": "FAILED", "error": task.error}
+
+        # Production incident fix (#70/#71): after sync, verify every agent-
+        # declared edit is actually visible in the host git state. A missing
+        # declared edit blocks publish (NEEDS_REVIEW, workspace preserved).
+        try:
+            verified = _verify_declared_edits(db, task, path, result.events)
+        except _DeclaredEditMissing as exc:
+            preserved = _workspace_sync_incomplete(db, task, exc.missing)
+            preserved["summary"] = result.summary
+            return preserved
+        except Exception as exc:
+            # Checker failure must never open the publish gate unverified.
+            preserved = _workspace_sync_incomplete(
+                db, task, [f"<verification-error: {str(exc)[:120]}>"]
+            )
+            preserved["summary"] = result.summary
+            return preserved
 
         # --- git (FixHub owns it) ---
         try:

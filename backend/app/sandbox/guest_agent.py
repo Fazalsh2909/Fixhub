@@ -27,7 +27,7 @@ import socket
 import struct
 import tarfile
 
-_OPS = {"exec", "exec_shell", "read", "write", "list", "git_status", "git_diff"}
+_OPS = {"exec", "exec_shell", "read", "write", "list", "manifest", "git_status", "git_diff"}
 
 _TOKEN_URL_RE = re.compile(r"(https?://)([^/@\s]+@)([^\s]+)")
 _X_TOKEN_RE = re.compile(r"x-access-token:[^@\s]+@")

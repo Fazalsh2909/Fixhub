@@ -48,9 +48,26 @@ def workspace_path(task_id: int | str) -> str:
     return os.path.join(root, f"task-{task_id}")
 
 
+def _ensure_workspace_dir(path: str) -> None:
+    """Create `path` with an explicit service-group directory mode.
+
+    Tasks #70/#71 failed at publish time (`git add `grep -i` — Permission
+    denied`) because workspace dirs inherited the invoking process's umask.
+    `mkdir(mode=...)` is still filtered by umask on Linux, so the leaf is
+    chmod'ed explicitly afterwards (best-effort: Windows emulates the bits
+    and dev/CI run without EPERM issues; a refusal on POSIX surfaces from
+    the preflight instead of here — this helper is bootstrap-only).
+    """
+    os.makedirs(path, exist_ok=True)
+    try:
+        os.chmod(path, int(getattr(settings, "WORKSPACE_DIR_MODE", 0o770)))
+    except (OSError, AttributeError):
+        pass
+
+
 def create_workspace(task_id: int | str) -> str:
     path = workspace_path(task_id)
-    os.makedirs(path, exist_ok=True)
+    _ensure_workspace_dir(path)
     return path
 
 
@@ -69,7 +86,7 @@ def clone_repo(source: str, task_id: int | str, branch: str = "") -> str:
     if os.path.isdir(path) or os.path.exists(path):
         if not _rmtree(path):
             raise WorkspaceError(f"workspace path already exists and could not be removed: {path}")
-    os.makedirs(os.path.abspath(settings.WORKSPACE_ROOT), exist_ok=True)
+    _ensure_workspace_dir(os.path.abspath(settings.WORKSPACE_ROOT))
     cmd = ["git", "clone", "--quiet", source, path]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if proc.returncode != 0:
@@ -80,6 +97,9 @@ def clone_repo(source: str, task_id: int | str, branch: str = "") -> str:
         )
         if proc.returncode != 0:
             raise WorkspaceError(f"checkout {branch} failed: {proc.stderr[-500:]}")
+    # git created the leaf under the worker's umask; make the mode explicit
+    # so the publisher identity can always traverse into the workspace.
+    _ensure_workspace_dir(os.path.abspath(path))
     return path
 
 

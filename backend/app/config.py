@@ -114,6 +114,20 @@ class Settings(BaseSettings):
     # 0 = remove per-task workspace after terminal states (fresh per-task).
     # 1 = keep for debugging (manual `docker compose down -v` to wipe).
     WORKSPACE_KEEP: int = 0
+    # Permission discipline for the workspace lifecycle (decimal ints —
+    # never octal literals here, they die silently under env overrides):
+    # every workspace dir/file must be readable+traversable by the publisher
+    # service identity; worker and publisher share one identity/group
+    # (tasks #70/#71: modes after a `git add` Permission denied).
+    # WORKSPACE_DIR_MODE=0o770, WORKSPACE_FILE_MODE=0o644.
+    WORKSPACE_DIR_MODE: int = 0o770
+    WORKSPACE_FILE_MODE: int = 0o644
+    # Manifest workspace reconciliation caps (guest -> host sync). Sync
+    # FAILS CLOSED when any cap is hit — it never silently truncates.
+    FC_SYNC_MANIFEST_MAX_FILES: int = 8000
+    FC_SYNC_MAX_FILES: int = 2000
+    FC_SYNC_MAX_BYTES: int = 10485760
+    FC_SYNC_FILE_MAX_BYTES: int = 2000000
     # Phase 5: execution substrate. "host" = legacy subprocess (dev/test only).
     # "firecracker" = real microVMs via jailer (required in prod). Unknown
     # values fail closed (never silently use host).

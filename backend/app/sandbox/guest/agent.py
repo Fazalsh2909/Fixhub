@@ -18,16 +18,27 @@ This file must NOT import app.* (it ships inside the guest image).
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
 import signal
 import socket
+import stat
 import struct
 import subprocess
 
 PORT = 5000
 CAP_DEFAULT = 20_000
+# Hard frame-safety bound for `manifest` responses (length-prefixed JSON
+# frames must stay far below the 4 MB vsock frame cap: 8000 entries
+# ~1.3 MB). The host clamps its configured cap against this.
+_MANIFEST_MAX_ENTRIES = 8000
+# Raw byte transfer guard: a single file larger than this is REFUSED by the
+# `read` op (mode=raw) rather than truncated — the host verifies every file
+# by sha256, so partial content is worse than none.
+_RAW_READ_MAX = 2_000_000
 
 _SENSITIVE = re.compile(
     r"(^|/)(\.env(\..*)?|\.git/.*|.*\.pem$|.*\.key$|.*secret.*|.*token.*|.*credentials.*)$",
@@ -162,6 +173,39 @@ def _handle(req: dict, root: str) -> dict:
             return {"req_id": req_id, "error": str(exc)}
         if _has_symlink_prefix(full):
             return {"req_id": req_id, "error": "symlink access is blocked"}
+        if req.get("mode") == "raw":
+            # Byte-exact transfer mode for the manifest reconciliation: the
+            # host verifies every file by sha256, so the text-mode decode
+            # below (errors="replace") would silently rewrite bytes and
+            # make digest verification meaningless. Response is base64
+            # `content_b64` + `size`; files beyond _RAW_READ_MAX are
+            # REFUSED (an over-cap file can never be silently truncated).
+            try:
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(full, flags)
+                try:
+                    with os.fdopen(fd, "rb") as fh:
+                        blob = fh.read()
+                except Exception as exc:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    return {"req_id": req_id, "error": str(exc)}
+            except OSError as exc:
+                return {"req_id": req_id, "error": str(exc)}
+            if len(blob) > _RAW_READ_MAX:
+                return {
+                    "req_id": req_id,
+                    "error": (
+                        f"file exceeds raw read cap: {len(blob)} > {_RAW_READ_MAX}"
+                    ),
+                }
+            return {
+                "req_id": req_id,
+                "content_b64": base64.b64encode(blob).decode("ascii"),
+                "size": len(blob),
+            }
         try:
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(full, flags)
@@ -223,7 +267,16 @@ def _handle(req: dict, root: str) -> dict:
                         if os.path.islink(fp):
                             continue
                         rel = os.path.relpath(fp, root).replace(os.sep, "/")
-                        if "__pycache__" in rel or rel.startswith(".git"):
+                        # NOTE: `.git` internals only — never a raw prefix
+                        # match, or `.github/*` (the workflow files) would
+                        # be silently dropped from the tree listing. That
+                        # prefix mistake is the exact root cause of the
+                        # #70/#71 "hidden edits invisible to sync" case.
+                        if (
+                            "__pycache__" in rel
+                            or rel == ".git"
+                            or rel.startswith(".git/")
+                        ):
                             continue
                         if _is_sensitive(rel):
                             continue
@@ -238,6 +291,83 @@ def _handle(req: dict, root: str) -> dict:
         except OSError as exc:
             return {"req_id": req_id, "error": str(exc)}
         return {"req_id": req_id, "entries": entries[:2000]}
+    if op == "manifest":
+        # Host->guest reconciliation response: regular repository files with
+        # rel path + size + sha256 so the host can transfer only CHANGED
+        # files and verify each write by digest. Hidden dirs are INCLUDED
+        # (.github/workflows/ci.yml must reconcile); `.git`, `__pycache__`,
+        # symlinks, and sensitive names are excluded (same rules as `list`).
+        # Truncation is EXPLICIT: a truncated response can never drive host
+        # deletions or be mistaken for the complete guest state.
+        path = req.get("path", ".")
+        if _is_sensitive(path):
+            return {"req_id": req_id, "error": "access to sensitive path is blocked"}
+        try:
+            full = _resolve(root, path)
+        except ValueError as exc:
+            return {"req_id": req_id, "error": str(exc)}
+        try:
+            max_entries = int(req.get("max_entries", _MANIFEST_MAX_ENTRIES))
+        except (TypeError, ValueError):
+            max_entries = _MANIFEST_MAX_ENTRIES
+        max_entries = max(1, min(int(max_entries), _MANIFEST_MAX_ENTRIES))
+        out: list[dict] = []
+        truncated = False
+        try:
+            for r, dirs, files in os.walk(full, followlinks=False):
+                dirs[:] = [
+                    d for d in dirs
+                    if d not in ("__pycache__", ".git")
+                    and not os.path.islink(os.path.join(r, d))
+                ]
+                for name in sorted(dirs + files):
+                    fp = os.path.join(r, name)
+                    rel = os.path.relpath(fp, root).replace(os.sep, "/")
+                    # `.git` internals only — same prefix-matching rule as
+                    # `list` (a raw `startswith(".git")` also swallowed
+                    # `.github/*` and hid workflow edits; see #70/#71).
+                    if (
+                        "__pycache__" in rel
+                        or rel == ".git"
+                        or rel.startswith(".git/")
+                    ):
+                        continue
+                    if _is_sensitive(rel):
+                        continue
+                    try:
+                        st = os.lstat(fp)
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(st.st_mode):
+                        continue  # dirs/symlinks/sockets never shipped
+                    if len(out) >= max_entries:
+                        truncated = True
+                        break
+                    h = hashlib.sha256()
+                    size = 0
+                    try:
+                        with open(fp, "rb") as fh:
+                            while True:
+                                chunk = fh.read(65536)
+                                if not chunk:
+                                    break
+                                h.update(chunk)
+                                size += len(chunk)
+                    except OSError:
+                        continue  # unreadable mid-walk: leave it out; the
+                        # host surfaces the gap through verification failure
+                    out.append(
+                        {"path": rel, "size": size, "sha256": h.hexdigest()}
+                    )
+                if truncated:
+                    break
+        except OSError as exc:
+            return {"req_id": req_id, "error": str(exc)}
+        return {
+            "req_id": req_id,
+            "entries": out,
+            "truncated": truncated,
+        }
     return {"req_id": req_id, "error": f"unknown op: {op}", "exit_code": 1}
 
 
