@@ -931,6 +931,14 @@ def _configure_and_boot(
     addrs = _net.guest_addrs(task_id)
     boot_args = (
         "console=ttyS0 reboot=k panic=1 pci=off ipv6.disable=1 "
+        # Bootability contract (pairs with build-rootfs.sh's baked /sbin/init):
+        # root= mounts the virtio root drive (virtio-mmio with pci=off still
+        # names block devices /dev/vda), init= starts the guest PID1 —
+        # debootstrap --variant=minbase ships NO init, so without root=/dev/vda
+        # the kernel panics before userspace ("VFS: Unable to mount root fs")
+        # and without an init the vsock CONNECT finds no agent listener
+        # ("Firecracker vsock bridge closed before CONNECT acknowledgement").
+        "root=/dev/vda rw init=/sbin/init "
         f"ip={addrs['vm']}::{addrs['gw']}:"
         f"255.255.255.252::eth0:off"
     )

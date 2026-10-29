@@ -294,6 +294,21 @@ scenario_success() {
         else
             fail "guest DNS stub missing"
         fi
+        # bootability: the minbase init gap (guest PID1 boot chain)
+        [[ -e "$mnt/bin/sh" ]] && ok "guest /bin/sh present" || fail "guest /bin/sh missing"
+        [[ -e "$mnt/bin/mount" ]] && ok "guest /bin/mount present" || fail "guest /bin/mount missing"
+        [[ -x "$mnt/sbin/init" ]] && ok "guest /sbin/init executable" \
+            || fail "guest /sbin/init missing or not executable"
+        if [[ "$(sudo head -n1 -- "$mnt/sbin/init")" == "#!/bin/sh" ]]; then
+            ok "guest /sbin/init has a shell shebang"
+        else
+            fail "guest /sbin/init is not a shell script (bad shebang)"
+        fi
+        if sudo grep -q 'exec /usr/bin/python3 -u /opt/fixhub/agent.py' "$mnt/sbin/init"; then
+            ok "guest PID1 execs the agent"
+        else
+            fail "guest PID1 does not exec the agent"
+        fi
         sudo umount "$mnt" 2>/dev/null || sudo umount -l "$mnt" 2>/dev/null
     else
         fail "cannot read-only mount the image for content validation"

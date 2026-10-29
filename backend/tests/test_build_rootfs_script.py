@@ -464,3 +464,88 @@ def test_manifest_op_baked_agent_required() -> None:
     code = _code()
     assert code.count('grep -q \'"manifest"\'') == 2
     assert "lacks the manifest op" in code
+
+
+# ---------------------------------------------------------------------------
+# Guest BOOTABILITY contract (the real-boot incident of 2026-10-29).
+#
+# The first real production Firecracker boot failed with
+# "guest agent never answered: Firecracker vsock bridge closed before
+# CONNECT acknowledgement". Host evidence: the rebuild completed green
+# (promoted + done + sidecar) yet the image had NO /sbin/init, NO inittab,
+# NO rc.local, NO systemd unit and zero references to agent.py — and
+# firecracker.py's boot_args had never carried root= nor init= (git grep
+# across every commit). debootstrap --variant=minbase is not a bootable
+# system, so the guest could never start the agent on vsock port 5000.
+# The pins below bind BOTH halves of the boot chain together because CI
+# can never boot a VM to test them (static-only suite, no KVM).
+
+
+def test_builder_bakes_a_bootable_guest_pid1() -> None:
+    """The image must contain an executable /sbin/init shell script that
+    mounts the pseudofs and execs the guest agent (debootstrap minbase
+    ships NO init). Raw-text assertions: the heredoc body is invisible to
+    _code()'s comment stripping."""
+    raw = SCRIPT.read_text(encoding="utf-8")
+    write = _pos(raw, 'sudo tee "$ROOT/sbin/init" >/dev/null')
+    body_start = raw.find("#!/bin/sh\n# FixHub guest PID1")
+    assert body_start > write >= 0, "PID1 heredoc must follow the tee write"
+    body = raw[body_start:raw.find("\nEOF", body_start)]
+    assert "mount -t proc proc /proc" in body, "PID1 must mount /proc"
+    assert "mount -t sysfs sysfs /sys" in body, "PID1 must mount /sys"
+    assert "exec /usr/bin/python3 -u /opt/fixhub/agent.py" in body, (
+        "PID1 must exec the baked agent (it binds AF_VSOCK:5000 and loops "
+        "forever — a never-exiting PID1 by design)"
+    )
+    chmod = _pos(raw, 'sudo chmod 755 "$ROOT/sbin/init"')
+    assert chmod > body_start, "PID1 must be made executable after the write"
+    # the glue belongs to the guest-content stage: written BEFORE the
+    # stage=copy hook and the image assembly
+    copy_hook = _pos(raw, "_fail_after copy")
+    mnt = _pos(raw, "sudo mount -o loop \"$IMG\"")
+    assert copy_hook < mnt, "PID1 glue must be written before the ext4 copy"
+
+
+def test_image_validation_requires_bootable_guest() -> None:
+    """The pre-promote validation battery must prove the boot chain, not
+    just agent content: sh + mount present, python3 executable, and an
+    executable /sbin/init shell script whose body execs the agent."""
+    code = _code()
+    agent_cmp = _pos(code, 'sudo cmp -s -- "$AGENT_SRC" "$MNT/opt/fixhub/agent.py"')
+    manifest = _pos(code, "\'\"manifest\"\' \"$MNT/opt/fixhub/agent.py\"")
+    checks = [
+        _pos(code, '[[ -e "$MNT/bin/sh" ]]'),
+        _pos(code, '[[ -e "$MNT/bin/mount" ]]'),
+        _pos(code, '[[ -x "$MNT/usr/bin/python3" ]]'),
+        _pos(code, '[[ -x "$MNT/sbin/init" ]]'),
+        _pos(code, '"$MNT/sbin/init")" == "#!/bin/sh"'),
+        _pos(code, "| die \"image validation: /sbin/init does not exec the guest agent\""),
+    ]
+    for chk in checks:
+        assert chk > manifest, "bootability checks must ride behind the manifest check"
+        assert chk > agent_cmp, "bootability must be checked after agent content"
+    # and ALL of it happens on the staging image BEFORE the atomic promote
+    promote = _pos(code, 'sudo mv -f -- "$IMG" "$OUT"')
+    assert promote > max(checks), "no image may be promoted before bootability passes"
+
+
+def test_boot_args_mount_root_and_start_the_baked_pid1() -> None:
+    """firecracker.py boot_args must mount the virtio root and exec the
+    /sbin/init the builder bakes — the two halves of one contract, pinned
+    together because neither is exercisable in CI (no KVM)."""
+    fc = ROOT / "backend" / "app" / "sandbox" / "firecracker.py"
+    text = fc.read_text(encoding="utf-8")
+    boot = _pos(text, "console=ttyS0")
+    root = _pos(text, "root=/dev/vda rw")
+    init = _pos(text, "init=/sbin/init")
+    ip = _pos(text, "255.255.255.252::eth0:off")
+    assert boot < root < init < ip, (
+        "boot_args order: console … root=/dev/vda rw init=/sbin/init ip=… "
+        "— init= is a kernel param (consumed); a stray ip= token reaching "
+        "PID1 as argv is harmless (the PID1 script ignores $@)"
+    )
+    # coupling: the exact PID1 path named by the kernel args is the file
+    # the builder bakes with the agent exec
+    glue = _code()
+    _pos(glue, 'sudo tee "$ROOT/sbin/init" >/dev/null')
+    _pos(glue, 'sudo chmod 755 "$ROOT/sbin/init"')

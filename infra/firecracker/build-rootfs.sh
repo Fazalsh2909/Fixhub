@@ -229,6 +229,25 @@ sudo install -m 644 -- "$AGENT_SRC" "$ROOT/opt/fixhub/agent.py"
 # 10.200.0.1 is the host-resolver stub on the Firecracker tap subnet).
 printf 'nameserver 10.200.0.1\n' | sudo tee "$ROOT/etc/resolv.conf" >/dev/null
 sudo chmod 644 "$ROOT/etc/resolv.conf"
+
+# --- Guest PID1: the image's ONLY boot glue ---------------------------------
+# debootstrap --variant=minbase ships NO /sbin/init, so even with the
+# root=/dev/vda rw init=/sbin/init of firecracker.py's boot_args the kernel
+# would panic at "No working init found" and the vsock CONNECT would find
+# no agent listener ("Firecracker vsock bridge closed before CONNECT
+# acknowledgement"). /sbin/init is a shell-script PID1: mount the pseudofs
+# the agent's stdlib expects, then exec the agent. The agent binds
+# AF_VSOCK:5000 and loops forever, so PID1 never exits voluntarily (VM
+# destroy terminates the whole guest kernel — there is no shutdown path).
+sudo tee "$ROOT/sbin/init" >/dev/null <<'EOF'
+#!/bin/sh
+# FixHub guest PID1 (baked by build-rootfs.sh): pseudofs first, then exec
+# the guest agent — it serves vsock port 5000 for its entire lifetime.
+mount -t proc proc /proc 2>/dev/null || true
+mount -t sysfs sysfs /sys 2>/dev/null || true
+exec /usr/bin/python3 -u /opt/fixhub/agent.py
+EOF
+sudo chmod 755 "$ROOT/sbin/init"
 _fail_after copy
 
 # --- Unmount EVERYTHING before the image copy ------------------------------
@@ -268,6 +287,21 @@ sudo cmp -s -- "$AGENT_SRC" "$MNT/opt/fixhub/agent.py" \
     || die "image validation: baked agent.py differs from the repo source"
 sudo grep -q '"manifest"' "$MNT/opt/fixhub/agent.py" \
     || die "image validation: baked agent lacks the manifest op"
+
+# --- Guest BOOTABILITY (the minbase init gap) --------------------------------
+# An image with correct agent content but no PID1 boots to a kernel panic
+# and answers no vsock. Validate the boot chain explicitly, BEFORE promote:
+[[ -e "$MNT/bin/sh" ]] || die "image validation: /bin/sh missing (guest PID1 interpreter)"
+[[ -e "$MNT/bin/mount" ]] \
+    || die "image validation: /bin/mount missing (guest PID1 pseudofs mount)"
+[[ -x "$MNT/usr/bin/python3" ]] \
+    || die "image validation: /usr/bin/python3 missing or not executable"
+[[ -x "$MNT/sbin/init" ]] \
+    || die "image validation: /sbin/init missing or not executable (guest PID1)"
+[[ "$(sudo head -n1 -- "$MNT/sbin/init")" == "#!/bin/sh" ]] \
+    || die "image validation: /sbin/init is not a shell script (bad shebang)"
+sudo grep -q 'exec /usr/bin/python3 -u /opt/fixhub/agent.py' "$MNT/sbin/init" \
+    || die "image validation: /sbin/init does not exec the guest agent"
 sudo grep -q '^nameserver 10\.200\.0\.1$' "$MNT/etc/resolv.conf" \
     || die "image validation: guest DNS stub missing"
 sudo umount "$MNT" 2>/dev/null \
