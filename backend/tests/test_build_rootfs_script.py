@@ -16,6 +16,7 @@ Linux/KVM host — CI does NOT build images.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -258,10 +259,12 @@ def test_preserve_success_run_does_not_inherit_injected_rc_and_is_traced() -> No
     assert "${BASH_SOURCE##*/}:${LINENO}: " in text, "PS4 must carry file:line"
 
 
-# The TEMP-DIAG breadcrumbs in build-rootfs.sh (the _diag calls bracketing
-# the post-apt stretch and each _fail_after) are DELIBERATELY NOT pinned:
-# they are Phase A diagnostics and must be removable in Phase C without
-# breaking any pin. The pins below cover only the permanent keepers.
+# The TEMP-DIAG breadcrumbs (the _diag calls bracketing the post-apt
+# stretch and each _fail_after) were Phase A diagnostics introduced
+# WITHOUT pins and were removed in the Phase C root-cause commit without
+# breaking any pin — exactly as designed. The keeper diagnostics
+# (startup env-reach note, cleanup exit-record, PS4-through-sudo-env,
+# log persistence, sudo-status line) remain pinned below.
 
 
 def test_builder_announces_fail_after_env_reach_on_startup() -> None:
@@ -285,8 +288,7 @@ def test_builder_announces_fail_after_env_reach_on_startup() -> None:
 
 def test_builder_cleanup_logs_resolved_exit_status() -> None:
     """Phase A keeper: cleanup() writes an exit-record line with its
-    RESOLVED status (natural rc after the nonzero-_RC override) — plus,
-    while the TEMP-DIAG breadcrumbs live, the last breadcrumb step.
+    RESOLVED status (natural rc after the nonzero-_RC override).
 
     Host evidence: a forced stage=copy run exited rc=1 WITHOUT the trap's
     "[rootfs] FAILED (exit 1)" banner, while "no leftover mounts" passed
@@ -302,12 +304,38 @@ def test_builder_cleanup_logs_resolved_exit_status() -> None:
     disarm = code.find("trap - EXIT INT TERM")
     final = _pos(code, 'exit "$rc"')
     assert "trap cleanup EXIT" in code, "the EXIT trap contract must be untouched"
-    record = _pos(code, 'note "diag: exit-recorder rc=$rc _RC=${_RC:-0} step=${_DIAG_N:-0}"')
+    record = _pos(code, 'note "diag: exit-recorder rc=$rc _RC=${_RC:-0}"')
     assert disarm < record < final, (
         "exit record must come after trap disarm (nothing may run before the "
         "$? capture) and before cleanup ends"
     )
     assert head < disarm, "cleanup() structurally intact"
+
+
+def test_lock_open_never_repoints_shell_stderr() -> None:
+    """ROOT-CAUSE regression (host-identified via the persisted archives).
+
+    `exec redirs` with ONLY redirections applies them PERMANENTLY to the
+    current shell. The old form
+        exec 9>"$LOCK" 2>/dev/null || echo "...running unlocked" >&2
+    opened the lock fine EVERY build — and in doing so re-bound the
+    builder shell's OWN stderr to /dev/null for the rest of the run.
+    From that line onward every stderr write vanished: the injected-
+    failure markers ("rc=1 WITHOUT the stage=copy/mount marker"),
+    die() texts, the cleanup "[rootfs] FAILED" banner and all bash -x
+    traces (six EC2 rounds worth of phantom "unrelated build failure").
+    The stderr redirection must never sit beside an `exec 9>` stdin/lock
+    open again; open-failure fallback stays the `|| echo ... >&2` WARN.
+    """
+    code = _code()
+    assert 'exec 9>"$LOCK"' in code, "the lock-open line must remain an exec fd 9"
+    assert not re.search(r"exec 9>[^\n]*2>/dev/null", code), (
+        "an stderr redirection beside exec 9 re-binds the SHELL's own "
+        "stderr permanently — the root cause of the marker-less rc=1"
+    )
+    assert "cannot open lock $LOCK; running unlocked" in code, (
+        "the unlocked-WARN fallback must stay"
+    )
 
 
 def test_harness_passes_tracing_ps4_through_sudo_env() -> None:
