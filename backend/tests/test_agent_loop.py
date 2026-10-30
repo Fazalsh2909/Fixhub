@@ -133,7 +133,9 @@ def test_on_tool_called_live(monkeypatch, tmp_path):
     calls = {"i": 0}
     script = [
         AssistantMessage("", [ToolCall("1", "read_file", {"path": "a.py"})]),
-        AssistantMessage("done", []),
+        AssistantMessage(
+            "Read the target file and verified the reported behavior end to end.", []
+        ),
     ]
 
     def fake_chat(messages, tools=None, **kw):

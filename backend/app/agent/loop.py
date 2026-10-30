@@ -192,6 +192,8 @@ def run_agent(
         )
 
     governor = _Governor()
+    # Honesty-guard flag: a degenerate stop may be re-asked once per run.
+    finish_reported = False
     for i in range(iteration_limit):
         iterations = i + 1
         if _cancelled():
@@ -263,7 +265,37 @@ def run_agent(
             # a zero diff goes to NEEDS_REVIEW (_no_changes_outcome).
             summary = (assistant.content or "").strip()[: settings.LLM_MAX_OUTPUT_BYTES]
             messages.append({"role": "assistant", "content": assistant.content or ""})
-            return LoopResult(True, summary or "done", iterations, tool_calls, events)
+            # Honesty guard (production task #76): an agent that stops with
+            # no workspace change and an empty "report" is a degenerate end
+            # — no one can act on it. Re-ask ONCE for the report itself;
+            # this never demands an edit (an explicit no-safe-fix statement
+            # with evidence is a complete finish). A run that produced work
+            # (state.changed_files) is never nagged, and a second
+            # degenerate stop ends exactly as before.
+            if (
+                not finish_reported
+                and not state.changed_files
+                and not _substantial(summary)
+            ):
+                finish_reported = True
+                _emit(
+                    {
+                        "tool": "finish_report",
+                        "args": {},
+                        "ok": True,
+                        "guarded": True,
+                        "step": tool_calls,
+                    }
+                )
+                messages.append({"role": "user", "content": FINISH_REPORT_TEXT})
+                continue
+            return LoopResult(
+                True,
+                summary or "(agent finished without a final report)",
+                iterations,
+                tool_calls,
+                events,
+            )
         # execute tools
         messages.append(
             {
@@ -514,6 +546,25 @@ REPEAT_NUDGE_WINDOW = 12
 REPEAT_NUDGE_LIMIT = 8
 REPEAT_STOP_WINDOW = 20
 REPEAT_STOP_LIMIT = 13
+
+# Honesty guard for degenerate finishes (production task #76): when the loop
+# ends on a content-only reply with zero successful workspace mutations, the
+# reply must carry a real report. Below this length it is re-asked for once;
+# a second degenerate stop ends the run as before. The pressure is toward
+# REPORTING the outcome — never toward editing.
+FINISH_MIN_SUMMARY_CHARS = 40
+FINISH_REPORT_TEXT = (
+    "Runtime note: your last reply was empty or not a report. End now with "
+    "the conclusion: the root cause and what changed in the workspace (if "
+    "anything), or — if no safe fix exists — say so explicitly with the "
+    "evidence that justifies it. Do not start new exploration and do not "
+    "edit anything new."
+)
+
+
+def _substantial(summary: str, *, min_chars: int = FINISH_MIN_SUMMARY_CHARS) -> bool:
+    """True when a final reply is substantive enough to act on."""
+    return len((summary or "").strip()) >= min_chars
 
 
 def _read_digest(content: str, head: int = 10, tail: int = 8, cap: int = 1400) -> str:

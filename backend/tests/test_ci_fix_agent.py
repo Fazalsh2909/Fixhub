@@ -2,8 +2,9 @@
 
 Covers: larger read budgets (with tail preserved), tool-name-aware history
 compaction, per-path read-cap reset on mutation, the honest content-only CI
-finish (no edit coercion: the loop ends finished=True and the service routes
-the outcome), and the max_tokens knob that keeps long edit payloads intact.
+finish (no edit coercion; a degenerate report-free stop is re-asked once
+for an honest report), and the max_tokens knob that keeps long edit
+payloads intact.
 """
 import httpx
 
@@ -236,7 +237,13 @@ def test_issue_trigger_finishes_content_only(monkeypatch, tmp_path):
     finish exactly as before."""
     import app.agent.loop as _loop
 
-    script = [AssistantMessage("done", [])]
+    script = [
+        AssistantMessage(
+            "Investigated the issue: it was already resolved by the current "
+            "code, so no change was needed.",
+            []
+        ),
+    ]
     _scripted_chat(monkeypatch, script)
     monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "content")
     out = _loop.run_agent(
@@ -247,3 +254,136 @@ def test_issue_trigger_finishes_content_only(monkeypatch, tmp_path):
         issue_body="b",
     )
     assert out.finished is True
+
+
+def test_degenerate_ci_finish_reasked_once_then_honest_end(monkeypatch, tmp_path):
+    """A content-only stop with no report (empty text, zero edits) is
+    re-asked for the report exactly once; the honest statement then ends the
+    run finished=True with zero workspace changes."""
+    import app.agent.loop as _loop
+
+    script = [
+        AssistantMessage("", []),
+        AssistantMessage(
+            "No safe fix exists: the failing step is an intentional canary "
+            "that exits 1 by design, and its workflow line is the evidence.",
+            [],
+        ),
+    ]
+    _scripted_chat(monkeypatch, script)
+    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "content")
+    seen: list[dict] = []
+    out = _loop.run_agent(
+        workspace=str(tmp_path),
+        trigger_type="ci",
+        repository="r",
+        ci_info="process completed with exit code 1",
+        on_tool=seen.append,
+    )
+    assert out.finished is True
+    assert "safe fix" in out.summary.lower()
+    assert sum(1 for e in seen if e.get("tool") == "finish_report") == 1
+    assert not any(e["tool"] in ("edit_file", "write_file") for e in seen)
+
+
+def test_done_length_stop_is_reasked_once(monkeypatch, tmp_path):
+    """A 'done'-length stop on a zero-edit run is below the substance bar:
+    the loop asks once for the actual report before accepting the finish."""
+    import app.agent.loop as _loop
+
+    script = [
+        AssistantMessage("done", []),
+        AssistantMessage(
+            "The failing workflow step exits 1 deliberately; no safe fix "
+            "exists and the workspace was left unchanged.",
+            [],
+        ),
+    ]
+    _scripted_chat(monkeypatch, script)
+    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "content")
+    seen: list[dict] = []
+    out = _loop.run_agent(
+        workspace=str(tmp_path),
+        trigger_type="ci",
+        repository="r",
+        ci_info="tests failed",
+        on_tool=seen.append,
+    )
+    assert out.finished is True
+    assert sum(1 for e in seen if e.get("tool") == "finish_report") == 1
+
+
+def test_second_degenerate_stop_ends_without_fake_report(monkeypatch, tmp_path):
+    """After the one re-ask, a second degenerate stop ends the run with the
+    explicit fallback wording instead of a fabricated 'done'."""
+    import app.agent.loop as _loop
+
+    script = [AssistantMessage("", [])]
+    _scripted_chat(monkeypatch, script)
+    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "content")
+    seen: list[dict] = []
+    out = _loop.run_agent(
+        workspace=str(tmp_path),
+        trigger_type="ci",
+        repository="r",
+        ci_info="tests failed",
+        on_tool=seen.append,
+    )
+    assert out.finished is True
+    assert out.summary == "(agent finished without a final report)"
+    assert sum(1 for e in seen if e.get("tool") == "finish_report") == 1
+
+
+def test_productive_finish_never_reasked(monkeypatch, tmp_path):
+    """A run that changed the workspace is never asked to justify its stop,
+    even with a terse final reply."""
+    import app.agent.loop as _loop
+
+    script = [
+        AssistantMessage("", [ToolCall("1", "read_file", {"path": "a.py"})]),
+        AssistantMessage(
+            "", [ToolCall("2", "edit_file", {"path": "a.py", "old": "x", "new": "y"})]
+        ),
+        AssistantMessage("Fixed.", []),
+    ]
+    _scripted_chat(monkeypatch, script)
+    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "updated a.py")
+    seen: list[dict] = []
+    out = _loop.run_agent(
+        workspace=str(tmp_path),
+        trigger_type="ci",
+        repository="r",
+        ci_info="tests failed",
+        on_tool=seen.append,
+    )
+    assert out.finished is True
+    assert out.summary == "Fixed."
+    assert not any(e.get("tool") == "finish_report" for e in seen)
+
+
+def test_issue_trigger_degenerate_stop_reasked_once(monkeypatch, tmp_path):
+    """The report guard is trigger-agnostic: a degenerate stop on an issue
+    task gets the same one re-ask for the report."""
+    import app.agent.loop as _loop
+
+    script = [
+        AssistantMessage("", []),
+        AssistantMessage(
+            "The reported failure no longer reproduces against the current "
+            "code; verified with the failing case and nothing to change.",
+            [],
+        ),
+    ]
+    _scripted_chat(monkeypatch, script)
+    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "content")
+    seen: list[dict] = []
+    out = _loop.run_agent(
+        workspace=str(tmp_path),
+        trigger_type="issue",
+        repository="r",
+        issue_title="t",
+        issue_body="b",
+        on_tool=seen.append,
+    )
+    assert out.finished is True
+    assert sum(1 for e in seen if e.get("tool") == "finish_report") == 1
