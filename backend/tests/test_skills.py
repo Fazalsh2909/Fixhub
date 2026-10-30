@@ -73,12 +73,15 @@ def test_registry_issue_selects_fix_issues():
     assert "UNDERSTAND" in _skills.skill_prompt(s)
 
 
-def test_registry_ci_selects_fix_ci_cd():
+def test_registry_ci_selects_ci_repair():
     s = _skills.resolve_skill("ci")
-    assert s.name == "fix-ci-cd"
+    assert s.name == "ci-repair"
+    assert s.doc_path == "CI_REPAIR.md"
     prompt = _skills.skill_prompt(s)
     assert "not to make the run report success" in prompt
     assert "continue-on-error" in prompt
+    # The honest-finish contract is part of the instruction doc itself.
+    assert "finish without editing" in prompt
 
 
 def test_registry_unknown_raises():
@@ -89,7 +92,7 @@ def test_registry_unknown_raises():
 
 def test_registry_case_insensitive_trims():
     assert _skills.resolve_skill("  Issue ").name == "fix-issues"
-    assert _skills.resolve_skill("CI").name == "fix-ci-cd"
+    assert _skills.resolve_skill("CI").name == "ci-repair"
 
 
 def test_loop_unknown_trigger_blocked(tmp_path, monkeypatch):
@@ -242,7 +245,7 @@ def test_service_ci_records_skill_selected(db, tmp_path, monkeypatch):
         .filter(TaskEvent.task_id == task.id, TaskEvent.type == "SKILL_SELECTED")
         .first()
     )
-    assert sel is not None and json.loads(sel.data_json)["skill"] == "fix-ci-cd"
+    assert sel is not None and json.loads(sel.data_json)["skill"] == "ci-repair"
 
 
 def test_service_unknown_trigger_blocked(db, tmp_path, monkeypatch):
@@ -321,3 +324,134 @@ def test_service_missing_issue_body_still_routes(db, tmp_path, monkeypatch):
     )
     out = _svc.run_task_inline(task.id, source=remote)
     assert out["status"] == "COMPLETED", out
+
+
+_CANARY_WORKFLOW = (
+    "name: ci\non: [push]\njobs:\n  t:\n    runs-on: ubuntu-latest\n"
+    "    steps:\n"
+    "      - name: tests\n"
+    "        run: python -m pytest tests/ -q\n"
+    "      - name: FixHub canary (deliberate failure)\n"
+    "        run: exit 1\n"
+)
+
+
+def _ci_task_row(db, remote, repository):
+    head_sha = _git(remote, "rev-parse", "HEAD").stdout.strip()
+    db.add(
+        Task(
+            repository=repository,
+            trigger_type="ci",
+            ci_job="t",
+            ci_workflow="ci",
+            ci_sha=head_sha,
+            ci_url="http://ci/1",
+            ci_excerpt="process completed with exit code 1",
+            status="RUNNING",
+        )
+    )
+    db.commit()
+    return db.query(Task).order_by(Task.id.desc()).first()
+
+
+def test_service_ci_no_change_ci_red_is_needs_review(db, tmp_path, monkeypatch):
+    """Regression: an intentional CI failure (deliberate canary step) ends
+    with zero workspace edits, and the honest loop finish routes through
+    _no_changes_outcome to NEEDS_REVIEW (no_changes_ci_red) — never a fake
+    COMPLETED and never FAILED."""
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "WORKSPACE_ROOT", str(tmp_path / "ws5"))
+    remote = _fixture_repo(
+        tmp_path,
+        files={
+            "app.py": "def f():\n    return 1\n",
+            "tests/test_f.py": "from app import f\ndef test_f():\n    assert f() == 1\n",
+            ".github/workflows/ci.yml": _CANARY_WORKFLOW,
+        },
+    )
+    task = _ci_task_row(db, remote, "acme/ci-no-change")
+    _script(
+        monkeypatch,
+        [
+            AssistantMessage(
+                "", [ToolCall("1", "read_file", {"path": ".github/workflows/ci.yml"})]
+            ),
+            AssistantMessage(
+                "The failing step is an intentional canary; no safe fix "
+                "exists — left unchanged for human review.",
+                [],
+            ),
+        ],
+    )
+    out = _svc.run_task_inline(task.id, source=remote)
+    assert out["status"] == "NEEDS_REVIEW", out
+    assert out.get("no_changes") is True
+    review = (
+        db.query(TaskEvent)
+        .filter(TaskEvent.task_id == task.id, TaskEvent.type == "NEEDS_REVIEW")
+        .first()
+    )
+    assert json.loads(review.data_json)["reason"] == "no_changes_ci_red"
+    db.expire_all()
+    row = db.query(Task).filter(Task.id == task.id).first()
+    assert row.status == "NEEDS_REVIEW"
+
+
+def test_service_ci_workflow_step_removal_blocked_at_publish(db, tmp_path, monkeypatch):
+    """Regression: 'fixing' CI by deleting a workflow run step dies at the
+    publishing gate (ci_weakening_detected); nothing is ever pushed."""
+    from app.config import settings as _settings
+
+    monkeypatch.setattr(_settings, "WORKSPACE_ROOT", str(tmp_path / "ws6"))
+    monkeypatch.setattr(_settings, "CI_WEAKENING_GATE", "block")
+    remote = _fixture_repo(
+        tmp_path,
+        files={
+            "app.py": "def f():\n    return 1\n",
+            ".github/workflows/ci.yml": _CANARY_WORKFLOW,
+        },
+    )
+    task = _ci_task_row(db, remote, "acme/ci-gate")
+    _script(
+        monkeypatch,
+        [
+            AssistantMessage(
+                "", [ToolCall("1", "read_file", {"path": ".github/workflows/ci.yml"})]
+            ),
+            AssistantMessage(
+                "",
+                [
+                    ToolCall(
+                        "2",
+                        "edit_file",
+                        {
+                            "path": ".github/workflows/ci.yml",
+                            "old": (
+                                "      - name: tests\n"
+                                "        run: python -m pytest tests/ -q\n"
+                                "      - name: FixHub canary (deliberate failure)\n"
+                                "        run: exit 1\n"
+                            ),
+                            "new": (
+                                "      - name: tests\n"
+                                "        run: python -m pytest tests/ -q\n"
+                            ),
+                        },
+                    )
+                ],
+            ),
+            AssistantMessage("Removed the failing step.", []),
+        ],
+    )
+    out = _svc.run_task_inline(task.id, source=remote)
+    assert out["status"] == "BLOCKED", out
+    assert "ci_weakening_detected" in (out.get("error") or "")
+    db.expire_all()
+    row = db.query(Task).filter(Task.id == task.id).first()
+    assert row.status == "BLOCKED"
+    types = [
+        e.type for e in db.query(TaskEvent).filter(TaskEvent.task_id == task.id).all()
+    ]
+    assert "CI_WEAKENING_WARNING" in types
+    assert "BLOCKED" in types

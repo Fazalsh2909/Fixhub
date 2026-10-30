@@ -1444,30 +1444,6 @@ def _usage_limit_reason(db, task: Task, buf: list[dict] | None = None) -> str:
     return ""
 
 
-def _usage_fraction(db, task: Task, buf: list[dict] | None = None) -> float:
-    """0..1 fraction of the binding task budget already consumed.
-
-    Advisory only: it drives the loop's converge nudge. The hard stop remains
-    ``_usage_limit_reason``. Returns 0 when no budget is configured.
-    """
-    max_req, cap_in, _ = _binding_limits(task)
-    frac = 0.0
-    if max_req > 0:
-        frac = max(
-            frac,
-            (_task_request_total(db, task.id) + len(buf or [])) / max_req,
-        )
-    if cap_in > 0:
-        committed_in, _ = _task_token_totals(db, task.id)
-        buf_in = sum(
-            int(r.get("input_tokens") or 0)
-            for r in (buf or [])
-            if r.get("input_tokens") is not None
-        )
-        frac = max(frac, ((committed_in or 0) + buf_in) / cap_in)
-    return max(0.0, min(1.0, frac))
-
-
 def _preserve_partial_work(db, task: Task, path: str, reason: str) -> dict | None:
     """NEEDS_REVIEW instead of FAILED+wipe when the workspace holds real work.
 

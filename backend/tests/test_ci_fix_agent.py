@@ -1,9 +1,9 @@
 """CI-repair capability test suite (A1–A6).
 
 Covers: larger read budgets (with tail preserved), tool-name-aware history
-compaction, per-path read-cap reset on mutation, convergence directives for
-edit-free stretches, the finish guard that refuses a content-only CI end with
-zero edits, and the max_tokens knob that keeps long edit payloads intact.
+compaction, per-path read-cap reset on mutation, the honest content-only CI
+finish (no edit coercion: the loop ends finished=True and the service routes
+the outcome), and the max_tokens knob that keeps long edit payloads intact.
 """
 import httpx
 
@@ -17,8 +17,8 @@ def test_ci_capability_settings_present():
     assert s.LLM_MAX_TOKENS == 4096
     assert s.LLM_READ_RESULT_MAX_CHARS == 10000
     assert s.LLM_CONTEXT_MAX_CHARS == 32768
-    assert s.LLM_CI_DIRECTIVE_AFTER == 6
-    assert s.LLM_CI_DIRECTIVE_FINAL == 12
+    # The CI iteration backstop stays; the converge-directive knobs are gone.
+    assert s.LLM_CI_MAX_ITERATIONS == 100
 
 
 def _cfg(monkeypatch):
@@ -152,8 +152,8 @@ def test_failed_mutation_does_not_reset_path_read_cap(monkeypatch):
     assert blocked is not None and blocked.startswith("ERROR")
 
 
-def _scripted_chat(monkeypatch, script, tracker=None):
-    """Script the loop's LLM and record outbound user notes (-directive tests)."""
+def _scripted_chat(monkeypatch, script):
+    """Script the loop's LLM (test_agent_loop.py conventions)."""
     import app.agent.loop as _loop
 
     calls = {"i": 0}
@@ -161,58 +161,26 @@ def _scripted_chat(monkeypatch, script, tracker=None):
     def fake_chat(messages, tools=None, **kw):
         m = script[min(calls["i"], len(script) - 1)]
         calls["i"] += 1
-        if tracker is not None:
-            tracker.extend(
-                str(m.get("content", ""))
-                for m in messages
-                if m.get("role") == "user" and str(m.get("content", "")).startswith("Runtime note:")
-            )
         return m
 
     monkeypatch.setattr(_loop._llm, "chat_completion", fake_chat)
     return calls
 
 
-def test_finish_guard_refuses_fake_completion_then_recovers(monkeypatch, tmp_path):
-    """A content-only finish with zero edits gets exactly one demand-to-edit
-    turn; after a real edit the loop finishes honestly (A4)."""
+def test_ci_edit_flow_finishes_without_coercion(monkeypatch, tmp_path):
+    """Ordinary application-code CI failure: read -> edit -> finish, with no
+    coercion machinery anywhere (the finish_guard event must be gone)."""
     import app.agent.loop as _loop
 
     script = [
-        AssistantMessage("Investigated; nothing to change.", []),
+        AssistantMessage("", [ToolCall("1", "read_file", {"path": "app.py"})]),
         AssistantMessage(
-            "", [ToolCall("1", "edit_file", {"path": "ci.yml", "old": "a", "new": "b"})]
+            "", [ToolCall("2", "edit_file", {"path": "app.py", "old": "a", "new": "b"})]
         ),
-        AssistantMessage("Fixed the failing step.", []),
+        AssistantMessage("Fixed the failing case.", []),
     ]
     _scripted_chat(monkeypatch, script)
-    monkeypatch.setattr(
-        _loop, "_execute", lambda ws, name, args: "updated ci.yml"
-    )
-    seen: list[dict] = []
-    out = _loop.run_agent(
-        workspace=str(tmp_path),
-        trigger_type="ci",
-        repository="r",
-        ci_info="lint failed at line 12",
-        on_tool=seen.append,
-    )
-    assert out.finished is True
-    assert any(e.get("tool") == "finish_guard" for e in seen)
-    assert any(e["tool"] == "edit_file" and e["ok"] for e in seen)
-
-
-def test_finish_guard_second_refusal_ends_without_fix_claim(monkeypatch, tmp_path):
-    """After the guard is given once, a second edit-free finish is an honest
-    NOT-finished result (never a false COMPLETED)."""
-    import app.agent.loop as _loop
-
-    script = [
-        AssistantMessage("Nothing needs changing.", []),
-        AssistantMessage("Still nothing to change.", []),
-    ]
-    _scripted_chat(monkeypatch, script)
-    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "content")
+    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "updated app.py")
     seen: list[dict] = []
     out = _loop.run_agent(
         workspace=str(tmp_path),
@@ -221,13 +189,51 @@ def test_finish_guard_second_refusal_ends_without_fix_claim(monkeypatch, tmp_pat
         ci_info="tests failed",
         on_tool=seen.append,
     )
-    assert out.finished is False
-    assert "no fix applied" in out.summary
-    assert sum(1 for e in seen if e.get("tool") == "finish_guard") == 1
+    assert out.finished is True
+    assert any(e["tool"] == "edit_file" and e.get("ok") for e in seen)
+    assert not any(e.get("tool") == "finish_guard" for e in seen)
+
+
+def test_ci_intentional_failure_finishes_without_edit(monkeypatch, tmp_path):
+    """An intentional CI failure (a deliberate-failure canary) may end with
+    zero workspace changes: the loop returns finished=True with the model's
+    honest summary instead of demanding an edit."""
+    import app.agent.loop as _loop
+
+    script = [
+        AssistantMessage(
+            "",
+            [
+                ToolCall(
+                    "1", "read_file", {"path": ".github/workflows/ci.yml"}
+                )
+            ],
+        ),
+        AssistantMessage(
+            "The failing step is an intentional canary; no safe fix exists — "
+            "left unchanged for review.",
+            [],
+        ),
+    ]
+    _scripted_chat(monkeypatch, script)
+    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "name: ci")
+    seen: list[dict] = []
+    out = _loop.run_agent(
+        workspace=str(tmp_path),
+        trigger_type="ci",
+        repository="r",
+        ci_info="deliberate failure step",
+        on_tool=seen.append,
+    )
+    assert out.finished is True
+    assert "no safe fix" in out.summary
+    assert not any(e["tool"] in ("edit_file", "write_file") for e in seen)
+    assert not any(e.get("tool") == "finish_guard" for e in seen)
 
 
 def test_issue_trigger_finishes_content_only(monkeypatch, tmp_path):
-    """The finish guard is CI-specific: issue tasks finish as before."""
+    """Content-only replies end the loop for every trigger; issue tasks
+    finish exactly as before."""
     import app.agent.loop as _loop
 
     script = [AssistantMessage("done", [])]
@@ -241,71 +247,3 @@ def test_issue_trigger_finishes_content_only(monkeypatch, tmp_path):
         issue_body="b",
     )
     assert out.finished is True
-
-
-def test_convergence_directive_fires_once(monkeypatch, tmp_path):
-    """After N dry requests the loop injects the act-now note; a successful
-    edit resets the counter and the final note is not needed (A3)."""
-    import app.agent.loop as _loop
-
-    monkeypatch.setattr(settings, "LLM_CI_DIRECTIVE_AFTER", 2)
-    monkeypatch.setattr(settings, "LLM_CI_DIRECTIVE_FINAL", 5)
-    notes: list[str] = []
-    script = [
-        AssistantMessage("", [ToolCall("1", "read_file", {"path": "a.py"})]),
-        AssistantMessage("", [ToolCall("2", "read_file", {"path": "a.py"})]),
-        AssistantMessage("", [ToolCall("3", "read_file", {"path": "a.py"})]),
-        AssistantMessage(
-            "",
-            [ToolCall("4", "edit_file", {"path": "a.py", "old": "x", "new": "y"})],
-        ),
-        AssistantMessage("Fixed it.", []),
-    ]
-    _scripted_chat(monkeypatch, script, tracker=notes)
-    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "updated a.py")
-    out = _loop.run_agent(
-        workspace=str(tmp_path),
-        trigger_type="ci",
-        repository="r",
-        ci_info="step failed",
-    )
-    assert out.finished is True
-    assert any("concrete edit" in n for n in notes)
-    # The note is delivered once; later outbound windows replay it as history,
-    # so count distinct texts, not occurrences.
-    assert len({n for n in notes if "concrete edit" in n}) == 1
-    assert not any("final phase" in n for n in notes)
-
-
-def test_convergence_final_directive_used_second(monkeypatch, tmp_path):
-    """The second directive (final phase) is the one used at the FINAL
-    threshold; at most two convergence notes ever appear."""
-    import app.agent.loop as _loop
-
-    monkeypatch.setattr(settings, "LLM_CI_DIRECTIVE_AFTER", 1)
-    monkeypatch.setattr(settings, "LLM_CI_DIRECTIVE_FINAL", 3)
-    notes: list[str] = []
-    script = [
-        AssistantMessage("", [ToolCall("1", "read_file", {"path": "a.py"})]),
-        AssistantMessage("", [ToolCall("2", "read_file", {"path": "a.py"})]),
-        AssistantMessage("", [ToolCall("3", "read_file", {"path": "a.py"})]),
-        AssistantMessage(
-            "",
-            [ToolCall("4", "edit_file", {"path": "a.py", "old": "x", "new": "y"})],
-        ),
-        AssistantMessage("Fixed it.", []),
-    ]
-    _scripted_chat(monkeypatch, script, tracker=notes)
-    monkeypatch.setattr(_loop, "_execute", lambda ws, name, args: "updated a.py")
-    out = _loop.run_agent(
-        workspace=str(tmp_path),
-        trigger_type="ci",
-        repository="r",
-        ci_info="step failed",
-    )
-    # Request 1 -> AFTER note; request 3 -> FINAL note at the FINAL threshold
-    # (before the edit at request 4). Later outbound windows replay each note
-    # as history, so count distinct texts: one delivery each, two total.
-    assert out.finished is True
-    assert len({n for n in notes if "final phase" in n}) == 1
-    assert len({n for n in notes if "concrete edit" in n}) == 1

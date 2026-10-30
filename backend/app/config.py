@@ -75,12 +75,6 @@ class Settings(BaseSettings):
     # provider re-charges the whole context on every call, and the old
     # 16-request default was exhausted by investigation alone.
     LLM_CI_MAX_REQUESTS_PER_TASK: int = 30
-    # Convergence pacing for CI tasks: after this many consecutive LLM
-    # requests without a successful workspace mutation, inject one user note
-    # (AFTER = act now, FINAL = last push before the useful budget is spent).
-    # At most two notes per run; a successful edit resets the counter.
-    LLM_CI_DIRECTIVE_AFTER: int = 6
-    LLM_CI_DIRECTIVE_FINAL: int = 12
     LLM_MAX_RUNTIME_S: int = 3600
     LLM_MAX_OUTPUT_BYTES: int = 200_000
 

@@ -1,4 +1,4 @@
-"""Deterministic trigger -> skill resolution. No plugins, no config knobs."""
+"""Deterministic trigger -> instruction-doc resolution. No plugins, no knobs."""
 
 from __future__ import annotations
 
@@ -15,8 +15,7 @@ class UnknownSkill(ValueError):
 class Skill:
     name: str
     trigger: str  # "issue" | "ci"
-    doc_path: str
-    phases: tuple[str, ...]
+    doc_path: str  # resolved by the loader (skills/ or instructions/)
 
 
 SKILLS: dict[str, Skill] = {
@@ -24,31 +23,11 @@ SKILLS: dict[str, Skill] = {
         name="fix-issues",
         trigger="issue",
         doc_path="fix_issues.md",
-        phases=(
-            "UNDERSTAND",
-            "INVESTIGATE",
-            "REPRODUCE",
-            "DIAGNOSE",
-            "IMPLEMENT",
-            "VALIDATE",
-            "FINISH",
-        ),
     ),
-    "fix-ci-cd": Skill(
-        name="fix-ci-cd",
+    "ci-repair": Skill(
+        name="ci-repair",
         trigger="ci",
-        doc_path="fix_ci_cd.md",
-        phases=(
-            "IDENTIFY",
-            "INSPECT",
-            "READ_ERROR",
-            "TRACE",
-            "REPRODUCE",
-            "DIAGNOSE",
-            "FIX",
-            "VALIDATE",
-            "FINISH",
-        ),
+        doc_path="CI_REPAIR.md",
     ),
 }
 
@@ -56,14 +35,14 @@ SKILLS: dict[str, Skill] = {
 def resolve_skill(trigger_type: str, **_ignored) -> Skill:
     """Map a task trigger to its skill. Raises UnknownSkill on anything else.
 
-    Only "issue" and "ci" are supported in Phase 1. Empty, None-equivalent,
-    or any other value fails safely instead of defaulting to the wrong skill.
+    Only "issue" and "ci" are supported. Empty, None-equivalent, or any other
+    value fails safely instead of defaulting to the wrong skill.
     """
     trig = (trigger_type or "").strip().lower()
     if trig == "issue":
         return SKILLS["fix-issues"]
     if trig == "ci":
-        return SKILLS["fix-ci-cd"]
+        return SKILLS["ci-repair"]
     raise UnknownSkill(f"unsupported trigger type: {trigger_type!r}")
 
 
