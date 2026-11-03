@@ -1,6 +1,8 @@
 """Minimal GitHub API client (httpx). Used for PR creation + Actions log excerpts."""
 from __future__ import annotations
 
+import re
+
 import httpx
 
 from app.config import settings
@@ -506,3 +508,159 @@ def list_installations(*, app_jwt: str) -> list[dict]:
             {"id": str(inst.get("id", "")), "account": acct.get("login", ""), "type": acct.get("type", "")}
         )
     return out
+
+
+# --- User access token surfaces (install-ownership fix) ---------------------
+#
+# These endpoints answer "which installations/repositories can THIS GITHUB
+# USER access" using a user-to-server token from the GitHub App web
+# application flow. They are the authoritative ownership proof per GitHub's
+# docs — the App-wide `/app/installations` JWT listing is NOT usable as
+# user attribution. (The JWT list below stays for webhook/app-level use.)
+
+_GITHUB_WEB_HOST = "https://github.com"
+
+_MAX_LINK_PAGES = 10  # 10 x per_page(100) = 1000 items per resource, bounded
+
+
+def _next_link(resp) -> str | None:
+    """rel="next" target from a GitHub list response, defensively parsed."""
+    try:  # prefer httpx's parsed Link header when available
+        nxt = (resp.links or {}).get("next") or {}
+        if nxt.get("url"):
+            return str(nxt["url"])
+    except Exception:
+        pass
+    header = resp.headers.get("link") or ""
+    match = re.search(r'<([^>]+)>;\s*rel="?next"?', header, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def get_user_identity(*, token: str) -> dict:
+    """GET /user with a user access token. Returns {id, login}. Raises on API failure."""
+    url = f"{settings.GITHUB_API_URL}/user"
+    resp = httpx.get(url, headers=_headers(token), timeout=30)
+    resp.raise_for_status()
+    d = resp.json()
+    return {"id": int(d.get("id") or 0), "login": str(d.get("login") or "")}
+
+
+def _user_token_pages(url: str, *, token: str, params: dict | None = None):
+    """Yield each list-page payload, following GitHub's Link: rel="next".
+
+    Stopping after page 1 silently cut repos beyond it off: a repository
+    omitted from the first 100 was un-connectable (404 at connect time) and
+    invisible in /api/github/repos. The loop removes that ceiling while
+    staying bounded; API errors raise exactly as before.
+    """
+    visited = 0
+    while url and visited < _MAX_LINK_PAGES:
+        resp = httpx.get(url, headers=_headers(token), params=params, timeout=30)
+        resp.raise_for_status()
+        yield resp.json()
+        # The next link is the complete URL (scheme + query); no params needed.
+        url, params = _next_link(resp), None
+        visited += 1
+
+
+def list_user_installations(*, token: str, limit: int = 300) -> list[dict]:
+    """GET /user/installations: App installations the token's USER can access.
+
+    Raises on API failure. Returns [{id, account, type}] with the numeric
+    installation ids (as strings) — GitHub's own access statement, never a
+    client-supplied or App-wide enumeration. All Link pages are followed
+    (up to _MAX_LINK_PAGES) and sliced to `limit`.
+    """
+    url = f"{settings.GITHUB_API_URL}/user/installations"
+    out: list[dict] = []
+    for page in _user_token_pages(url, token=token, params={"per_page": 100}):
+        for inst in (page.get("installations", []) if isinstance(page, dict) else []):
+            acct = inst.get("account") or {}
+            out.append(
+                {
+                    "id": str(inst.get("id", "")),
+                    "account": acct.get("login", ""),
+                    "type": acct.get("type", ""),
+                }
+            )
+    return out[:limit]
+
+
+def list_user_installation_repos(
+    *, token: str, installation_id: str | int, limit: int = 300
+) -> list[dict]:
+    """GET /user/installations/{id}/repositories: repos the USER can access
+    inside one installation (404/403 when it is not accessible to them).
+
+    Raises on API failure. Same dict shape as list_installation_repos. All
+    Link pages are followed (up to _MAX_LINK_PAGES) and sliced to `limit`.
+    """
+    url = (
+        f"{settings.GITHUB_API_URL}/user/installations/{installation_id}/repositories"
+    )
+    out: list[dict] = []
+    for page in _user_token_pages(url, token=token, params={"per_page": 100}):
+        for r in (page.get("repositories", []) if isinstance(page, dict) else []):
+            out.append(
+                {
+                    "full_name": r.get("full_name", ""),
+                    "private": bool(r.get("private", False)),
+                    "default_branch": r.get("default_branch") or "main",
+                }
+            )
+    return out[:limit]
+
+
+def exchange_authorization_code(
+    *, code: str, code_verifier: str = "", redirect_uri: str = ""
+) -> dict:
+    """GitHub Apps web application flow step 3: exchange the one-time code.
+
+    POST https://github.com/login/oauth/access_token with client_id +
+    client_secret. Returns the raw token response dict (access_token, optional
+    expires_in/refresh_token/refresh_token_expires_in). Raises on API failure
+    or GitHub error payloads. `Accept: application/json` is required — the
+    default response is form-encoded.
+    """
+    oauth_url = f"{_GITHUB_WEB_HOST}/login/oauth/access_token"
+    data: dict = {
+        "client_id": settings.GITHUB_APP_CLIENT_ID,
+        "client_secret": settings.GITHUB_APP_CLIENT_SECRET,
+        "code": code,
+    }
+    if code_verifier:
+        data["code_verifier"] = code_verifier
+    if redirect_uri:
+        data["redirect_uri"] = redirect_uri
+    resp = httpx.post(
+        oauth_url,
+        json=data,
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    d = resp.json()
+    if not d.get("access_token"):
+        raise ValueError(f"github oauth error: {d.get('error') or 'no access_token'}")
+    return d
+
+
+def refresh_user_access_token(*, refresh_token: str) -> dict:
+    """Refresh an expiring user access token (grant_type=refresh_token)."""
+    oauth_url = f"{_GITHUB_WEB_HOST}/login/oauth/access_token"
+    resp = httpx.post(
+        oauth_url,
+        json={
+            "client_id": settings.GITHUB_APP_CLIENT_ID,
+            "client_secret": settings.GITHUB_APP_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    d = resp.json()
+    if not d.get("access_token"):
+        raise ValueError(f"github oauth error: {d.get('error') or 'no access_token'}")
+    return d

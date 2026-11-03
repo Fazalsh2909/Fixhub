@@ -1703,7 +1703,9 @@ def run_task_inline(
 
             _root_failures = _preflight.preflight_workspace_root()
         except Exception as exc:  # preflight must not crash the pipeline
-            _root_failures = [f"<preflight-error: {str(exc)[:120]}>"]
+            _root_failures = [
+                f"<preflight-error: {_ws.redact_url_credentials(str(exc))[:120]}>"
+            ]
         if _root_failures:
             _set(
                 db,
@@ -1834,7 +1836,10 @@ def run_task_inline(
                 db,
                 task,
                 status="BLOCKED",
-                error=f"sandbox/workspace unavailable: {exc}",
+                error=(
+                    f"sandbox/workspace unavailable: "
+                    f"{_ws.redact_url_credentials(str(exc))}"
+                )[:1000],
             )
             _event(db, task.id, "BLOCKED", {"reason": "workspace_failed"})
             db.commit()

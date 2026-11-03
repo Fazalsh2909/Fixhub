@@ -13,17 +13,25 @@ from tests.conftest import make_user, session_cookies
 
 
 def _owned(db, email, repo_name, task_status="RUNNING"):
-    """Seed one user + connected repo + task. Returns (user, cookies, repo, task)."""
-    from app.db.models import GitHubConnection
+    """Seed one user + verified GitHub identity + connected repo + task."""
+    from tests.conftest import make_github_identity
 
     u = make_user(db, email=email)
+    inst = "inst-" + email
+    # Distinct per-user tokens so per-user GitHub mocks can be keyed safely.
+    gh_id = make_github_identity(
+        db, u, login=email.split("@")[0], installations=(inst,),
+        token="tok-inst-" + email,
+    )
     repo = Repository(
-        github_full_name=repo_name, installation_id="inst-" + email, owner_id=u.id
+        github_full_name=repo_name,
+        installation_id=inst,
+        owner_id=u.id,
+        github_user_id=gh_id,
     )
     db.add(repo)
     db.commit()
     db.refresh(repo)
-    db.add(GitHubConnection(user_id=u.id, installation_id="inst-" + email))
     task = Task(
         repository=repo_name,
         repository_id=repo.id,
@@ -160,9 +168,32 @@ def test_sequential_id_guessing_blocked(db):
     assert c.get("/api/tasks/999999", cookies=cb).status_code == 404
 
 
-def test_client_user_id_tampering_ignored(db):
+def test_client_user_id_tampering_ignored(db, monkeypatch):
+    from app.github import client as _gh
+
     ua, ca, ra, ta = _owned(db, "a9@example.com", "acme/a9")
     ub, cb, _, _ = _owned(db, "b9@example.com", "acme/b9")
+    # GitHub-truth: A's own install for A's token; nothing for B's token.
+    # Stubs are mandatory here so the tampering test never touches the
+    # live GitHub API.
+    monkeypatch.setattr(
+        _gh,
+        "list_user_installations",
+        lambda *, token: (
+            [{"id": "inst-a9@example.com", "account": "a9", "type": "User"}]
+            if token == "tok-inst-a9@example.com"
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        _gh,
+        "list_user_installation_repos",
+        lambda *, token, installation_id: (
+            [{"full_name": "acme/a9", "private": False, "default_branch": "main"}]
+            if token == "tok-inst-a9@example.com"
+            else []
+        ),
+    )
     c = TestClient(app)
     # from-issue with another repo: B cannot create tasks on A's repo.
     r = c.post(

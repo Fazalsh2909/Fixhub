@@ -161,22 +161,39 @@ def test_meaningful_changes_and_commit_push(tmp_path):
     assert "app.py" in _pub.changed_files(work)
 
 
-def test_installed_repos_merges_connected(db, monkeypatch):
+def test_installed_repos_lists_only_users_verified_installations(db, monkeypatch):
     from app.db.models import Repository
-    from app.github import app_auth as _auth
+    from tests.conftest import make_github_identity
+
     from app.github import client as _gh
 
     u, cookies = _authed(db)
-    db.add(Repository(github_full_name="u/connected", installation_id="99", owner_id=u.id))
+    gh_id = make_github_identity(
+        db, u, github_user_id=501, login="u", token="tok-ghu-u", installations=("99",)
+    )
+    db.add(
+        Repository(
+            github_full_name="u/connected",
+            installation_id="99",
+            owner_id=u.id,
+            github_user_id=gh_id,
+        )
+    )
     db.commit()
-    monkeypatch.setattr(_auth, "app_jwt", lambda: "jwt")
-    monkeypatch.setattr(_auth, "installation_token", lambda iid: "tok")
-    monkeypatch.setattr(_gh, "list_installations", lambda **k: [
-        {"id": "99", "account": "u", "type": "User"}])
-    monkeypatch.setattr(_gh, "list_installation_repos", lambda **k: [
-        {"full_name": "u/connected", "private": False, "default_branch": "main"},
-        {"full_name": "u/newrepo", "private": True, "default_branch": "main"},
-    ])
+    # GitHub data comes strictly from this user's own access token surfaces.
+    monkeypatch.setattr(
+        _gh,
+        "list_user_installations",
+        lambda *, token: [{"id": "99", "account": "u", "type": "User"}],
+    )
+    monkeypatch.setattr(
+        _gh,
+        "list_user_installation_repos",
+        lambda *, token, installation_id: [
+            {"full_name": "u/connected", "private": False, "default_branch": "main"},
+            {"full_name": "u/newrepo", "private": True, "default_branch": "main"},
+        ],
+    )
     c = TestClient(app)
     r = c.get("/api/github/repos", cookies=cookies)
     assert r.status_code == 200, r.text
@@ -188,19 +205,55 @@ def test_installed_repos_merges_connected(db, monkeypatch):
     assert by_name["u/newrepo"]["installation_id"] == "99"
 
 
-def test_installed_repos_degrades_per_installation(db, monkeypatch):
-    from app.github import app_auth as _auth
+def test_installed_repos_requires_github_authorization(db, monkeypatch):
+    """Install-ownership fix: without a verified GitHub identity the endpoint
+    returns 400 + the OAuth start URL instead of the App-wide enumeration."""
+    _, cookies = _authed(db, email="git-noauth@example.com")
     from app.github import client as _gh
 
-    _, cookies = _authed(db, email="git2@example.com")
-    monkeypatch.setattr(_auth, "app_jwt", lambda: "jwt")
-    monkeypatch.setattr(_gh, "list_installations", lambda **k: [
-        {"id": "1", "account": "a", "type": "User"}])
-    monkeypatch.setattr(_auth, "installation_token",
-                        lambda iid: (_ for _ in ()).throw(RuntimeError("nope")))
+    def _never(*a, **k):
+        raise AssertionError("App JWT / App-wide listing must not be called")
+
+    monkeypatch.setattr(_gh, "list_installations", _never)
+    monkeypatch.setattr(_gh, "list_user_installations", _never)
     c = TestClient(app)
     r = c.get("/api/github/repos", cookies=cookies)
-    assert r.status_code == 200 and r.json()[0]["repos"] == []
+    assert r.status_code == 400, r.text
+    body = r.json()
+    assert body["github_authorization_required"] is True
+    assert body["start_url"] == "/api/github/install/start"
+
+
+def test_installed_repos_degrades_per_installation(db, monkeypatch):
+    from tests.conftest import make_github_identity
+
+    from app.github import client as _gh
+
+    u, cookies = _authed(db, email="git2@example.com")
+    make_github_identity(
+        db, u, github_user_id=602, login="b", token="tok-ghu-b2", installations=("2",)
+    )
+    monkeypatch.setattr(
+        _gh,
+        "list_user_installations",
+        lambda *, token: [
+            {"id": "1", "account": "a", "type": "User"},
+            {"id": "2", "account": "b", "type": "User"},
+        ],
+    )
+
+    def _repos(*, token, installation_id):
+        if installation_id == "1":
+            raise RuntimeError("nope")
+        return [{"full_name": "b/ok", "private": True, "default_branch": "main"}]
+
+    monkeypatch.setattr(_gh, "list_user_installation_repos", _repos)
+    c = TestClient(app)
+    r = c.get("/api/github/repos", cookies=cookies)
+    assert r.status_code == 200, r.text
+    groups = {g["installation_id"]: g for g in r.json()}
+    assert groups["1"]["repos"] == []
+    assert groups["2"]["repos"][0]["github_full_name"] == "b/ok"
 
 
 def test_task_detail_api(db):

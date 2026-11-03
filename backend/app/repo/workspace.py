@@ -6,6 +6,7 @@ added in the GitHub phase; token is embedded in the clone URL and never logged.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -17,6 +18,30 @@ from app.config import settings
 
 class WorkspaceError(RuntimeError):
     pass
+
+
+# scheme://user:pass@  — keep the username (context), redact the password.
+_URL_CRED_RE = re.compile(
+    r"(?P<scheme>[a-zA-Z][\w+.-]*)://(?P<user>[^/@\s:]+):(?P<pass>[^@\s/]+)@"
+)
+# scheme://bare-user@  (no password) — over-redact the whole userinfo; the
+# pattern excludes ':' so an already-redacted `user:***@` is never re-hit.
+_URL_BARE_USER_RE = re.compile(
+    r"(?P<scheme>[a-zA-Z][\w+.-]*)://(?P<userinfo>[^/@\s:]+)@"
+)
+
+
+def redact_url_credentials(text: str) -> str:
+    """Strip credentials from URLs embedded in error text.
+
+    `git clone` echoes the source URL in failure stderr; when the source is
+    the installation-token clone URL (`.../x-access-token:<ghs_...>@github`)
+    the raw token must never reach `task.error`, which the browser can read.
+    """
+    if not text:
+        return text or ""
+    text = _URL_CRED_RE.sub(r"\g<scheme>://\g<user>:***@", text)
+    return _URL_BARE_USER_RE.sub(r"\g<scheme>://***@", text)
 
 
 def _on_rm_error(func, path: str, _exc_info) -> None:
@@ -90,7 +115,9 @@ def clone_repo(source: str, task_id: int | str, branch: str = "") -> str:
     cmd = ["git", "clone", "--quiet", source, path]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if proc.returncode != 0:
-        raise WorkspaceError(f"clone failed: {proc.stderr[-500:]}")
+        raise WorkspaceError(
+            f"clone failed: {redact_url_credentials(proc.stderr)[-500:]}"
+        )
     if branch:
         proc = subprocess.run(
             ["git", "checkout", branch], cwd=path, capture_output=True, text=True, timeout=60

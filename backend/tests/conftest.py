@@ -98,6 +98,63 @@ def session_cookies(db, user) -> dict:
     return {settings.AUTH_COOKIE_NAME: raw}
 
 
+def make_github_identity(
+    db,
+    user,
+    *,
+    github_user_id: int | None = None,
+    login: str = "acme",
+    installations: tuple[str, ...] = ("inst-1",),
+    token: str = "ghu-test-token",
+    expires_in: int | None = None,
+):
+    """Install-ownership fix helper: seed a VERIFIED GitHub identity.
+
+    Creates one GitHubAuthorization row (encrypted non-expiring/set-expiry
+    user access token) plus VERIFIED GitHubConnection rows for
+    `installations`. Callers still create their own Repository rows (they
+    must set `github_user_id` themselves for verified semantics) and
+    monkeypatch the GitHub client functions they need. github_user_id
+    defaults to a stable per-user value so distinct users never share an
+    identity by accident.
+    """
+    from datetime import timedelta
+
+    from app.db.database import utcnow
+    from app.db.models import GitHubAuthorization, GitHubConnection
+    from app.llm import crypto as _crypto
+
+    gh_id = github_user_id if github_user_id is not None else 1000 + user.id
+    now = utcnow()
+    db.add(
+        GitHubAuthorization(
+            user_id=user.id,
+            github_user_id=gh_id,
+            github_login=login,
+            encrypted_user_token=_crypto.encrypt_secret(token),
+            encrypted_refresh_token="",
+            token_expires_at=(
+                now + timedelta(seconds=expires_in) if expires_in else None
+            ),
+            refresh_token_expires_at=None,
+            last_verified_at=now,
+        )
+    )
+    for inst in installations:
+        db.add(
+            GitHubConnection(
+                user_id=user.id,
+                installation_id=inst,
+                github_user_id=gh_id,
+                github_account=login,
+                github_account_type="User",
+                verified_at=now,
+            )
+        )
+    db.commit()
+    return gh_id
+
+
 @pytest.fixture()
 def db():
     Base.metadata.drop_all(bind=_test_engine)

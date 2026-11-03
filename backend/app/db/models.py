@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     DateTime,
     ForeignKey,
     Index,
@@ -35,6 +36,14 @@ class Repository(Base):
     )  # owner/repo
     installation_id: Mapped[str] = mapped_column(String(64), default="")
     default_branch: Mapped[str] = mapped_column(String(128), default="main")
+    # Install-ownership fix: the installation_id here is only usable by
+    # user-facing endpoints when it was VERIFIED against the owner's GitHub
+    # user access token (see app/github/install.py). NULL = legacy/unverified
+    # row: workers may still use it, browsers may not (re-verify required).
+    github_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Phase 2: owning FixHub user. Nullable so pre-auth rows stay readable by
     # nobody (fail-safe 404) instead of breaking existing databases.
     owner_id: Mapped[int | None] = mapped_column(
@@ -255,8 +264,14 @@ class LoginAttempt(Base):
 class GitHubConnection(Base):
     """Phase 2: mapping of FixHub user -> GitHub App installation.
 
-    Minimum metadata to associate user/install/repositories. No tokens or
-    secrets are stored here (installation tokens stay in-memory only).
+    Minimum metadata to associate user/install/repositories. Raw user access
+    tokens live ONLY in github_authorizations (Fernet-encrypted at rest);
+    installation tokens stay in-memory only.
+
+    Install-ownership fix: rows here are created/verified ONLY through the
+    GitHub App user authorization flow (github_authorizations). A row whose
+    github_user_id is NULL is unverfied legacy data: user-facing endpoints
+    refuse it (no silent assignment), webhook resolution keeps working.
     """
 
     __tablename__ = "github_connections"
@@ -265,6 +280,13 @@ class GitHubConnection(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     installation_id: Mapped[str] = mapped_column(String(64), index=True)
     github_account: Mapped[str] = mapped_column(String(255), default="")
+    github_account_type: Mapped[str] = mapped_column(String(32), default="")
+    # The verified GitHub account this connection was confirmed for. NULL on
+    # legacy rows (pre-ownership-fix) = treated as unverified for user APIs.
+    github_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )
@@ -273,6 +295,49 @@ class GitHubConnection(Base):
         UniqueConstraint(
             "user_id", "installation_id", name="uq_gh_connection_user_install"
         ),
+    )
+
+
+class GitHubAuthorization(Base):
+    """Install-ownership fix: a FixHub user's VERIFIED GitHub identity.
+
+    Created exclusively by the GitHub App user authorization (web application
+    flow) after verifying GET /user + GET /user/installations with the
+    exchanged user access token. One row per FixHub user (github_user_id is
+    the immutable numeric GitHub ID; logins change).
+
+    The user access token (+ refresh token when the app issues expiring
+    tokens) is stored Fernet-encrypted at rest, same master key as BYOK
+    credentials, and is used ONLY to re-verify this user's own installations
+    — never to enumerate the App-wide installation list.
+    """
+
+    __tablename__ = "github_authorizations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    github_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    github_login: Mapped[str] = mapped_column(String(255), default="")
+    encrypted_user_token: Mapped[str] = mapped_column(Text, default="")
+    encrypted_refresh_token: Mapped[str] = mapped_column(Text, default="")
+    token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    refresh_token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_verified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_github_authorization_user"),
     )
 
 

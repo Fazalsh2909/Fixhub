@@ -180,6 +180,16 @@ class Settings(BaseSettings):
     GITHUB_APP_PRIVATE_KEY_PATH: str = ""
     GITHUB_WEBHOOK_SECRET: str = ""
     GITHUB_API_URL: str = "https://api.github.com"
+    # Install-ownership fix: GitHub App user authorization (OAuth web flow).
+    # client_id/client_secret come from the App's settings page (NOT the
+    # numeric App ID above). Used ONLY to bind each FixHub user to their
+    # VERIFIED GitHub identity + installations; setup-URL installation_id
+    # hints are never trusted (GitHub documents them as spoofable).
+    GITHUB_APP_CLIENT_ID: str = ""
+    GITHUB_APP_CLIENT_SECRET: str = ""
+    # Optional explicit callback URL; empty = use the first Callback URL
+    # registered on the App's settings page (redirect_uri omitted everywhere).
+    GITHUB_APP_REDIRECT_URI: str = ""
 
     # Queue (RQ/Redis). Webhooks enqueue; `worker` service runs jobs.
     REDIS_URL: str = "redis://localhost:6379/0"

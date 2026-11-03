@@ -12,7 +12,19 @@ def _authed(db, email="rb@example.com"):
 
 
 def _connected(db, user, full_name="u/demo"):
-    db.add(Repository(github_full_name=full_name, installation_id="99", owner_id=user.id))
+    from tests.conftest import make_github_identity
+
+    gh_id = make_github_identity(
+        db, user, login=full_name.split("/")[0], installations=("99",)
+    )
+    db.add(
+        Repository(
+            github_full_name=full_name,
+            installation_id="99",
+            owner_id=user.id,
+            github_user_id=gh_id,
+        )
+    )
     db.commit()
 
 

@@ -35,26 +35,42 @@ def _post_webhook(c, payload, delivery, event="issues"):
 
 
 def test_connection_visible_to_owner_only(db, monkeypatch):
-    from app.github import app_auth as _auth
+    """A connects a verified installation: visible to A, invisible to B."""
+    from tests.conftest import make_github_identity
+
     from app.github import client as _gh
 
-    monkeypatch.setattr(_auth, "installation_token", lambda iid: "tok")
-    monkeypatch.setattr(
-        _gh,
-        "list_installations",
-        lambda app_jwt: [{"id": "inst-1", "account": "acme", "type": "Organization"}],
-    )
-    monkeypatch.setattr(
-        _gh,
-        "list_installation_repos",
-        lambda token: [
-            {"full_name": "acme/repo", "private": False, "default_branch": "main"}
-        ],
-    )
     ua = make_user(db, email="ga@example.com")
     ca = session_cookies(db, ua)
     ub = make_user(db, email="gb@example.com")
     cb = session_cookies(db, ub)
+    # GitHub-truthful identities: A verified for inst-1 (acme), B for inst-2.
+    make_github_identity(
+        db, ua, github_user_id=701, login="acme", token="tok-ghu-a",
+        installations=("inst-1",),
+    )
+    make_github_identity(
+        db, ub, github_user_id=702, login="other", token="tok-ghu-b",
+        installations=("inst-2",),
+    )
+    monkeypatch.setattr(
+        _gh,
+        "list_user_installations",
+        lambda *, token: (
+            [{"id": "inst-1", "account": "acme", "type": "User"}]
+            if token == "tok-ghu-a"
+            else [{"id": "inst-2", "account": "other", "type": "User"}]
+        ),
+    )
+    monkeypatch.setattr(
+        _gh,
+        "list_user_installation_repos",
+        lambda *, token, installation_id: (
+            [{"full_name": "acme/repo", "private": False, "default_branch": "main"}]
+            if token == "tok-ghu-a"
+            else []
+        ),
+    )
     c = TestClient(app)
     r = c.post(
         "/api/repositories/connect",
@@ -72,32 +88,102 @@ def test_connection_visible_to_owner_only(db, monkeypatch):
     assert "acme/repo" not in names_b
 
 
-def test_cannot_claim_anothers_installation(db):
+def _fail_no_mint(monkeypatch):
+    """Installation tokens must never be minted from these request paths."""
+    from app.github import app_auth as _auth
+
+    def _boom(iid):
+        raise AssertionError(f"installation token minted for {iid!r} without verification")
+
+    monkeypatch.setattr(_auth, "installation_token", _boom)
+
+
+def test_spoofed_installation_id_rejected(db, monkeypatch):
+    """B (verified for inst-9's neighbor only) cannot claim inst-9 by id;
+    the pre-fix 'connect your installation_id' theft is dead."""
+    from tests.conftest import make_github_identity
+
+    from app.github import client as _gh
+
     ua = make_user(db, email="gc@example.com")
     ub = make_user(db, email="gd@example.com")
     cb = session_cookies(db, ub)
-    db.add(GitHubConnection(user_id=ua.id, installation_id="inst-9"))
+    make_github_identity(
+        db, ua, github_user_id=801, login="acme", token="tok-ghu-a",
+        installations=("inst-9",),
+    )
+    make_github_identity(
+        db, ub, github_user_id=802, login="mallory", token="tok-ghu-b",
+        installations=("inst-m",),
+    )
     db.add(
         Repository(
-            github_full_name="acme/claimed", installation_id="inst-9", owner_id=ua.id
+            github_full_name="acme/claimed",
+            installation_id="inst-9",
+            owner_id=ua.id,
+            github_user_id=801,
         )
     )
     db.commit()
+    monkeypatch.setattr(
+        _gh,
+        "list_user_installations",
+        lambda *, token: (
+            [{"id": "inst-9", "account": "acme", "type": "User"}]
+            if token == "tok-ghu-a"
+            else [{"id": "inst-m", "account": "mallory", "type": "User"}]
+        ),
+    )
+    monkeypatch.setattr(
+        _gh, "list_user_installation_repos", lambda *, token, installation_id: []
+    )
+    _fail_no_mint(monkeypatch)
     c = TestClient(app)
-    # B tries to steal the repo row.
+    # B tries to steal the repo row (globally unique full_name): 404.
     r = c.post(
         "/api/repositories/connect",
         json={"github_full_name": "acme/claimed", "installation_id": "inst-9"},
         cookies=cb,
     )
     assert r.status_code == 404, r.text
-    # B tries to claim the installation id on a fresh repo.
+    # B tries to claim inst-9 on a fresh repo by changing installation_id: 404.
     r = c.post(
         "/api/repositories/connect",
         json={"github_full_name": "acme/other", "installation_id": "inst-9"},
         cookies=cb,
     )
     assert r.status_code == 404, r.text
+    # Nothing was created for B and nothing changed for A.
+    assert db.query(Repository).filter(Repository.github_full_name == "acme/other").first() is None
+    claimed = db.query(Repository).filter(Repository.github_full_name == "acme/claimed").first()
+    assert claimed.owner_id == ua.id
+
+
+def test_connect_requires_verified_github_identity(db):
+    """Without the OAuth flow, connect explicitly asks for authorization."""
+    from tests.conftest import make_github_identity
+
+    ua = make_user(db, email="uj@example.com")
+    ub = make_user(db, email="uk@example.com")
+    cb = session_cookies(db, ub)
+    make_github_identity(
+        db, ua, github_user_id=901, login="owner", token="tok-ghu-a",
+        installations=("inst-5",),
+    )
+    db.add(Repository(github_full_name="own/locked", installation_id="inst-5", owner_id=ua.id))
+    db.commit()
+    c = TestClient(app)
+    r = c.post(
+        "/api/repositories/connect",
+        json={"github_full_name": "own/locked", "installation_id": "inst-5"},
+        cookies=cb,
+    )
+    assert r.status_code == 400, r.text
+    body = r.json()
+    assert body["github_authorization_required"] is True
+    assert body["start_url"] == "/api/github/install/start"
+    # The locked repo row stays untouched by the failed attempt.
+    assert db.query(Repository).filter(Repository.github_full_name == "own/locked").first().owner_id == ua.id
 
 
 def test_webhook_installation_creates_owned_task(db):

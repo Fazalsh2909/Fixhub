@@ -18,12 +18,14 @@ from app.api.llm_keys import router as llm_keys_router
 from app.config import settings
 from app.db.database import Base, engine
 from app.db.models import GitHubConnection, Repository, Task, User  # noqa: F401  (register tables)
+from app.github.install import router as github_install_router
 from app.github.webhook import router as github_router
 
 app = FastAPI(title=settings.APP_NAME)
 app.include_router(auth_router)
 app.include_router(llm_keys_router)
 app.include_router(github_router)
+app.include_router(github_install_router)
 app.include_router(ide_router)
 
 
@@ -506,6 +508,41 @@ def _db():
         db.close()
 
 
+def _repo_verification_guard(row: Repository, repo: str, user: User, db: Session):
+    """400 when a row's installation is NOT verified for the CURRENT user.
+
+    Install-ownership fix: installation tokens are minted only for rows whose
+    installation_id GitHub confirmed for this user (see app/github/install.py).
+    Legacy rows (github_user_id NULL — set before the fix) and rows poisoned by
+    the pre-fix first-claim connect bug are refused here; the response tells
+    the owner to complete the OAuth flow once, which re-verifies GitHub-
+    confirmed rows server-side. Returns None when all checks pass.
+    """
+    from fastapi.responses import JSONResponse
+
+    from app.github import install as _install
+
+    if not row.installation_id:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"{repo} is not connected (set installation_id via POST /api/repositories/connect)"
+            },
+        )
+    if not _install.installation_verified_for_user(row, db, user):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": (
+                    f"{repo} needs GitHub re-verification: connect your FixHub "
+                    f"account via {_install.INSTALL_START_URL} (or reconnect the repository)"
+                ),
+                **_install.oauth_required_payload(),
+            },
+        )
+    return None
+
+
 @app.get("/api/repositories")
 def list_repositories(
     user: User = Depends(get_current_user), db: Session = Depends(_db)
@@ -535,12 +572,24 @@ def connect_repository(
     user: User = Depends(get_current_user),
     db: Session = Depends(_db),
 ) -> dict:
-    """Store the GitHub App installation mapping for a repo (enables issues + clone).
+    """Connect a repository under an installation GitHub VERIFIED for the user.
 
-    Phase 2: the repository and installation claim belong to the authenticated
-    user. Claiming another user's repository or installation returns 404.
+    Install-ownership fix: the client-supplied installation_id is untrusted
+    input (GitHub documents setup-URL installation_id as spoofable). It is
+    accepted only when all three hold, verified server-side:
+      1. the FixHub user completed the GitHub App user authorization flow,
+      2. GitHub GET /user/installations (with THAT user's encrypted token)
+         includes the installation,
+      3. GitHub GET /user/installations/{id}/repositories includes the repo.
+    A spoofed/foreign installation returns 404 with no rows created.
     """
+    from datetime import datetime, timezone
+
     from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    from app.github import client as _gh
+    from app.github import install as _install
 
     require_csrf(request)
     full_name = str(payload.get("github_full_name", "")).strip()
@@ -551,79 +600,144 @@ def connect_repository(
         )
     if not installation_id:
         raise HTTPException(status_code=400, detail="installation_id is required")
+    # Step 1: verified GitHub identity for THIS FixHub user, or an explicit
+    # 400 pointing at the OAuth start URL (no silent identity assignment).
+    ident = _install.get_user_token(db, user)
+    if ident is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": (
+                    "connect your GitHub account first "
+                    "(GitHub App user authorization required)"
+                ),
+                **_install.oauth_required_payload(),
+            },
+        )
+    try:
+        installations = _gh.list_user_installations(token=ident["token"])
+    except Exception as exc:
+        return JSONResponse(
+            status_code=502, content={"error": f"github api failed: {exc}"[:300]}
+        )
+    verified = {str(i.get("id", "")) for i in installations}
+    # Step 2: the claimed installation must belong to GitHub's verified set
+    # for this user. Reconnaissance or first-claim theft returns 404.
+    if installation_id not in verified:
+        raise HTTPException(status_code=404, detail="repository not found")
+    # Step 3: the repository must actually live in that installation
+    # (GitHub's own per-user repository listing — not the browser's name).
+    try:
+        repos = _gh.list_user_installation_repos(
+            token=ident["token"], installation_id=installation_id
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=502, content={"error": f"github api failed: {exc}"[:300]}
+        )
+    if not any(r.get("full_name") == full_name for r in repos):
+        raise HTTPException(status_code=404, detail="repository not found")
+    inst_meta = next(
+        (i for i in installations if str(i.get("id", "")) == installation_id), {}
+    )
+    # Repo row: Repository rows are globally unique (unique full_name) and
+    # another owner's row cannot be stolen — unchanged Phase 2 posture.
     repo = db.query(Repository).filter(Repository.github_full_name == full_name).first()
     if repo and repo.owner_id is not None and repo.owner_id != user.id:
         raise HTTPException(status_code=404, detail="repository not found")
-    # An installation claimed by another user cannot be re-claimed here.
-    other = (
-        db.query(GitHubConnection)
-        .filter(
-            GitHubConnection.installation_id == installation_id,
-            GitHubConnection.user_id != user.id,
-        )
-        .first()
-    )
-    if other:
-        raise HTTPException(status_code=404, detail="repository not found")
+    now = datetime.now(timezone.utc)
     if not repo:
         repo = Repository(github_full_name=full_name, owner_id=user.id)
         db.add(repo)
     if repo.owner_id is None:
         repo.owner_id = user.id
     repo.installation_id = installation_id
-    if (
-        not db.query(GitHubConnection)
+    repo.github_user_id = ident["github_user_id"]
+    repo.verified_at = now
+    conn = (
+        db.query(GitHubConnection)
         .filter(
             GitHubConnection.user_id == user.id,
             GitHubConnection.installation_id == installation_id,
         )
         .first()
-    ):
-        db.add(GitHubConnection(user_id=user.id, installation_id=installation_id))
+    )
+    if not conn:
+        conn = GitHubConnection(user_id=user.id, installation_id=installation_id)
+        db.add(conn)
+    conn.github_user_id = ident["github_user_id"]
+    conn.verified_at = now
+    conn.github_account = str(inst_meta.get("account") or ident.get("github_login", ""))[:255]
+    conn.github_account_type = str(inst_meta.get("type") or "")[:32]
     db.commit()
     db.refresh(repo)
     return {"id": repo.id, "github_full_name": repo.github_full_name, "connected": True}
 
 
 @app.get("/api/github/installations")
-def list_installations(user: User = Depends(get_current_user)) -> list[dict] | dict:
-    """Show where the GitHub App is installed (id + account). Needs App key configured."""
-    from fastapi.responses import JSONResponse
+def list_installations(
+    user: User = Depends(get_current_user), db: Session = Depends(_db)
+) -> list[dict]:
+    """Installations VERIFIED for the current FixHub user (id + account).
 
-    from app.github import app_auth as _app_auth
-    from app.github import client as _gh
-
-    try:
-        token = _app_auth.app_jwt()
-        return _gh.list_installations(app_jwt=token)
-    except RuntimeError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc)[:300]})
-    except Exception as exc:
-        return JSONResponse(
-            status_code=502, content={"error": f"github api failed: {exc}"[:300]}
+    Install-ownership fix: the App-wide `/app/installations` JWT listing is
+    NEVER served to a browser — it would enumerate every installation of the
+    GitHub App across all users. Only connections created or confirmed by
+    the GitHub App user authorization flow (GitHub's own GET
+    /user/installations for THIS user) are returned.
+    """
+    rows = (
+        db.query(GitHubConnection)
+        .filter(
+            GitHubConnection.user_id == user.id,
+            GitHubConnection.github_user_id.isnot(None),
         )
+        .order_by(GitHubConnection.id.asc())
+        .all()
+    )
+    return [
+        {
+            "id": r.installation_id,
+            "account": r.github_account,
+            "type": r.github_account_type or "",
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/github/repos")
 def list_installed_repos(
     user: User = Depends(get_current_user), db: Session = Depends(_db)
 ) -> list[dict] | dict:
-    """Every repo the GitHub App can see, grouped by installation, with the
-    FixHub `connected` flag (installation mapping stored = runs enabled).
+    """Repos grouped by installation, from installations GitHub VERIFIED for
+    the current FixHub user (their user access token — never the App-wide
+    /app/installations list).
 
-    Unconnected repos show a one-click Connect in the UI; the manual
-    owner/repo + installation form stays for forks/OSS repos outside these
-    installations. Never raises: per-installation failures degrade to []."""
+    Each group: GET /user/installations; each repo listing:
+    GET /user/installations/{id}/repositories — GitHub's authoritative
+    user-scoped data (other users' private repos simply never appear for
+    this user). Requires a completed GitHub authorization: unverified /
+    absent identities get a 400 with the OAuth start URL. Never raises:
+    per-installation failures degrade to []."""
     from fastapi.responses import JSONResponse
 
-    from app.github import app_auth as _app_auth
     from app.github import client as _gh
+    from app.github import install as _install
 
+    ident = _install.get_user_token(db, user)
+    if ident is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": (
+                    "connect your GitHub account first "
+                    "(GitHub App user authorization required)"
+                ),
+                **_install.oauth_required_payload(),
+            },
+        )
     try:
-        app_token = _app_auth.app_jwt()
-        installations = _gh.list_installations(app_jwt=app_token)
-    except RuntimeError as exc:
-        return JSONResponse(status_code=400, content={"error": str(exc)[:300]})
+        installations = _gh.list_user_installations(token=ident["token"])
     except Exception as exc:
         return JSONResponse(
             status_code=502, content={"error": f"github api failed: {exc}"[:300]}
@@ -641,22 +755,27 @@ def list_installed_repos(
             "repos": [],
         }
         try:
-            token = _app_auth.installation_token(inst.get("id", ""))
-            repos = _gh.list_installation_repos(token=token)
+            repos = _gh.list_user_installation_repos(
+                token=ident["token"], installation_id=inst.get("id", "")
+            )
         except Exception:
             repos = []
         for repo in repos:
             row = rows.get(repo["full_name"])
+            connected = bool(
+                row
+                and row.installation_id
+                and row.github_user_id is not None
+                and int(row.github_user_id) == int(ident["github_user_id"])
+            )
             entry["repos"].append(
                 {
                     "github_full_name": repo["full_name"],
                     "private": repo["private"],
                     "default_branch": repo["default_branch"],
-                    "connected": bool(row and row.installation_id),
+                    "connected": connected,
                     "installation_id": (
-                        row.installation_id
-                        if row and row.installation_id
-                        else inst.get("id", "")
+                        row.installation_id if connected else inst.get("id", "")
                     ),
                 }
             )
@@ -675,13 +794,9 @@ def list_github_issues(
     from app.github import client as _gh
 
     row = require_owned_repository_by_name(repo, user, db)
-    if not row.installation_id:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": f"{repo} is not connected (set installation_id via POST /api/repositories/connect)"
-            },
-        )
+    guard = _repo_verification_guard(row, repo, user, db)
+    if guard:
+        return guard
     try:
         token = _app_auth.installation_token(row.installation_id)
         return _gh.list_issues(token=token, full_name=repo)
@@ -710,13 +825,9 @@ def read_repo_dir(
     from app.github import client as _gh
 
     row = require_owned_repository_by_name(repo, user, db)
-    if not row.installation_id:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": f"{repo} is not connected (set installation_id via POST /api/repositories/connect)"
-            },
-        )
+    guard = _repo_verification_guard(row, repo, user, db)
+    if guard:
+        return guard
     try:
         token = _app_auth.installation_token(row.installation_id)
         return _gh.repo_dir_contents(token=token, full_name=repo, path=path, ref=ref)
@@ -747,13 +858,9 @@ def read_repo_file(
     from app.github import client as _gh
 
     row = require_owned_repository_by_name(repo, user, db)
-    if not row.installation_id:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": f"{repo} is not connected (set installation_id via POST /api/repositories/connect)"
-            },
-        )
+    guard = _repo_verification_guard(row, repo, user, db)
+    if guard:
+        return guard
     try:
         token = _app_auth.installation_token(row.installation_id)
         return _gh.repo_file_content(token=token, full_name=repo, path=path, ref=ref)
@@ -789,6 +896,16 @@ def task_published_diff(
     )
     if not row or not row.installation_id:
         raise HTTPException(status_code=400, detail=f"{t.repository} is not connected")
+    from app.github import install as _install
+
+    if not _install.installation_verified_for_user(row, db, user):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{t.repository} needs GitHub re-verification "
+                f"(connect your FixHub account via {_install.INSTALL_START_URL})"
+            ),
+        )
     try:
         token = _app_auth.installation_token(row.installation_id)
         files = _gh.pull_files(token=token, full_name=t.repository, number=t.pr_number)
@@ -837,6 +954,16 @@ def create_task_from_issue(
     row = require_owned_repository_by_name(full_name, user, db)
     if not row.installation_id:
         raise HTTPException(status_code=400, detail=f"{full_name} is not connected")
+    from app.github import install as _install
+
+    if not _install.installation_verified_for_user(row, db, user):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{full_name} needs GitHub re-verification "
+                f"(connect your FixHub account via {_install.INSTALL_START_URL})"
+            ),
+        )
     from app.github.webhook import _active_issue_task, _start_task
 
     dup = _active_issue_task(db, repo_name=full_name, number=number)
