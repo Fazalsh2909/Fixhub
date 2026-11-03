@@ -7,9 +7,13 @@ Instead it binds each authenticated FixHub session to GitHub's OWN statement
 about that user, via the GitHub Apps web application flow:
 
 1. GET /api/github/install/start   (logged-in FixHub session)
-   -> sets a signed, session-bound, expiring, single-use state cookie
-      (PKCE S256 verifier baked in), then 302 to
+   -> sets a signed, session-bound, expiring cookie whose payload alone
+      holds the PKCE S256 verifier (never to be sent anywhere), then 302
+      to
       https://github.com/login/oauth/authorize?client_id=...&state=...
+      where the URL state is an opaque, unpredictable signed payload
+      that contains ONLY the nonce + binding/expiry/redirect record —
+      never the verifier.
 2. GitHub redirects to /api/github/install/callback?code=...&state=...
    -> the one-time code is exchanged (client_secret held server-side) for a
       user access token, identity verified via GET /user, and the set of
@@ -30,15 +34,21 @@ State/CSRF design:
   (required on every deployed boot; dev/test set it via conftest);
 - binds to the caller's opaque session token hash, so a state issued to one
   browser session is worthless in every other one;
-- verbatim-return matching against the OAuth `state` query parameter
-  (cookie + param must agree, compared constant-time);
-- server-enforced one-time use: the state nonce is consumed Redis-side
-  (SETNX + TTL) at the callback, so a replayed state cookie is rejected
-  even across processes; when Redis is unavailable this degrades to the
-  historical (cookie deletion + GitHub's single-use code + session
-  binding + expiring HMAC) guarantees instead of blocking authorization;
-- PKCE S256: the code_verifier lives only inside the signed cookie, never
-  in the DB or URL.
+- the OAuth URL state and the cookie are TWO separately signed payloads
+  (v2), minted together at start but with different contents: the URL
+  state is opaque {v,n,u,x,p}; the cookie additionally carries the PKCE
+  verifier {v,n,u,x,k,p}. At the callback both must verify, be unexpired,
+  bind to this session, and AGREE on their nonce (constant-time);
+- server-enforced one-time use: the nonce is consumed Redis-side at the
+  callback (SET key NX EX ttl; the consumed key is created ONLY at the
+  callback — issuance is proven by the signed cookie, never by a stored
+  key), so a replayed callback fails even across processes/workers. When
+  the store is unreachable a deployed environment (ENV=prod) fails SAFE
+  with a temporary 503 and never authorizes without enforcement; dev/test
+  degrade to the stateless guarantees below instead;
+- PKCE S256: the code_verifier lives ONLY inside the HttpOnly signed
+  cookie — never in the URL (no access-log/referrer exposure), the DB,
+  or any browser-visible output.
 """
 
 from __future__ import annotations
@@ -182,47 +192,50 @@ def _clear_state_cookie(response: Response) -> None:
     )
 
 
-# --- server-enforced one-time state nonces (Redis, best effort) ---------------
+# --- server-enforced one-time state nonces (Redis) ----------------------------
 
 
-def _state_nonce_register(nonce: str) -> None:
-    """Record an OAuth state nonce as issued (best effort, Redis-backed).
+def _get_state_store():
+    """Redis client factory for one-time state-nonce consumption.
 
-    Turns "delete the state cookie in the browser" into a server-enforced
-    one-time guarantee: the callback refuses any nonce that is already
-    consumed, across processes/workers. Redis unavailability degrades to
-    the stateless behavior (cookie deletion + GitHub's single-use code +
-    session binding + expiring HMAC) rather than blocking fresh flows.
+    Deliberately a module-level function: tests swap in a Redis-compatible
+    fake by patching THIS factory — the consumption logic itself is never
+    stubbed, so tests exercise real nonce semantics.
+    """
+    import redis as _redis
+
+    return _redis.Redis.from_url(settings.REDIS_URL, socket_timeout=3)
+
+
+def _state_nonce_consume(nonce: str) -> bool | None:
+    """Atomically consume a one-time OAuth state nonce (tri-state).
+
+    The consumed key is created ONLY here, at the callback:
+        SET fixhub:gh_state:{nonce} "1" NX EX STATE_TTL_S
+    so exactly ONE callback per nonce can ever succeed, across processes
+    and workers. There is no start-time registration: that the nonce was
+    issued by FixHub is proven by the signed session-bound cookie which
+    shares the nonce; that it was never consumed before is proven here.
+
+    True  => fresh first use: the callback may proceed.
+    False => nonce already consumed: replay; the callback must reject.
+    None  => enforcement unavailable (Redis unreachable / import failed):
+             callers must fail SAFE — a deployed environment
+             (settings.ENV == "prod") returns a temporary error instead of
+             silently authorizing without the one-time guarantee; dev/test
+             may degrade to the stateless guarantees (expiring HMAC state,
+             session binding, cookie deletion, GitHub's single-use code).
     """
     if not nonce:
-        return
+        return False  # no nonce identity: freshness is unprovable
     try:
-        import redis as _redis
-
-        client = _redis.Redis.from_url(settings.REDIS_URL, socket_timeout=3)
-        client.setex(f"fixhub:gh_state:{nonce}", STATE_TTL_S, "1")
-    except Exception:
-        pass
-
-
-def _state_nonce_consume(nonce: str) -> bool:
-    """Atomically consume a state nonce. True => proceed, False => replay.
-
-    SETNX with a TTL marks consumption, so exactly one callback per nonce
-    succeeds even across workers. On Redis failure this evaluates True
-    (fail-open): a fresh authorization must never depend on Redis liveness.
-    """
-    if not nonce:
-        return True
-    try:
-        import redis as _redis
-
-        client = _redis.Redis.from_url(settings.REDIS_URL, socket_timeout=3)
         return bool(
-            client.set(f"fixhub:gh_state:{nonce}", "1", nx=True, ex=STATE_TTL_S)
+            _get_state_store().set(
+                f"fixhub:gh_state:{nonce}", "1", nx=True, ex=STATE_TTL_S
+            )
         )
     except Exception:
-        return True
+        return None
 
 
 # --- the web application flow -------------------------------------------------
@@ -237,9 +250,10 @@ def install_start(
     """Begin GitHub user authorization for the logged-in FixHub session.
 
     Requires an authenticated FixHub session (401 for anonymous callers,
-    instead of silently starting a GitHub round-trip). The signed state
-    carries a PKCE verifier, an expiry stamp, the session binding, and the
-    validated next-redirect target.
+    instead of silently starting a GitHub round-trip). The URL state is an
+    opaque signed nonce record; the PKCE verifier rides only in the HttpOnly
+    signed state cookie (same nonce, verifier field, expiry, session
+    binding, validated next-redirect target).
     """
     if not _oauth_enabled():
         raise HTTPException(
@@ -252,19 +266,20 @@ def install_start(
     verifier = secrets.token_urlsafe(48)  # PKCE verifier (unreserved chars only)
     challenge = _b64url_encode(hashlib.sha256(verifier.encode("utf-8")).digest())
     payload = {
-        "v": 1,
+        "v": 2,
         "n": secrets.token_urlsafe(24),
         "u": _session_bind_hash(request),
         "x": int(utcnow().timestamp()) + STATE_TTL_S,
-        "k": verifier,
         "p": _safe_next(next),
     }
+    # The URL state GitHub carries back and forth is opaque: NO verifier.
     state = _state_encode(payload)
-    _state_nonce_register(payload["n"])
+    # The verifier travels only in the HttpOnly signed cookie (same nonce).
+    cookie_state = _state_encode({**payload, "k": verifier})
     response = RedirectResponse(
         _authorize_url(state=state, code_challenge=challenge), status_code=302
     )
-    _set_state_cookie(response, state)
+    _set_state_cookie(response, cookie_state)
     return response
 
 
@@ -283,44 +298,91 @@ def install_callback(
         response = RedirectResponse("/?github_connect=error", status_code=302)
         _clear_state_cookie(response)
         return response
-    data = _state_decode(state_param)
+    # Two signed payloads were minted together: the URL state (opaque, no
+    # verifier) and the cookie (also carrying the PKCE verifier). Both must
+    # verify, be unexpired, bind to THIS session, and agree on their nonce.
+    url_data = _state_decode(state_param)
     cookie_state = (request.cookies.get(STATE_COOKIE) or "").strip()
-    expired = (
-        data is None
-        or not isinstance(data.get("x"), int)
-        or data["x"] <= int(utcnow().timestamp())
+    cookie_data = _state_decode(cookie_state)
+    bind = _session_bind_hash(request)
+    now_ts = int(utcnow().timestamp())
+    url_ok = (
+        isinstance(url_data, dict)
+        and url_data.get("v") == 2
+        and isinstance(url_data.get("x"), int)
+        and url_data["x"] > now_ts
+        and url_data.get("u") == bind
     )
-    unbound = data is not None and data.get("u") != _session_bind_hash(request)
-    replay = data is not None and not _state_nonce_consume(
-        str(data.get("n") or "")
+    cookie_ok = (
+        isinstance(cookie_data, dict)
+        and cookie_data.get("v") == 2
+        and isinstance(cookie_data.get("x"), int)
+        and cookie_data["x"] > now_ts
+        and cookie_data.get("u") == bind
+        # PKCE lives ONLY in the cookie: no verifier there, no exchange.
+        and isinstance(cookie_data.get("k"), str)
+        and bool(cookie_data["k"])
     )
-    if (
-        data is None
-        or expired
-        or unbound
-        or replay
-        # double-check the returned state matches what we set (no GitHub-side
-        # swap); constant-time so the match itself leaks no prefix timing
-        or not hmac.compare_digest(state_param, cookie_state)
+    nonce = str(url_data.get("n") or "") if url_ok else ""
+    verifier = str(cookie_data["k"]) if cookie_ok else ""
+    cookie_nonce = (
+        str(cookie_data.get("n") or "") if isinstance(cookie_data, dict) else ""
+    )
+    if not (
+        url_ok
+        and cookie_ok
+        # minted together: URL state + cookie must describe ONE flow; the
+        # nonce agreement closes GitHub-side swaps and mismatched/replayed
+        # pairs and is compared constant-time (both are HMAC-verified here)
+        and hmac.compare_digest(nonce, cookie_nonce)
+        and bool(nonce)
     ):
         response = RedirectResponse("/?github_connect=error", status_code=302)
         _clear_state_cookie(response)
         return response
-    next_path = _safe_next(str(data.get("p") or "/"))
+    # Cheap checks passed: enforce server-side single use of the nonce.
+    consumed = _state_nonce_consume(nonce)
+    if consumed is False:
+        # Replay of an already-used state: never re-run the exchange.
+        response = RedirectResponse("/?github_connect=error", status_code=302)
+        _clear_state_cookie(response)
+        return response
+    if consumed is None:
+        if settings.ENV == "prod":
+            # Fail SAFE, not silently weaker: deployed environments must
+            # never authorize when one-time enforcement is unavailable.
+            response = JSONResponse(
+                status_code=503,
+                content={
+                    "detail": (
+                        "authorization temporarily unavailable "
+                        "(state store unreachable); retry shortly"
+                    )
+                },
+            )
+            _clear_state_cookie(response)
+            return response
+        # Dev/test degrade to the stateless guarantees (expiring HMAC state,
+        # session binding, cookie deletion, GitHub's single-use code).
+    next_path = _safe_next(str(cookie_data.get("p") or "/"))
     if not _oauth_enabled():
-        raise HTTPException(
+        response = JSONResponse(
             status_code=400,
-            detail=(
-                "GitHub App user authorization is not configured "
-                "(set GITHUB_APP_CLIENT_ID / GITHUB_APP_CLIENT_SECRET)"
-            ),
+            content={
+                "detail": (
+                    "GitHub App user authorization is not configured "
+                    "(set GITHUB_APP_CLIENT_ID / GITHUB_APP_CLIENT_SECRET)"
+                )
+            },
         )
+        _clear_state_cookie(response)
+        return response
     try:
         from app.github import client as _gh
 
         token_payload = _gh.exchange_authorization_code(
             code=code,
-            code_verifier=str(data.get("k") or ""),
+            code_verifier=verifier,
             redirect_uri=(settings.GITHUB_APP_REDIRECT_URI or "").strip(),
         )
         access_token = str(token_payload.get("access_token", ""))
