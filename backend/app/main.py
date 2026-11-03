@@ -511,12 +511,14 @@ def _db():
 def _repo_verification_guard(row: Repository, repo: str, user: User, db: Session):
     """400 when a row's installation is NOT verified for the CURRENT user.
 
-    Install-ownership fix: installation tokens are minted only for rows whose
-    installation_id GitHub confirmed for this user (see app/github/install.py).
-    Legacy rows (github_user_id NULL — set before the fix) and rows poisoned by
-    the pre-fix first-claim connect bug are refused here; the response tells
-    the owner to complete the OAuth flow once, which re-verifies GitHub-
-    confirmed rows server-side. Returns None when all checks pass.
+    Install-ownership fix: installation tokens are minted only when
+    app/github/install.py's gate confirms GitHub STILL lists this user's
+    installation and the exact repository (live revalidation, fail-closed)
+    in addition to the persisted binding. Legacy rows (github_user_id NULL
+    — set before the fix) and rows poisoned by the pre-fix first-claim
+    connect bug are refused here; the response tells the owner to complete
+    the OAuth flow once, which re-verifies GitHub-confirmed rows
+    server-side. Returns None when all checks pass.
     """
     from fastapi.responses import JSONResponse
 

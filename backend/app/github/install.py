@@ -22,11 +22,14 @@ about that user, via the GitHub Apps web application flow:
       user id + the Fernet-encrypted token; GitHubConnection / Repository
       rows are marked verified ONLY for installations GitHub confirmed.
 
-Other user-facing endpoints (issues/contents/file/connect) then verify a
-row's installation_id against the *current user's* persisted verified
-identity before any installation token is minted. The App JWT stays
-reserved for webhook/app-level operations and never enumerates
-installations for a browser.
+Other user-facing endpoints (issues/contents/file/from-issue/published-diff)
+then refuse rows whose installation_id AND exact repository full_name are
+not part of GitHub's CURRENT grants for the user's verified identity: the
+persisted binding is checked first, then live /user/installations and the
+per-installation repository listing are re-validated (short permission
+cache, failed lookups never cached) before any installation token is
+minted. The App JWT stays reserved for webhook/app-level operations and
+never enumerates installations for a browser.
 
 State/CSRF design:
 - cookie "fixhub_gh_state": HttpOnly, SameSite=settings, ~10 min TTL;
@@ -58,6 +61,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -400,7 +404,12 @@ def install_callback(
         _clear_state_cookie(response)
         return response
     _persist_authorization(db, user, ident, token_payload)
-    _reconcile_verified_connections(db, user, ident, installations)
+    # A fresh OAuth grant is the user re-proving access: drop any cached
+    # live-permission decision so everything is re-asked against GitHub.
+    _clear_user_perm_cache(user.id)
+    _reconcile_verified_connections(
+        db, user, ident, installations, token=access_token
+    )
     db.commit()
     target = next_path + ("&" if "?" in next_path else "?") + "github_connect=done"
     response = RedirectResponse(target, status_code=302)
@@ -421,6 +430,30 @@ def _authorize_url(*, state: str, code_challenge: str) -> str:
     if redirect_uri:
         params["redirect_uri"] = redirect_uri
     return f"https://github.com/login/oauth/authorize?{urlencode(params)}"
+
+
+# --- live permission cache (repository-level revalidation) --------------------
+#
+# The browser gate must re-check GitHub's CURRENT grants, but asking GitHub
+# twice per request is wasteful: successful listings live in a deliberately
+# SHORT cache. Its TTL is read at call time (tests shrink it to 0), a
+# successful OAuth re-connect clears the user's entries immediately, and
+# failures are NEVER cached — the cache cannot preserve access after the
+# user's grants change by more than its own expiry.
+PERM_CACHE_TTL_S = 60
+_PERM_INSTALL_CACHE: dict[int, tuple[float, frozenset[str]]] = {}
+_PERM_REPO_CACHE: dict[tuple[int, str], tuple[float, frozenset[str]]] = {}
+
+
+def _clear_user_perm_cache(user_id: int | None = None) -> None:
+    """Drop live-permission cache entries for one user (or all users)."""
+    if user_id is None:
+        _PERM_INSTALL_CACHE.clear()
+        _PERM_REPO_CACHE.clear()
+        return
+    _PERM_INSTALL_CACHE.pop(user_id, None)
+    for key in [k for k in _PERM_REPO_CACHE if k[0] == user_id]:
+        _PERM_REPO_CACHE.pop(key, None)
 
 
 # --- persistence + verification services -------------------------------------
@@ -473,7 +506,7 @@ def _persist_authorization(
 
 
 def _reconcile_verified_connections(
-    db: Session, user: User, ident: dict, installations: list[dict]
+    db: Session, user: User, ident: dict, installations: list[dict], *, token: str
 ) -> None:
     """Stamp verified claims ONLY where GitHub confirmed access.
 
@@ -483,8 +516,10 @@ def _reconcile_verified_connections(
       unverified for user APIs; never deleted, webhooks still work);
     - brand-new rows are created for confirmed installations this user had
       not yet connected (GitHub-truthful, not a silent guess);
-    - Repository rows owned by this user whose installation matches the
-      confirmed set get the same verification stamp.
+    - Repository rows owned by this user are verified ONLY when BOTH their
+      installation is confirmed AND the exact repository full_name appears
+      in GitHub's user-accessible listing for that installation; a listing
+      failure is never treated as verification and leaves rows unverified.
     """
     now = utcnow()
     gh_id = int(ident["id"])
@@ -516,14 +551,35 @@ def _reconcile_verified_connections(
                 verified_at=now,
             )
         )
+    from app.github import client as _gh
+
+    # Repository-level truth: exact membership in each installation's
+    # user-accessible repo listing. An API failure maps to None for that
+    # installation — never to "verified" — and its rows stay unverified.
+    accessible: dict[str, frozenset[str] | None] = {}
+    for iid in want:
+        try:
+            listing = _gh.list_user_installation_repos(
+                token=token, installation_id=iid
+            )
+        except Exception:
+            accessible[iid] = None
+            continue
+        accessible[iid] = frozenset(
+            str(r.get("full_name", "")) for r in listing if r.get("full_name")
+        )
     for repo in (
         db.query(Repository).filter(Repository.owner_id == user.id).all()
     ):
-        if repo.installation_id in want and (
-            repo.github_user_id is None or int(repo.github_user_id) == gh_id
+        if repo.installation_id not in want or (
+            repo.github_user_id is not None and int(repo.github_user_id) != gh_id
         ):
-            repo.github_user_id = gh_id
-            repo.verified_at = now
+            continue
+        names = accessible.get(repo.installation_id)
+        if not names or (repo.github_full_name or "") not in names:
+            continue  # stays unverified; preserved for webhooks, never deleted
+        repo.github_user_id = gh_id
+        repo.verified_at = now
 
 
 def get_user_token(db: Session, user: User) -> dict | None:
@@ -670,12 +726,27 @@ def get_user_token(db: Session, user: User) -> dict | None:
 def installation_verified_for_user(
     row: Repository | None, db: Session, user: User
 ) -> bool:
-    """True only when the row's installation is bound to this user's verified identity.
+    """True only when GitHub CURRENTLY authorizes this user for the row.
 
-    Guards every user-facing endpoint that mints an installation token: a
-    Repository row connected pre-fix (github_user_id NULL) or poisoned by the
-    old first-claim connect bug (bound to another GitHub account) is refused
-    here, even when the FixHub row itself is owned by the requester.
+    Guards every user-facing endpoint that mints an installation token.
+    Three layers, cheapest first:
+
+    1. persisted-binding precheck: a Repository row connected pre-fix
+       (github_user_id NULL) or poisoned by the old first-claim connect bug
+       (bound to another GitHub account) is refused with zero GitHub calls;
+    2. live install authorization: the row's installation_id must still be
+       in GitHub's /user/installations listing for this user's token —
+       get_user_token refuses revoked, undecryptable, or unrefreshable
+       secrets outright;
+    3. live repository authorization: the row's exact github_full_name must
+       appear in the installation's CURRENT user-accessible repository
+       listing — membership is never inferred from the persisted row.
+
+    Fail-closed: any GitHub API/refresh failure returns False and is never
+    cached. Successful listings are cached briefly (PERM_CACHE_TTL_S is read
+    at each call so tests can shrink it); _clear_user_perm_cache drops a
+    user's entries on every successful OAuth re-connect, and entries expire
+    on their own, so no access can outlive GitHub's statement about it.
     """
     if row is None or not row.installation_id:
         return False
@@ -689,4 +760,51 @@ def installation_verified_for_user(
     )
     if auth is None or row.github_user_id is None:
         return False
-    return int(row.github_user_id) == int(auth.github_user_id)
+    if int(row.github_user_id) != int(auth.github_user_id):
+        return False
+
+    from app.github import client as _gh
+
+    token = get_user_token(db, user)
+    user_token = (token or {}).get("token", "")
+    if not user_token:
+        # Revoked/expired-beyond-refresh/corrupt secret: no live proof can
+        # exist, so nothing to ask GitHub for. Refuse.
+        return False
+
+    iid = str(row.installation_id)
+    now = time.time()
+    ttl = PERM_CACHE_TTL_S
+
+    installs = _PERM_INSTALL_CACHE.get(user.id)
+    if installs is None or installs[0] <= now:
+        try:
+            ids = frozenset(
+                str(i.get("id", ""))
+                for i in _gh.list_user_installations(token=user_token)
+                if str(i.get("id", ""))
+            )
+            _PERM_INSTALL_CACHE[user.id] = (time.time() + ttl, ids)
+        except Exception:
+            _clear_user_perm_cache(user.id)  # a failure caches nothing
+            return False
+        installs = _PERM_INSTALL_CACHE[user.id]
+    if iid not in installs[1]:
+        return False
+
+    allowed = _PERM_REPO_CACHE.get((user.id, iid))
+    if allowed is None or allowed[0] <= now:
+        try:
+            names = frozenset(
+                str(r.get("full_name", ""))
+                for r in _gh.list_user_installation_repos(
+                    token=user_token, installation_id=iid
+                )
+                if r.get("full_name")
+            )
+        except Exception:
+            _PERM_REPO_CACHE.pop((user.id, iid), None)  # failures never cached
+            return False
+        _PERM_REPO_CACHE[(user.id, iid)] = (time.time() + ttl, names)
+        allowed = _PERM_REPO_CACHE[(user.id, iid)]
+    return str(row.github_full_name) in allowed[1]

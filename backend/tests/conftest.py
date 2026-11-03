@@ -166,6 +166,23 @@ def db():
         s.close()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_live_perm_cache():
+    """The live-permission cache (app/github/install.py) is process-global.
+
+    User ids repeat across tests (the DB is recreated per test), so leftover
+    entries would leak one test's GitHub truth into the next: every test
+    starts AND ends with the cache empty.
+    """
+    import app.github.install as _install
+
+    _install._clear_user_perm_cache()
+    try:
+        yield
+    finally:
+        _install._clear_user_perm_cache()
+
+
 @pytest.fixture()
 def enc_key(monkeypatch):
     """Throwaway Fernet master key for credential tests (never production)."""

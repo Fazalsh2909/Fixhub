@@ -11,9 +11,27 @@ def _authed(db, email="rb@example.com"):
     return u, session_cookies(db, u)
 
 
-def _connected(db, user, full_name="u/demo"):
+def _connected(db, user, full_name="u/demo", monkeypatch=None):
     from tests.conftest import make_github_identity
 
+    if monkeypatch is not None:
+        # The mint gate revalidates grants against GitHub's CURRENT
+        # /user/installations + per-installation repo listing (real
+        # authorization logic is never stubbed — only github.com itself).
+        from app.github import client as _gh
+
+        monkeypatch.setattr(
+            _gh,
+            "list_user_installations",
+            lambda *, token: [{"id": "99", "account": "u", "type": "User"}],
+        )
+        monkeypatch.setattr(
+            _gh,
+            "list_user_installation_repos",
+            lambda *, token, installation_id: [
+                {"full_name": full_name, "private": False, "default_branch": "main"}
+            ],
+        )
     gh_id = make_github_identity(
         db, user, login=full_name.split("/")[0], installations=("99",)
     )
@@ -38,7 +56,7 @@ def test_contents_lists_directory(db, monkeypatch):
     from app.github import client as _gh
 
     u, cookies = _authed(db)
-    _connected(db, u)
+    _connected(db, u, monkeypatch=monkeypatch)
     _no_github(monkeypatch)
     monkeypatch.setattr(_gh, "repo_dir_contents", lambda **k: [
         {"name": "app.py", "type": "file", "size": 10, "sha": "a"},
@@ -62,7 +80,7 @@ def test_contents_maps_value_error_to_400(db, monkeypatch):
     from app.github import client as _gh
 
     u, cookies = _authed(db)
-    _connected(db, u)
+    _connected(db, u, monkeypatch=monkeypatch)
     _no_github(monkeypatch)
 
     def _boom(**k):
@@ -78,7 +96,7 @@ def test_file_returns_content_shape(db, monkeypatch):
     from app.github import client as _gh
 
     u, cookies = _authed(db)
-    _connected(db, u)
+    _connected(db, u, monkeypatch=monkeypatch)
     _no_github(monkeypatch)
     monkeypatch.setattr(_gh, "repo_file_content", lambda **k: {
         "content": "x = 1\n", "truncated": False, "binary": False, "size": 6})
@@ -101,7 +119,7 @@ def test_published_diff_returns_diffinfo_shape(db, monkeypatch):
     from app.github import client as _gh
 
     u, cookies = _authed(db)
-    _connected(db, u, "acme/demo")
+    _connected(db, u, "acme/demo", monkeypatch=monkeypatch)
     _no_github(monkeypatch)
     db.add(Task(repository="acme/demo", trigger_type="ci", status="COMPLETED",
                 branch="fixhub-fixes/ci-abc-task-1", pr_number=11, pr_url="http://pr/11",

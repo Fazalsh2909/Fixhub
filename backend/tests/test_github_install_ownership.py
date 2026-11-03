@@ -17,6 +17,8 @@ Contract under test:
 """
 
 import hashlib
+import hmac
+import json
 import threading
 from urllib.parse import parse_qs, urlparse
 
@@ -24,7 +26,7 @@ from fastapi.testclient import TestClient
 
 import app.github.install as _install
 from app.config import settings
-from app.db.models import GitHubAuthorization, GitHubConnection, Repository
+from app.db.models import GitHubAuthorization, GitHubConnection, Repository, Task
 from app.main import app
 from tests.conftest import make_user, session_cookies
 
@@ -1050,3 +1052,466 @@ def test_connect_without_verified_identity_explains_oauth(db, monkeypatch):
     assert body["github_authorization_required"] is True
     assert body["start_url"] == _install.INSTALL_START_URL
     assert db.query(GitHubConnection).filter(GitHubConnection.user_id == u.id).count() == 0
+
+
+# --- repository-level authorization: mint-time permission revalidation --------
+#
+# The browser gate (app.github.install.installation_verified_for_user) no
+# longer trusts the persisted github_user_id alone: before ANY installation
+# token is minted it must reconfirm against GitHub's CURRENT grants
+# (/user/installations AND the per-installation user-accessible repository
+# listing). These tests stub ONLY github.com's HTTP surface (the shared
+# registry) — FixHub's own gate/refresh/consume logic always runs for real.
+
+
+def _recording_mint(monkeypatch) -> list[str]:
+    """Accepted paths append here; rejected paths must leave it EMPTY."""
+    from app.github import app_auth as _auth
+
+    mints: list[str] = []
+
+    def _mint(iid):
+        mints.append(str(iid))
+        return "minted-" + str(iid)
+
+    monkeypatch.setattr(_auth, "installation_token", _mint)
+    return mints
+
+
+def _reconciled_row(db, monkeypatch, c, docs, *, token, gh_id, login, iid, full_name):
+    """Create a legacy repo row and let the OAuth reconcile verify it for real.
+
+    Returns (user, persisted Repository row) after the passing callback.
+    """
+    u = make_user(db, email=f"{login}@example.com")
+    db.add(
+        Repository(
+            github_full_name=full_name,
+            installation_id=iid,
+            owner_id=u.id,
+            github_user_id=None,  # legacy: decided by GitHub, never by the client
+        )
+    )
+    db.commit()
+    docs["cs"] = session_cookies(db, u)
+    r = _drive_authorization(
+        monkeypatch,
+        c,
+        docs["cs"],
+        token=token,
+        gh_id=gh_id,
+        login=login,
+        installations=[{"id": iid, "account": login, "type": "User"}],
+        repos_by_installation={
+            iid: [{"full_name": full_name, "private": False, "default_branch": "main"}]
+        },
+    )
+    assert r.status_code == 302, r.text
+    row = (
+        db.query(Repository).filter(Repository.github_full_name == full_name).first()
+    )
+    assert row is not None and row.github_user_id == gh_id
+    return u, row
+
+
+def test_reconcile_verifies_only_github_listed_repositories(db, monkeypatch):
+    """Legacy repos: verified ONLY when the exact full_name appears in the
+    user's accessible listing; installation membership alone is NOT enough,
+    and unlisted rows are preserved (never deleted)."""
+    u = make_user(db, email="recon-owner@example.com")
+    db.add(
+        Repository(
+            github_full_name="recon/listed",
+            installation_id="ri-1",
+            owner_id=u.id,
+            github_user_id=None,
+        )
+    )
+    db.add(
+        Repository(
+            github_full_name="recon/hidden",
+            installation_id="ri-1",
+            owner_id=u.id,
+            github_user_id=None,
+        )
+    )
+    db.commit()
+    docs = {"cs": session_cookies(db, u)}
+    c = TestClient(app)
+    r = _drive_authorization(
+        monkeypatch,
+        c,
+        docs["cs"],
+        token="tok-recon",
+        gh_id=651,
+        login="recon-user",
+        installations=[{"id": "ri-1", "account": "recon-user", "type": "User"}],
+        repos_by_installation={
+            "ri-1": [
+                {"full_name": "recon/listed", "private": False, "default_branch": "main"}
+            ]
+        },
+    )
+    assert r.status_code == 302, r.text
+    listed = (
+        db.query(Repository)
+        .filter(Repository.github_full_name == "recon/listed")
+        .first()
+    )
+    hidden = (
+        db.query(Repository)
+        .filter(Repository.github_full_name == "recon/hidden")
+        .first()
+    )
+    # A repository the user can access IS verified.
+    assert listed is not None
+    assert listed.github_user_id == 651 and listed.verified_at is not None
+    # Valid installation but absent from the listing: NOT verified, and the
+    # row is preserved rather than deleted.
+    assert hidden is not None
+    assert hidden.github_user_id is None and hidden.verified_at is None
+
+
+def test_reconcile_listing_failure_never_verifies(db, monkeypatch):
+    """A GitHub API failure during reconcile is not verification: the row
+    stays unverified while the installation reconcile still succeeds."""
+    from app.github import client as _gh
+
+    u = make_user(db, email="recon-flaky@example.com")
+    db.add(
+        Repository(
+            github_full_name="recon/real",
+            installation_id="rf-1",
+            owner_id=u.id,
+            github_user_id=None,
+        )
+    )
+    db.commit()
+    docs = {"cs": session_cookies(db, u)}
+    c = TestClient(app)
+    _enable_oauth(monkeypatch)
+    _stub_github(
+        monkeypatch,
+        token="tok-flaky",
+        gh_id=653,
+        login="flaky-user",
+        installations=[{"id": "rf-1", "account": "flaky-user", "type": "User"}],
+        repos_by_installation={"rf-1": [{"full_name": "recon/real"}]},
+    )
+
+    def _github_500(*, token, installation_id):
+        raise RuntimeError("github 502")
+
+    monkeypatch.setattr(_gh, "list_user_installation_repos", _github_500)
+    flow = _start_flow(c, docs["cs"])
+    r = _callback(c, docs["cs"], flow["cookie"], flow["state"])
+    # The OAuth flow still succeeds overall (the reconcile is resilient).
+    assert r.status_code == 302, r.text
+    row = (
+        db.query(Repository).filter(Repository.github_full_name == "recon/real").first()
+    )
+    # Broken listing != verified: the row is never stamped on API failure.
+    assert row is not None
+    assert row.github_user_id is None and row.verified_at is None
+    # The installation WAS confirmed; browser access stays refused meanwhile.
+    insts = [i["id"] for i in c.get("/api/github/installations", cookies=docs["cs"]).json()]
+    assert insts == ["rf-1"]
+    _fail_no_mint(monkeypatch)
+    refused = c.get("/api/github/issues?repo=recon/real", cookies=docs["cs"])
+    assert refused.status_code == 400, refused.text
+
+
+def test_repo_removed_from_user_listing_denied_without_mint(db, monkeypatch):
+    """When the repo vanishes from the user's accessible listing, the next
+    browser request is refused with NO token minted; the row is preserved."""
+    c = TestClient(app)
+    docs: dict = {}
+    u, _row = _reconciled_row(
+        db,
+        monkeypatch,
+        c,
+        docs,
+        token="tok-live",
+        gh_id=661,
+        login="live-owner",
+        iid="li-1",
+        full_name="live/repo",
+    )
+    from app.github import client as _gh
+
+    mints = _recording_mint(monkeypatch)
+    monkeypatch.setattr(
+        _gh,
+        "list_issues",
+        lambda *, token, full_name, state="open", limit=50: [
+            {"number": 1, "title": "t", "body": "b", "url": "", "labels": []}
+        ],
+    )
+    ok = c.get("/api/github/issues?repo=live/repo", cookies=docs["cs"])
+    assert ok.status_code == 200, ok.text
+    assert mints == ["li-1"]
+    # GitHub's truth changes: the user can no longer see this repository.
+    monkeypatch._fixhub_gh_registry["repos"]["li-1"] = []
+    _install._clear_user_perm_cache()  # the designed invalidation hook
+    mints.clear()
+    denied = c.get("/api/github/issues?repo=live/repo", cookies=docs["cs"])
+    assert denied.status_code == 400, denied.text
+    assert denied.json()["github_authorization_required"] is True
+    assert mints == []  # no installation token for a rejected request
+    # The repository row is preserved (usable again once access returns).
+    preserved = (
+        db.query(Repository).filter(Repository.github_full_name == "live/repo").first()
+    )
+    assert preserved is not None and preserved.owner_id == u.id
+
+
+def test_installation_removed_denied_without_mint(db, monkeypatch):
+    """When the installation leaves the user's installation listing, minting
+    is refused for every repo under it — no token, row preserved."""
+    c = TestClient(app)
+    docs: dict = {}
+    u, _row = _reconciled_row(
+        db,
+        monkeypatch,
+        c,
+        docs,
+        token="tok-uninst",
+        gh_id=663,
+        login="uninst-owner",
+        iid="ui-1",
+        full_name="uninst/repo",
+    )
+    mints = _recording_mint(monkeypatch)
+    monkeypatch._fixhub_gh_registry["tokens"]["tok-uninst"]["installations"] = []
+    _install._clear_user_perm_cache()
+    r = c.get("/api/github/issues?repo=uninst/repo", cookies=docs["cs"])
+    assert r.status_code == 400, r.text
+    assert r.json()["github_authorization_required"] is True
+    assert mints == []
+    preserved = (
+        db.query(Repository)
+        .filter(Repository.github_full_name == "uninst/repo")
+        .first()
+    )
+    assert preserved is not None and preserved.owner_id == u.id
+
+
+def test_revoked_user_authorization_cannot_mint_tokens(db, monkeypatch):
+    """Revoked/cleared stored tokens stop minting immediately; and even a
+    fresh DB-side token cannot mint while GitHub cannot vouch (fail closed)."""
+    c = TestClient(app)
+    docs: dict = {}
+    u, _row = _reconciled_row(
+        db,
+        monkeypatch,
+        c,
+        docs,
+        token="tok-revoke",
+        gh_id=665,
+        login="revoke-owner",
+        iid="rv-1",
+        full_name="revoke/repo",
+    )
+    registry = monkeypatch._fixhub_gh_registry
+    _fail_no_mint(monkeypatch)  # any mint during refusal fails the test
+    from app.github import client as _gh
+    from app.llm import crypto as _crypto
+
+    auth_row = (
+        db.query(GitHubAuthorization).filter(GitHubAuthorization.user_id == u.id).first()
+    )
+    # 1) The stored user token is revoked in DB reality (empty ciphertext):
+    #    get_user_token refuses, so the gate denies with no GitHub call.
+    auth_row.encrypted_user_token = ""
+    db.commit()
+    r = c.get("/api/github/issues?repo=revoke/repo", cookies=docs["cs"])
+    assert r.status_code == 400, r.text
+    assert r.json()["github_authorization_required"] is True
+    # 2) A fresh stored token is not enough while GitHub cannot establish
+    #    permission: a failing listing must fail CLOSED (never "pass").
+    auth_row.encrypted_user_token = _crypto.encrypt_secret("tok-fresh")
+    db.commit()
+    registry["tokens"]["tok-fresh"] = {
+        "gh_id": 665,
+        "login": "revoke-owner",
+        "installations": [{"id": "rv-1", "account": "revoke-owner", "type": "User"}],
+    }
+
+    def _github_down(*, token):
+        raise RuntimeError("github unreachable")
+
+    monkeypatch.setattr(_gh, "list_user_installations", _github_down)
+    _install._clear_user_perm_cache()
+    r2 = c.get("/api/github/issues?repo=revoke/repo", cookies=docs["cs"])
+    assert r2.status_code == 400, r2.text
+    # 3) Once GitHub answers truthfully again, the SAME fresh token proves
+    #    access and minting resumes — recovery requires current GitHub truth.
+    monkeypatch.setattr(
+        _gh,
+        "list_user_installations",
+        lambda *, token: (
+            list(registry["tokens"][token]["installations"])
+            if token in registry["tokens"]
+            else []
+        ),
+    )
+    minted = _recording_mint(monkeypatch)
+    monkeypatch.setattr(
+        _gh,
+        "list_issues",
+        lambda *, token, full_name, state="open", limit=50: [
+            {"number": 1, "title": "t", "body": "b", "url": "", "labels": []}
+        ],
+    )
+    monkeypatch.setattr(
+        _gh,
+        "list_user_installation_repos",
+        lambda *, token, installation_id: (
+            list(registry["repos"].get(str(installation_id), []))
+            if token in registry["tokens"]
+            else []
+        ),
+    )
+    _install._clear_user_perm_cache()
+    r3 = c.get("/api/github/issues?repo=revoke/repo", cookies=docs["cs"])
+    assert r3.status_code == 200, r3.text
+    assert minted == ["rv-1"]
+
+
+def test_legitimate_access_keeps_working_and_cache_is_short_lived(db, monkeypatch):
+    """The exact verified repository keeps working end to end; within the
+    short TTL the gate does NOT re-query GitHub, after expiry it re-asks."""
+    c = TestClient(app)
+    docs: dict = {}
+    u, _row = _reconciled_row(
+        db,
+        monkeypatch,
+        c,
+        docs,
+        token="tok-legit",
+        gh_id=667,
+        login="legit-owner",
+        iid="lg-1",
+        full_name="legit/app",
+    )
+    from app.github import client as _gh
+
+    registry = monkeypatch._fixhub_gh_registry
+    repo_calls: list[str] = []
+
+    def _watch_repos(*, token, installation_id):
+        repo_calls.append(str(installation_id))
+        if token not in registry["tokens"]:
+            return []
+        return list(registry["repos"].get(str(installation_id), []))
+
+    monkeypatch.setattr(_gh, "list_user_installation_repos", _watch_repos)
+    mints = _recording_mint(monkeypatch)
+    monkeypatch.setattr(
+        _gh,
+        "list_issues",
+        lambda *, token, full_name, state="open", limit=50: [
+            {"number": 7, "title": "t", "body": "b", "url": "", "labels": []}
+        ],
+    )
+    r1 = c.get("/api/github/issues?repo=legit/app", cookies=docs["cs"])
+    assert r1.status_code == 200, r1.text
+    assert r1.json()[0]["number"] == 7
+    assert mints == ["lg-1"]
+    first = len(repo_calls)
+    # Second request inside the TTL: cached listing, GitHub not re-queried…
+    r2 = c.get("/api/github/issues?repo=legit/app", cookies=docs["cs"])
+    assert r2.status_code == 200, r2.text
+    assert len(repo_calls) == first
+    # …and after expiry (the TTL is read at call time) the gate re-asks
+    # GitHub instead of extending a stale decision: every subsequent request
+    # re-queries because a TTL-0 entry is born already expired.
+    monkeypatch.setattr(_install, "PERM_CACHE_TTL_S", 0)
+    _install._clear_user_perm_cache()
+    r3 = c.get("/api/github/issues?repo=legit/app", cookies=docs["cs"])
+    assert r3.status_code == 200, r3.text
+    assert len(repo_calls) == first + 1
+    r4 = c.get("/api/github/issues?repo=legit/app", cookies=docs["cs"])
+    assert r4.status_code == 200, r4.text
+    assert len(repo_calls) == first + 2
+    # Restore the normal TTL: one re-query after the clear, then cache hits.
+    monkeypatch.setattr(_install, "PERM_CACHE_TTL_S", 60)
+    _install._clear_user_perm_cache()
+    r5 = c.get("/api/github/issues?repo=legit/app", cookies=docs["cs"])
+    assert r5.status_code == 200, r5.text
+    assert len(repo_calls) == first + 3
+    r6 = c.get("/api/github/issues?repo=legit/app", cookies=docs["cs"])
+    assert r6.status_code == 200, r6.text
+    assert len(repo_calls) == first + 3  # back inside the TTL: cache hit
+
+
+def _webhook_sig(body: bytes) -> str:
+    """Same contract as tests/test_github_ownership.py (conftest secret)."""
+    return "sha256=" + hmac.new(b"test-secret", body, hashlib.sha256).hexdigest()
+
+
+def _post_webhook(c, payload, delivery, event="issues"):
+    body = json.dumps(payload).encode()
+    return c.post(
+        "/webhooks/github",
+        content=body,
+        headers={
+            "X-Hub-Signature-256": _webhook_sig(body),
+            "X-GitHub-Delivery": delivery,
+            "X-GitHub-Event": event,
+        },
+    )
+
+
+def test_webhook_automation_ignores_user_permission_state(db, monkeypatch):
+    """A repo whose user-facing authorization is severed (legacy row, no
+    listing, no usable user token) still accepts webhook-driven tasks."""
+    ua = make_user(db, email="hook-owner@example.com")
+    db.add(GitHubConnection(user_id=ua.id, installation_id="4242"))
+    db.add(
+        Repository(
+            github_full_name="acme/hooked",
+            installation_id="4242",
+            owner_id=ua.id,
+            github_user_id=None,  # browser gate refuses this row
+        )
+    )
+    db.commit()
+    docs = {"cs": session_cookies(db, ua)}
+    _fail_no_mint(monkeypatch)  # and the webhook path must not mint either
+    c = TestClient(app)
+    # The browser path is closed for this repo…
+    r_browser = c.get("/api/github/issues?repo=acme/hooked", cookies=docs["cs"])
+    assert r_browser.status_code == 400, r_browser.text
+    # …while signature-validated webhook automation still creates tasks.
+    payload = {
+        "action": "opened",
+        "installation": {"id": 4242},
+        "repository": {"full_name": "acme/hooked"},
+        "issue": {
+            "number": 421,
+            "title": "t",
+            "body": "b",
+            "html_url": "",
+            "labels": [],
+        },
+    }
+    r = _post_webhook(c, payload, "d-hook-1")
+    assert r.status_code == 200, r.text
+    assert r.json()["task_id"]
+    t = db.query(Task).filter(Task.issue_number == 421).first()
+    assert t is not None and t.owner_id == ua.id
+    # Sever the stored user token (authorization revoked) and try again: the
+    # next webhook keeps working, still independent of the browser gate.
+    auth_row = (
+        db.query(GitHubAuthorization).filter(GitHubAuthorization.user_id == ua.id).first()
+    )
+    if auth_row is not None:
+        auth_row.encrypted_user_token = ""
+        db.commit()
+    payload["issue"]["number"] = 422
+    r2 = _post_webhook(c, payload, "d-hook-2")
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["task_id"]
+    t2 = db.query(Task).filter(Task.issue_number == 422).first()
+    assert t2 is not None and t2.owner_id == ua.id
