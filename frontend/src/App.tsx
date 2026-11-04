@@ -131,15 +131,15 @@ function overviewGithubHint(status: GithubStatus): string {
     case "loading":
       return "Checking GitHub connection…";
     case "unauthorized":
-      return "GitHub isn’t connected — open Repositories to connect it.";
+      return "GitHub isn’t connected yet — use Connect GitHub to authorize FixHub.";
     case "reauth":
-      return "GitHub authorization needs to be repeated — open Repositories to reconnect.";
+      return "GitHub authorization needs to be repeated — use Reconnect GitHub.";
     case "no_installations":
-      return "GitHub is connected, but the FixHub GitHub App isn’t installed yet — open Repositories.";
+      return "GitHub is connected, but the FixHub GitHub App isn’t installed yet — use Install GitHub App.";
     case "no_repositories":
-      return "The FixHub GitHub App has no accessible repositories — open Repositories.";
+      return "The FixHub GitHub App has no accessible repositories — manage it from Repositories.";
     case "unavailable":
-      return "GitHub is temporarily unavailable — open Repositories to retry.";
+      return "GitHub is temporarily unavailable — retry from Repositories.";
     default:
       return "";
   }
@@ -184,6 +184,8 @@ export default function App() {
   const connectedRepos = connectedCount(github.groups);
   const oauthNextPath = nav === "Settings" ? "/?view=settings" : "/?view=repositories";
   const oauthHref = githubStartUrl(oauthNextPath);
+  const githubInstallUrl = githubConfig?.install_url || "";
+  const githubOauthDisabled = githubConfig?.oauth_enabled === false;
 
   // A reachable Redis is not a working queue: with zero live RQ workers every
   // new task sits in QUEUED forever. workers === -1 means introspection failed
@@ -204,6 +206,68 @@ export default function App() {
 
   // Title fallback for tasks without an issue title (e.g. CI runs).
   const taskTitle = (t: TaskSummary) => t.issue_title || `${t.trigger_type} · ${t.repository}`;
+
+  // One GitHub action, visible in the header on every screen. The user should
+  // never have to discover the Repositories tab before they can connect.
+  const githubHeaderAction = () => {
+    if (githubStatus === "unauthorized" || githubStatus === "reauth") {
+      const label = githubStatus === "reauth" ? "Reconnect GitHub" : "Connect GitHub";
+      if (githubOauthDisabled) {
+        return (
+          <button
+            type="button"
+            className="ui-btn ui-btn-primary ui-btn-sm header-github-cta"
+            disabled
+            title="GitHub sign-in isn’t configured on this server."
+          >
+            <GitBranch size={14} /> {label}
+          </button>
+        );
+      }
+      return (
+        <a className="ui-btn ui-btn-primary ui-btn-sm header-github-cta" href={oauthHref}>
+          <GitBranch size={14} /> {label}
+        </a>
+      );
+    }
+    if (githubStatus === "no_installations") {
+      if (githubInstallUrl) {
+        return (
+          <a
+            className="ui-btn ui-btn-primary ui-btn-sm header-github-cta"
+            href={githubInstallUrl}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <GitBranch size={14} /> Install GitHub App
+          </a>
+        );
+      }
+      return (
+        <button
+          type="button"
+          className="ui-btn ui-btn-outline ui-btn-sm header-github-cta"
+          onClick={() => setNav("Repositories")}
+          title="The GitHub App install URL isn’t configured."
+        >
+          <GitBranch size={14} /> GitHub setup needed
+        </button>
+      );
+    }
+    if (githubStatus === "ready" || githubStatus === "no_repositories") {
+      return (
+        <button
+          type="button"
+          className="ui-btn ui-btn-outline ui-btn-sm header-github-cta"
+          onClick={() => setNav("Repositories")}
+          title="Manage GitHub repositories"
+        >
+          <Check size={14} /> GitHub connected
+        </button>
+      );
+    }
+    return null;
+  };
 
   const refreshGithub = useCallback(async (showLoading = false) => {
     if (showLoading) setGithub((prev) => ({ ...prev, loading: true }));
@@ -487,6 +551,7 @@ export default function App() {
         </div>
         <div className="header-actions">
           {msg && <span className="header-message" role="status">{msg}<button className="header-dismiss" aria-label="Dismiss message" onClick={() => setMsg("")}><X size={12} /></button></span>}
+          {githubHeaderAction()}
           <Button variant="ghost" onClick={loadAll} aria-label="Refresh tasks and repositories"><RefreshCw size={15} /> Refresh</Button>
           <span className="avatar" title={user.display_name || user.email}>
             {(user.display_name || user.email).slice(0, 2).toUpperCase()}

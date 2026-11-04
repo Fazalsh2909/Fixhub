@@ -45,6 +45,7 @@ svg.lucide { flex:none; }
 .repo-context { color:var(--muted-foreground); display:flex; align-items:center; gap:6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .header-status { display:flex; align-items:center; gap:6px; }
 .header-actions { margin-left:auto;display:flex;align-items:center;gap:8px; flex:none; }
+.header-github-cta { white-space:nowrap; flex:none; }
 .header-message { color:var(--muted-foreground);max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; display:flex; align-items:center; gap:6px; font-size:12px; }
 .header-dismiss { border:1px solid var(--border); background:transparent; border-radius:var(--radius-sm); cursor:pointer; color:var(--muted-foreground); width:22px; height:22px; display:grid; place-items:center; }
 .header-dismiss:hover { color:var(--foreground); border-color:var(--border-strong); }

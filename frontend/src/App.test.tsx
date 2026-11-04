@@ -117,11 +117,91 @@ describe("GitHub connection", () => {
     await openRepositories();
 
     expect(await screen.findByText("Not connected")).not.toBeNull();
-    const link = screen.getByRole("link", { name: "Connect GitHub" });
+    const card = document.querySelector(".github-card") as HTMLElement;
+    const link = within(card).getByRole("link", { name: "Connect GitHub" });
     expect(link.getAttribute("href")).toBe(
       "/api/github/install/start?next=%2F%3Fview%3Drepositories",
     );
     expect(screen.queryByText(/No GitHub installations/i)).toBeNull();
+  });
+
+  it("shows a persistent Connect GitHub action in the header", async () => {
+    await renderAuthed(
+      baseRoutes(() =>
+        json(
+          {
+            error: "connect your GitHub account first",
+            github_authorization_required: true,
+            start_url: "/api/github/install/start",
+          },
+          400,
+        ),
+      ),
+    );
+
+    const header = document.querySelector(".app-header") as HTMLElement;
+    const link = await within(header).findByRole("link", {
+      name: "Connect GitHub",
+    });
+    expect(link.getAttribute("href")).toBe(
+      "/api/github/install/start?next=%2F%3Fview%3Drepositories",
+    );
+  });
+
+  it("disables the header Connect action when OAuth is not configured", async () => {
+    await renderAuthed(
+      baseRoutes(
+        () =>
+          json(
+            {
+              error: "connect your GitHub account first",
+              github_authorization_required: true,
+              start_url: "/api/github/install/start",
+            },
+            400,
+          ),
+        {
+          "GET /api/github/config": () =>
+            json({
+              install_url: "",
+              oauth_enabled: false,
+              start_url: "/api/github/install/start",
+            }),
+        },
+      ),
+    );
+
+    const header = document.querySelector(".app-header") as HTMLElement;
+    const button = await within(header).findByRole("button", {
+      name: "Connect GitHub",
+    });
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("shows the connected state in the header once GitHub is ready", async () => {
+    await renderAuthed(
+      baseRoutes(() =>
+        json(
+          groupWith([
+            {
+              github_full_name: "acme/connected",
+              private: false,
+              default_branch: "main",
+              connected: true,
+              installation_id: "123",
+            },
+          ]),
+        ),
+      ),
+    );
+
+    const header = document.querySelector(".app-header") as HTMLElement;
+    expect(
+      await within(header).findByRole("button", { name: "GitHub connected" }),
+    ).not.toBeNull();
+    expect(
+      within(header).queryByRole("link", { name: "Connect GitHub" }),
+    ).toBeNull();
   });
 
   it("offers the App install action when authorized with zero installations", async () => {
@@ -129,7 +209,8 @@ describe("GitHub connection", () => {
     await openRepositories();
 
     expect(await screen.findByText("App not installed")).not.toBeNull();
-    const link = screen.getByRole("link", { name: /Install GitHub App/i });
+    const card = document.querySelector(".github-card") as HTMLElement;
+    const link = within(card).getByRole("link", { name: /Install GitHub App/i });
     expect(link.getAttribute("href")).toBe(INSTALL_URL);
     expect(
       screen.getByRole("button", { name: "Refresh GitHub connection" }),
