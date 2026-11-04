@@ -28,7 +28,7 @@ import {
 } from "lucide-react";
 import RepoExplorer from "./components/RepoExplorer";
 import ReviewPanel from "./components/ReviewPanel";
-import TraceView from "./components/TraceView";
+import ActivityFeed from "./components/ActivityFeed";
 import {
   GithubConnectionCard,
   GithubNotice,
@@ -513,11 +513,9 @@ export default function App() {
     { label: "Repositories", Icon: LayoutGrid },
   ];
 
-  const progressSteps = ["Understand issue", "Inspect repository", "Implement fix", "Validate changes", "Open pull request"];
-  // Truthful mapping: only derive the active step from the stored task status,
-  // never a hard-coded index. Unknown/transient states show no active step.
-  const activeStep = task?.status === "RUNNING" ? 2 : task?.status === "AWAITING_CI" ? 4 : -1;
-  const stepsDone = task?.status === "COMPLETED" ? progressSteps.map(() => true) : progressSteps.map((_, i) => activeStep > 0 && i < activeStep);
+  // Activity is the primary right-panel experience; review and notes stay
+  // one click away in a dock so neither overwhelms the feed.
+  const [dock, setDock] = useState<"review" | "notes">("review");
 
   if (authLoading) {
     return (
@@ -758,29 +756,40 @@ export default function App() {
                 <div className="issue-branch"><GitBranch size={13} /> {task.branch || "branch pending"}</div>
               </Card>
 
-              <SectionLabel>Agent progress</SectionLabel>
-              <Card className="progress-card">
-                {progressSteps.map((step, i) => {
-                  const active = i === activeStep;
-                  const done = stepsDone[i];
-                  return (
-                    <div key={step} className={`progress-step ${active ? "active" : ""} ${done ? "done" : ""}`} aria-current={active ? "step" : undefined}>
-                      <span className="step-icon">{done ? <Check size={11} /> : active ? <LoaderCircle size={11} className="spin" /> : i + 1}</span>
-                      <span>{step}</span>
-                      {active && <span className="step-live">working</span>}
-                    </div>
-                  );
-                })}
-              </Card>
+              <div className="activity-shell">
+                <ActivityFeed taskId={taskId} status={task.status} error={task.error} />
+              </div>
 
-              <SectionLabel action={<span className="live-label"><span className="worker-dot online" /> Live</span>}>Agent trace</SectionLabel>
-              <div className="trace-shell"><TraceView taskId={taskId} /></div>
-
-              <SectionLabel>Review</SectionLabel>
-              <div className="review-shell"><ReviewPanel task={task} onChanged={loadAll} onDiffRefresh={() => setDiffKey((k) => k + 1)} /></div>
-
-              <SectionLabel>Notes</SectionLabel>
-              <div className="chat-shell"><ChatPanel taskId={taskId} /></div>
+              <div className="agent-dock">
+                <div className="segmented agent-dock-tabs" role="tablist" aria-label="Review and notes">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={dock === "review"}
+                    className={dock === "review" ? "active" : ""}
+                    onClick={() => setDock("review")}
+                  >
+                    Review
+                    {task.status === "NEEDS_REVIEW" && <span className="dock-flag" aria-label="Action needed" />}
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={dock === "notes"}
+                    className={dock === "notes" ? "active" : ""}
+                    onClick={() => setDock("notes")}
+                  >
+                    Notes
+                  </button>
+                </div>
+                <div className="agent-dock-body" role="tabpanel">
+                  {dock === "review" ? (
+                    <ReviewPanel task={task} onChanged={loadAll} onDiffRefresh={() => setDiffKey((k) => k + 1)} />
+                  ) : (
+                    <ChatPanel taskId={taskId} />
+                  )}
+                </div>
+              </div>
             </>
           ) : (
             <div className="agent-empty">

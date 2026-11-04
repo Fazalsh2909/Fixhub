@@ -342,6 +342,12 @@ def run_agent(
                     )
                 )
                 meta = _parse_command_result(result) if tc.name == "run_command" else {}
+                if meta:
+                    excerpt = _output_excerpt(
+                        result, command=str(args.get("command", ""))
+                    )
+                    if excerpt:
+                        meta["output"] = excerpt
                 # exit_code is authoritative (null = timeout). A non-zero
                 # command is a failed command, not a successful action: it must
                 # never count as progress or investigation evidence.
@@ -1032,9 +1038,20 @@ def _execute(workspace: str, name: str, args: dict) -> str:
         return f"ERROR: {exc}"
 
 
+_BODY_ARG_KEYS = {"content", "old", "new"}
+
+
 def _summarise_args(args: dict) -> dict:
+    """Operational metadata only.
+
+    File bodies (`content`, `old`, `new`) are never copied into a
+    TOOL_CALL event: the activity feed says what the agent did and
+    where, never the contents of the file or the edit payload.
+    """
     out = {}
     for k, v in (args or {}).items():
+        if k in _BODY_ARG_KEYS:
+            continue
         s = str(v)
         out[k] = s[:200] + ("..." if len(s) > 200 else "")
     return out
@@ -1060,6 +1077,81 @@ def _parse_command_result(text: str) -> dict:
     if m:
         out["timed_out"] = m.group(1) == "true"
     return out
+
+
+# Bounded command output attached to TOOL_CALL events for the activity panel.
+# Only command OUTPUT is persisted - never file bodies, never credentials: the
+# sandbox redacts registered secrets, token-shaped values are scrubbed again,
+# and the excerpt is capped so an event stays small.
+OUTPUT_EXCERPT_CHARS = 600
+_FILE_DUMP_COMMANDS = frozenset(
+    {
+        "cat",
+        "bat",
+        "head",
+        "tail",
+        "less",
+        "more",
+        "type",
+        "nl",
+        "xxd",
+        "hexdump",
+        "od",
+        "strings",
+        "base64",
+        "sed",
+        "awk",
+        "get-content",
+        "gc",
+    }
+)
+_SECRET_PATTERN = re.compile(
+    r"(gh[pousr]_[A-Za-z0-9]{16,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|sk-[A-Za-z0-9_-]{20,}"
+    r"|(?i:bearer)\s+[A-Za-z0-9._~+/=-]{16,})"
+)
+
+
+def _command_reads_files(command: str) -> bool:
+    """True when any shell segment dumps file contents.
+
+    Such output IS file content, so it must never be persisted in an event.
+    """
+    for token in re.split(r"[\s;&|()<>]+", command or ""):
+        if not token:
+            continue
+        name = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if name in _FILE_DUMP_COMMANDS:
+            return True
+    return False
+
+
+def _output_excerpt(
+    text: str, *, command: str = "", limit: int = OUTPUT_EXCERPT_CHARS
+) -> str:
+    """Bounded, redacted stdout/stderr excerpt for the activity panel.
+
+    Returns "" when nothing safe can be persisted: not a command result, no
+    output, or a command that dumps file contents.
+    """
+    if not text.startswith("exit_code:") or _command_reads_files(command):
+        return ""
+    try:
+        body = text.split("--- stdout ---\n", 1)[1]
+        stdout, stderr = body.split("\n--- stderr ---\n", 1)
+    except (IndexError, ValueError):
+        return ""
+    from app.sandbox import sandbox as _sandbox
+
+    parts = [part.strip() for part in (stdout, stderr) if part and part.strip()]
+    raw = _SECRET_PATTERN.sub("[REDACTED]", _sandbox.redact("\n".join(parts))).strip()
+    if not raw:
+        return ""
+    if len(raw) > limit:
+        # The tail holds the assertion/failure lines that explain a result.
+        raw = "\u2026" + raw[-max(0, limit - 1) :]
+    return raw
 
 
 def summarize_event(ev: dict) -> str:
