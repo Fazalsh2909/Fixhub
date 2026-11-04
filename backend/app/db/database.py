@@ -92,6 +92,9 @@ _SCHEMA_PATCHES = {
         ("ci_is_fork", "INTEGER NOT NULL DEFAULT 0"),
         ("ci_unobservable_ticks", "INTEGER NOT NULL DEFAULT 0"),
         ("active_issue_key", "VARCHAR(512)"),
+        # Task 1.8: persisted run provenance (browser vs trusted automation).
+        ("run_origin", "VARCHAR(16) NOT NULL DEFAULT 'automation'"),
+        ("run_actor_id", "INTEGER REFERENCES users(id)"),
     ],
     "repositories": [
         ("owner_id", "INTEGER REFERENCES users(id)"),

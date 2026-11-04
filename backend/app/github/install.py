@@ -75,6 +75,7 @@ from app.db.models import (
     GitHubAuthorization,
     GitHubConnection,
     Repository,
+    Task,
     User,
 )
 
@@ -808,3 +809,37 @@ def installation_verified_for_user(
         _PERM_REPO_CACHE[(user.id, iid)] = (time.time() + ttl, names)
         allowed = _PERM_REPO_CACHE[(user.id, iid)]
     return str(row.github_full_name) in allowed[1]
+
+
+def task_github_authorization(
+    db: Session, task: Task, user: User
+) -> tuple[bool, str]:
+    """Current GitHub truth for a browser-originated task operation.
+
+    Reuses installation_verified_for_user() (persisted identity binding, live
+    installation membership, then exact repository membership) for every task
+    bound to a GitHub App installation. Tasks with no GitHub binding have no
+    installation-token path to protect and are allowed so local/self-hosted
+    work (and the existing test fixtures) keep functioning.
+
+    Fail-closed when the task claims a repository binding but the Repository
+    row is gone: a formerly GitHub-backed run must never fall through to a
+    local push after the repo was disconnected.
+    """
+    full_name = str(getattr(task, "repository", "") or "")
+    row = (
+        db.query(Repository)
+        .filter(Repository.github_full_name == full_name)
+        .first()
+        if full_name
+        else None
+    )
+    if row is None:
+        if getattr(task, "repository_id", None) is not None:
+            return False, "repository is no longer connected"
+        return True, ""
+    if not str(row.installation_id or "").strip():
+        return True, ""
+    if installation_verified_for_user(row, db, user):
+        return True, ""
+    return False, f"GitHub access to {full_name} is no longer authorized"

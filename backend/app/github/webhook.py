@@ -920,6 +920,8 @@ def _handle_issue(db: Session, payload: dict) -> dict:
         repository_id=repo.id,
         owner_id=owner_id,
         trigger_type="issue",
+        # Task 1.8: signature-validated webhook automation (trusted path).
+        run_origin="automation",
         issue_number=issue.get("number"),
         issue_title=issue.get("title", "")[:500],
         issue_body=(issue.get("body") or "")[:8000],
@@ -1015,6 +1017,8 @@ def _handle_workflow_run(db: Session, payload: dict) -> dict:
         repository_id=repo.id,
         owner_id=owner_id,
         trigger_type="ci",
+        # Task 1.8: signature-validated webhook automation (trusted path).
+        run_origin="automation",
         ci_run_id=str(run.get("id", "")),
         ci_sha=sha,
         ci_workflow=workflow,
@@ -1123,6 +1127,8 @@ def _handle_check_run(db: Session, payload: dict) -> dict:
         repository_id=repo.id,
         owner_id=owner_id,
         trigger_type="ci",
+        # Task 1.8: signature-validated webhook automation (trusted path).
+        run_origin="automation",
         ci_run_id=run_id,
         ci_sha=sha,
         ci_job=job,

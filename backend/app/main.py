@@ -976,6 +976,13 @@ def create_task_from_issue(
             "duplicate": "active_task",
         }
         if dup.status == "QUEUED":
+            # Task 1.8: this browser action re-drives the queued run, so the
+            # worker must revalidate THIS user's current GitHub access when it
+            # starts. Persist provenance before the enqueue (never inferred
+            # from the existing task's trigger type).
+            dup.run_origin = "user"
+            dup.run_actor_id = user.id
+            db.commit()
             # Make the Fix button immediate even when the original enqueue was
             # lost (Redis restart/crash); the reconciler also covers this.
             started = _start_task(db, dup.id)
@@ -1002,6 +1009,11 @@ def create_task_from_issue(
         issue_body=issue["body"][:8000],
         issue_url=issue["url"],
         status="QUEUED",
+        # Task 1.8: this run was initiated by a browser session. Persist the
+        # authenticated actor so the worker revalidates their CURRENT GitHub
+        # access before minting an installation token or publishing.
+        run_origin="user",
+        run_actor_id=user.id,
     )
     db.add(task)
     db.commit()
@@ -1077,16 +1089,45 @@ def rerun_task(
     require_csrf(request)
     row = require_owned_task(task_id, user, db)
     status = str(row.status or "").upper()
+
+    from app.github import install as _install
+
+    def _github_authorization_required(reason: str):
+        """Task 1.8: reject a browser run before queue/execute with no token.
+
+        Same error contract as the other user-facing GitHub endpoints: a clear
+        400 carrying `github_authorization_required` + the re-verification URL.
+        """
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "task_id": task_id,
+                "queued": False,
+                "error": f"github_authorization_required: {reason}"[:1000],
+                **_install.oauth_required_payload(),
+            },
+        )
+
     if status in {"FAILED", "BLOCKED", "CANCELLED", "NEEDS_REVIEW"}:
         from sqlalchemy.exc import IntegrityError
 
         from app.tasks.service import _active_keys_for, cas_status
 
+        # Browser rerun: verify the authenticated owner's CURRENT GitHub
+        # access BEFORE re-queueing. Provenance is persisted atomically with
+        # the CAS, so the worker revalidates the same actor again.
+        ok, reason = _install.task_github_authorization(db, row, user)
+        if not ok:
+            return _github_authorization_required(reason)
         fields: dict = {
             "error": "",
             "claimed_by": "",
             "claimed_at": None,
             "lease_expires_at": None,
+            "run_origin": "user",
+            "run_actor_id": user.id,
         }
         # Re-take the active identity in the SAME update (a crash between two
         # commits would otherwise leave a terminal row holding the key).
@@ -1137,6 +1178,15 @@ def rerun_task(
                 ),
             },
         )
+    else:
+        # Already QUEUED/RUNNING: still a browser action that can put a job on
+        # the worker (or run inline), so gate it and persist the actor first.
+        ok, reason = _install.task_github_authorization(db, row, user)
+        if not ok:
+            return _github_authorization_required(reason)
+        row.run_origin = "user"
+        row.run_actor_id = user.id
+        db.commit()
     if sync:
         from app.tasks.service import run_task_inline
 

@@ -113,6 +113,20 @@ class Task(Base):
     owner_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id"), nullable=True, index=True
     )
+    # Task 1.8: persisted execution provenance — never inferred from title,
+    # branch, or request payload.
+    #   automation = created/triggered only by signature-validated GitHub
+    #                webhooks, their CI/issue processing, and CI repair
+    #                scheduling (App installation identity, no user token).
+    #   user       = a browser initiated the current run/approval; the worker
+    #                MUST revalidate run_actor_id's CURRENT GitHub grants
+    #                before minting an installation token or publishing.
+    run_origin: Mapped[str] = mapped_column(
+        String(16), default="automation", server_default="automation"
+    )
+    run_actor_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
     # Phase 4: worker claim/lease. claimed_by identifies the worker (or "sync");
     # lease_expires_at bounds crash recovery; queue_job_id tracks the RQ job.
     claimed_by: Mapped[str] = mapped_column(String(64), default="")

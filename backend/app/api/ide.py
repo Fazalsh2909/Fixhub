@@ -325,14 +325,43 @@ def approve(task_id: int, request: Request, payload: dict | None = None,
             user: User = Depends(get_current_user),
             db: Session = Depends(_db)) -> dict:
     """ReviewPanel Approve & Commit: publish pending NEEDS_REVIEW changes."""
+    from app.github import install as _install
     from app.tasks.service import approve_task as _approve
 
     require_csrf(request)
-    _task_or_404(db, task_id, user)
+    t = _task_or_404(db, task_id, user)
+    # Task 1.8: manual approval mints an installation token and publishes.
+    # Check the authenticated user's CURRENT GitHub access (task ownership,
+    # installation membership, exact repository membership) before the
+    # service layer runs; the service revalidates again with the actor id.
+    ok, reason = _install.task_github_authorization(db, t, user)
+    if not ok:
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "task_id": task_id,
+                "error": f"github_authorization_required: {reason}"[:1000],
+                **_install.oauth_required_payload(),
+            },
+        )
     title = str((payload or {}).get("title", ""))
     body = str((payload or {}).get("body", ""))
     # approve_task manages its own session (needs fresh state after agent run).
-    result = _approve(task_id, title=title, body=body)
+    # The authenticated actor comes from the session, never from the payload.
+    result = _approve(task_id, title=title, body=body, actor_id=user.id)
+    if result.get("github_authorization_required"):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=400,
+            content={
+                "task_id": task_id,
+                "error": str(result.get("error") or "github authorization required")[:1000],
+                **_install.oauth_required_payload(),
+            },
+        )
     if result.get("status") == "FAILED":
         raise HTTPException(status_code=500, detail=result.get("error", "approve failed")[:500])
     return result

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from app.agent import loop as _loop
 from app.config import settings
 from app.db.database import SessionLocal
-from app.db.models import PullRequest, Repository, Task, TaskEvent
+from app.db.models import PullRequest, Repository, Task, TaskEvent, User
 from app.github import app_auth as _app_auth
 from app.github import publisher as _pub
 from app.repo import workspace as _ws
@@ -225,6 +225,50 @@ def _repo_token(db, task: Task) -> str:
         return _app_auth.installation_token(installation_id)
     except Exception:
         return ""
+
+
+def _user_run_authorized(db, task: Task) -> tuple[bool, str]:
+    """Revalidate a browser-originated run against GitHub's CURRENT grants.
+
+    Task 1.8: `run_origin='user'` is persisted by every browser entry point
+    (from-issue, rerun, approve) together with the authenticated actor.
+    Automation-origin tasks are never gated here: webhook/CI processing keeps
+    using the GitHub App installation identity after HMAC + repo validation.
+    """
+    if str(getattr(task, "run_origin", "") or "").lower() != "user":
+        return True, ""
+    actor_id = getattr(task, "run_actor_id", None)
+    if actor_id is None:
+        return False, "no authenticated user recorded for this run"
+    actor = db.query(User).filter(User.id == actor_id).first()
+    if (
+        actor is None
+        or task.owner_id is None
+        or int(actor.id) != int(task.owner_id)
+    ):
+        return False, "run actor is not the task owner"
+    from app.github.install import task_github_authorization
+
+    return task_github_authorization(db, task, actor)
+
+
+def _deny_github_authorization(db, task: Task, reason: str) -> dict:
+    """Refuse a browser-originated operation before mint/publish side effects."""
+    error = f"github_authorization_required: {reason}"[:1000]
+    _set(db, task, status="FAILED", error=error)
+    _event(
+        db,
+        task.id,
+        "GITHUB_AUTHORIZATION_REQUIRED",
+        {"reason": reason[:300], "origin": "user"},
+    )
+    db.commit()
+    _cleanup(task.id)
+    return {
+        "status": "FAILED",
+        "error": task.error,
+        "github_authorization_required": True,
+    }
 
 
 def _green_upstream_fix(*, token: str, full_name: str, changed: list[str]) -> str:
@@ -524,8 +568,17 @@ def _last_summary(db, task_id: int) -> str:
         return row.data_json[:2000]
 
 
-def approve_task(task_id: int, *, title: str = "", body: str = "") -> dict:
-    """Publish a NEEDS_REVIEW task (ReviewPanel Approve & Commit). Never raises."""
+def approve_task(
+    task_id: int, *, title: str = "", body: str = "", actor_id: int | None = None
+) -> dict:
+    """Publish a NEEDS_REVIEW task (ReviewPanel Approve & Commit). Never raises.
+
+    `actor_id` is the authenticated FixHub user resolved from the HTTP session
+    (never an owner_id supplied in the request payload). Browser approvals
+    always pass it; it is validated as the task owner and revalidated against
+    GitHub's CURRENT grants before any installation token is minted or any
+    publish side effect happens.
+    """
     import os
 
     db = SessionLocal()
@@ -536,6 +589,30 @@ def approve_task(task_id: int, *, title: str = "", body: str = "") -> dict:
         if task.status not in ("NEEDS_REVIEW", "FAILED", "RUNNING"):
             if task.pr_url:
                 return {"status": task.status, "pr": task.pr_url, "branch": task.branch}
+        # Task 1.8: persist + validate the authenticated approval actor BEFORE
+        # touching the workspace or publishing. run_origin='user' makes the
+        # same gate apply again inside _publish_task (defense in depth).
+        if actor_id is not None:
+            actor = db.query(User).filter(User.id == actor_id).first()
+            if (
+                actor is None
+                or task.owner_id is None
+                or int(actor.id) != int(task.owner_id)
+            ):
+                return _deny_github_authorization(
+                    db, task, "approver is not the task owner"
+                )
+            task.run_origin = "user"
+            task.run_actor_id = actor.id
+            db.commit()
+        elif str(task.run_origin or "").lower() == "user":
+            # A browser-originated approval must carry its authenticated actor.
+            return _deny_github_authorization(
+                db, task, "approval requires an authenticated owner"
+            )
+        ok, reason = _user_run_authorized(db, task)
+        if not ok:
+            return _deny_github_authorization(db, task, reason)
         path = task.workspace
         if not path or not os.path.isdir(path):
             _set(db, task, status="FAILED", error="workspace expired (re-run the task)")
@@ -585,6 +662,13 @@ def _publish_task(
     ownership before touching GitHub; user-driven approve calls pass False
     (NEEDS_REVIEW carries user authorization, never a worker lease).
     """
+    # Task 1.8: revalidate browser-originated publishing at the exact side
+    # effect boundary. Approval can happen long after the API check and a
+    # queued run can lose GitHub access before the worker publishes; refused
+    # runs must never mint a token or fall back to a local push.
+    ok, reason = _user_run_authorized(db, task)
+    if not ok:
+        return _deny_github_authorization(db, task, reason)
     # Collision guard: never silently reuse another active task's branch.
     # (Branch names embed the task id, so this fires only on genuine misuse.)
     clash = (
@@ -1666,6 +1750,15 @@ def run_task_inline(
         pre_reason = _usage_limit_reason(db, task)
         if pre_reason:
             return _fail_usage_limit(db, task, pre_reason)
+
+        # Task 1.8: revalidate inside the worker, not only at the API. A
+        # browser-originated run can lose installation/repository access
+        # after it was queued; refuse BEFORE minting an installation token,
+        # cloning a private repo, reading GitHub data, or publishing.
+        # Automation-origin tasks keep executing on the App identity.
+        ok, reason = _user_run_authorized(db, task)
+        if not ok:
+            return _deny_github_authorization(db, task, reason)
 
         repo = (
             db.query(Repository)
