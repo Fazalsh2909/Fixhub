@@ -1515,3 +1515,142 @@ def test_webhook_automation_ignores_user_permission_state(db, monkeypatch):
     assert r2.json()["task_id"]
     t2 = db.query(Task).filter(Task.issue_number == 422).first()
     assert t2 is not None and t2.owner_id == ua.id
+
+# --- public GitHub connection config + browser-friendly callback failures ---
+
+
+def _public_github_settings(monkeypatch, *, slug="", install_url="") -> None:
+    monkeypatch.setattr(settings, "GITHUB_APP_SLUG", slug)
+    monkeypatch.setattr(settings, "GITHUB_APP_INSTALL_URL", install_url)
+    monkeypatch.setattr(settings, "GITHUB_APP_CLIENT_ID", "")
+    monkeypatch.setattr(settings, "GITHUB_APP_CLIENT_SECRET", "")
+
+
+def test_github_config_requires_fixhub_session(db):
+    r = TestClient(app).get("/api/github/config")
+    assert r.status_code == 401
+
+
+def test_github_config_exposes_only_public_install_settings(db, monkeypatch):
+    _public_github_settings(monkeypatch, slug="fixhub-app")
+    _enable_oauth(monkeypatch)
+    u = make_user(db, email="gh-config@example.com")
+
+    r = TestClient(app).get(
+        "/api/github/config", cookies=session_cookies(db, u)
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {
+        "install_url": "https://github.com/apps/fixhub-app/installations/new",
+        "oauth_enabled": True,
+        "start_url": "/api/github/install/start",
+    }
+    assert set(body) == {"install_url", "oauth_enabled", "start_url"}
+    lowered = r.text.lower()
+    for secret in ("client_secret", "private_key", "t45t-5ecret", "access_token"):
+        assert secret not in lowered
+
+
+def test_github_config_explicit_https_install_url_overrides_slug(db, monkeypatch):
+    _public_github_settings(
+        monkeypatch,
+        slug="ignored-slug",
+        install_url="https://github.example.com/apps/fixhub/installations/new",
+    )
+    u = make_user(db, email="gh-config-url@example.com")
+
+    body = TestClient(app).get(
+        "/api/github/config", cookies=session_cookies(db, u)
+    ).json()
+
+    assert (
+        body["install_url"]
+        == "https://github.example.com/apps/fixhub/installations/new"
+    )
+    assert body["oauth_enabled"] is False
+
+
+def test_github_config_never_exposes_unsafe_install_values(db, monkeypatch):
+    _public_github_settings(monkeypatch)
+    u = make_user(db, email="gh-config-unsafe@example.com")
+    c = TestClient(app)
+    cookies = session_cookies(db, u)
+
+    unsafe = [
+        "javascript:alert(1)",
+        "http://github.com/apps/fixhub/installations/new",
+        "//github.com/apps/fixhub/installations/new",
+        "https://user:pass@github.com/apps/fixhub/installations/new",
+        "not a url",
+    ]
+    for value in unsafe:
+        monkeypatch.setattr(settings, "GITHUB_APP_INSTALL_URL", value)
+        body = c.get("/api/github/config", cookies=cookies).json()
+        assert body["install_url"] == "", value
+
+    # A slug is only accepted when it is a single safe path segment.
+    monkeypatch.setattr(settings, "GITHUB_APP_INSTALL_URL", "")
+    for slug in ("../evil", "two/segments", "bad slug", "-leading-dash"):
+        monkeypatch.setattr(settings, "GITHUB_APP_SLUG", slug)
+        body = c.get("/api/github/config", cookies=cookies).json()
+        assert body["install_url"] == "", slug
+
+
+def test_callback_exchange_failure_redirects_browser_navigation(db, monkeypatch):
+    """A top-level browser callback must land back in the app, not on JSON."""
+    _fake_store(monkeypatch)
+    _enable_oauth(monkeypatch)
+    _stub_github(
+        monkeypatch,
+        token="tok-html-502",
+        gh_id=731,
+        login="browser-502",
+        installations=[],
+    )
+    from app.github import client as _gh
+
+    def _exchange_boom(*args, **kwargs):
+        raise RuntimeError("github unreachable")
+
+    monkeypatch.setattr(_gh, "exchange_authorization_code", _exchange_boom)
+    u = make_user(db, email="browser-502@example.com")
+    cookies = session_cookies(db, u)
+    c = TestClient(app)
+    flow = _start_flow(c, cookies)
+
+    r = c.get(
+        f"/api/github/install/callback?code=code-html&state={flow['state']}",
+        cookies={**cookies, _install.STATE_COOKIE: flow["cookie"]},
+        headers={"accept": "text/html,application/xhtml+xml"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 302, r.text
+    assert r.headers["location"] == "/?github_connect=error"
+    cleared = (r.headers.get("set-cookie") or "").lower()
+    assert "fixhub_gh_state=" in cleared and "max-age=0" in cleared
+
+
+def test_callback_state_store_outage_redirects_browser_navigation(db, monkeypatch):
+    """The production 503 fail-safe is a redirect for browser navigations."""
+    _fake_store(monkeypatch, fail=True)
+    _enable_oauth(monkeypatch)
+    monkeypatch.setattr(settings, "ENV", "prod")
+    u = make_user(db, email="browser-503@example.com")
+    cookies = session_cookies(db, u)
+    c = TestClient(app)
+    flow = _start_flow(c, cookies)
+
+    r = c.get(
+        f"/api/github/install/callback?code=code-html&state={flow['state']}",
+        cookies={**cookies, _install.STATE_COOKIE: flow["cookie"]},
+        headers={"accept": "text/html"},
+        follow_redirects=False,
+    )
+
+    assert r.status_code == 302, r.text
+    assert r.headers["location"] == "/?github_connect=error"
+    cleared = (r.headers.get("set-cookie") or "").lower()
+    assert "fixhub_gh_state=" in cleared and "max-age=0" in cleared

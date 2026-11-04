@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { api, type AuthUser } from "./api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, githubStartUrl, isApiError, type AuthUser, type GithubConfig } from "./api";
 import AuthView from "./components/AuthView";
 import LlmSettings from "./components/LlmSettings";
 import ChatPanel from "./components/ChatPanel";
@@ -29,8 +29,24 @@ import {
 import RepoExplorer from "./components/RepoExplorer";
 import ReviewPanel from "./components/ReviewPanel";
 import TraceView from "./components/TraceView";
-import { Button, Card, IconButton, Input, SectionLabel, Status, TaskStatus } from "./components/ui";
-import type { InstallationGroup, InstalledRepo, Issue, TaskSummary } from "./types";
+import {
+  GithubConnectionCard,
+  GithubNotice,
+  type GithubNoticeState,
+} from "./components/GitHubConnection";
+import { Button, Card, IconButton, SectionLabel, Status, TaskStatus } from "./components/ui";
+import {
+  connectedCount,
+  deriveGithubStatus,
+  githubErrorMessage,
+  initialGithubState,
+  isGithubAuthorizationError,
+  normalizeInstallationGroups,
+  repositoryCount,
+  type GithubState,
+  type GithubStatus,
+} from "./github";
+import type { InstalledRepo, Issue, TaskSummary } from "./types";
 import "./styles.css";
 
 type CenterTab = "code" | "diff";
@@ -39,43 +55,53 @@ type NavView = "Overview" | "Tasks" | "Issues" | "Repositories" | "Settings";
 
 interface RepoBlockProps {
   account: string;
-  installationId: string;
   repos: InstalledRepo[];
   expandedRepo: string;
   issuesCache: Record<string, Issue[]>;
   fixing: number | null;
+  connecting: Record<string, boolean>;
   onToggle: (repo: string) => void;
   onFix: (repo: string, num: number) => void;
   onConnect: (fullName: string, installationId: string) => void;
   onBrowse: (repo: string, ref: string) => void;
 }
 
-function RepoBlock({ account, installationId, repos, expandedRepo, issuesCache, fixing, onToggle, onFix, onConnect, onBrowse }: RepoBlockProps) {
+function RepoBlock({ account, repos, expandedRepo, issuesCache, fixing, connecting, onToggle, onFix, onConnect, onBrowse }: RepoBlockProps) {
+  const connected = repos.filter((r) => r.connected).length;
   return (
     <div>
-      <div className="account-row">{account}<span>· {installationId}</span></div>
+      <div className="account-row">
+        <span className="account-name">{account || "GitHub account"}</span>
+        <span>{connected}/{repos.length} connected</span>
+      </div>
       {repos.map((r) => {
         const expanded = expandedRepo === r.github_full_name;
+        const isConnecting = connecting[r.github_full_name] === true;
         return (
-        <div key={r.github_full_name}>
+        <div key={r.github_full_name} className="repo-item">
+          <div className={`repo-row ${expanded ? "selected" : ""}`}>
           <button
-            className={`repo-row ${expanded ? "selected" : ""}`}
+            type="button"
+            className="repo-row-main"
             aria-expanded={expanded}
             aria-label={`${r.github_full_name}${r.connected ? ", connected" : ", not connected"}`}
             onClick={() => { onToggle(r.github_full_name); onBrowse(r.github_full_name, r.default_branch || ""); }}
           >
             <span>{expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />} {r.private ? <Lock size={14} /> : <Globe size={14} />} {r.github_full_name}</span>
-            {r.connected
-              ? <Status tone="success" icon={Check}>Connected</Status>
-              : <span
-                  role="button"
-                  tabIndex={0}
-                  className="repo-connect"
-                  aria-label={`Connect ${r.github_full_name}`}
-                  onClick={(e) => { e.stopPropagation(); onConnect(r.github_full_name, r.installation_id); }}
-                  onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.stopPropagation(); onConnect(r.github_full_name, r.installation_id); } }}
-                >Connect</span>}
           </button>
+          {r.connected
+            ? <Status tone="success" icon={Check}>Connected</Status>
+            : <button
+                type="button"
+                className="repo-connect"
+                disabled={isConnecting}
+                aria-label={`Connect ${r.github_full_name}`}
+                aria-busy={isConnecting || undefined}
+                onClick={() => onConnect(r.github_full_name, r.installation_id)}
+              >
+                {isConnecting ? <><LoaderCircle size={12} className="spin" /> Connecting…</> : "Connect"}
+              </button>}
+          </div>
           {expanded && (
             <div className="issue-list">
               {(issuesCache[r.github_full_name] || []).map((i) => (
@@ -100,8 +126,32 @@ function RepoBlock({ account, installationId, repos, expandedRepo, issuesCache, 
   );
 }
 
+function overviewGithubHint(status: GithubStatus): string {
+  switch (status) {
+    case "loading":
+      return "Checking GitHub connection…";
+    case "unauthorized":
+      return "GitHub isn’t connected — open Repositories to connect it.";
+    case "reauth":
+      return "GitHub authorization needs to be repeated — open Repositories to reconnect.";
+    case "no_installations":
+      return "GitHub is connected, but the FixHub GitHub App isn’t installed yet — open Repositories.";
+    case "no_repositories":
+      return "The FixHub GitHub App has no accessible repositories — open Repositories.";
+    case "unavailable":
+      return "GitHub is temporarily unavailable — open Repositories to retry.";
+    default:
+      return "";
+  }
+}
+
 export default function App() {
-  const [installed, setInstalled] = useState<InstallationGroup[]>([]);
+  const [github, setGithub] = useState<GithubState>(initialGithubState);
+  const [githubConfig, setGithubConfig] = useState<GithubConfig | null>(null);
+  const [githubNotice, setGithubNotice] = useState<GithubNoticeState | null>(null);
+  const [connecting, setConnecting] = useState<Record<string, boolean>>({});
+  const connectingRef = useRef<Set<string>>(new Set());
+  const callbackHandled = useRef(false);
   const [tasks, setTasks] = useState<TaskSummary[]>([]);
   const [taskId, setTaskId] = useState<number | null>(null);
   const [queue, setQueue] = useState<{
@@ -114,8 +164,6 @@ export default function App() {
   }>({ ok: false });
   const [center, setCenter] = useState<CenterTab>("code");
   const [diffKey, setDiffKey] = useState(0);
-  const [connFull, setConnFull] = useState("");
-  const [connInst, setConnInst] = useState("");
   const [expandedRepo, setExpandedRepo] = useState("");
   const [issuesCache, setIssuesCache] = useState<Record<string, Issue[]>>({});
   const [fixing, setFixing] = useState<number | null>(null);
@@ -131,6 +179,11 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(true);
 
   const task = tasks.find((t) => t.id === taskId) || null;
+  const githubStatus = deriveGithubStatus(github);
+  const accessibleRepos = repositoryCount(github.groups);
+  const connectedRepos = connectedCount(github.groups);
+  const oauthNextPath = nav === "Settings" ? "/?view=settings" : "/?view=repositories";
+  const oauthHref = githubStartUrl(oauthNextPath);
 
   // A reachable Redis is not a working queue: with zero live RQ workers every
   // new task sits in QUEUED forever. workers === -1 means introspection failed
@@ -152,30 +205,89 @@ export default function App() {
   // Title fallback for tasks without an issue title (e.g. CI runs).
   const taskTitle = (t: TaskSummary) => t.issue_title || `${t.trigger_type} · ${t.repository}`;
 
-  const loadAll = useCallback(async () => {
+  const refreshGithub = useCallback(async (showLoading = false) => {
+    if (showLoading) setGithub((prev) => ({ ...prev, loading: true }));
     try {
-      const [g, t, q] = await Promise.all([
-        api.installedRepos().catch(() => []),
-        api.tasks(),
-        api.queueHealth().catch(() => ({ ok: false })),
-      ]);
-      setInstalled(Array.isArray(g) ? g : []);
-      setTasks(t);
-      setQueue(q);
+      const groups = normalizeInstallationGroups(await api.installedRepos());
+      setGithub({
+        loading: false,
+        loaded: true,
+        unauthorized: false,
+        needsReauth: false,
+        groups,
+        error: "",
+        stale: false,
+      });
     } catch (e) {
-      if ((e as { status?: number }).status === 401) {
+      if (isApiError(e) && e.status === 401) {
         setUser(null);
         return;
       }
-      setMsg(e instanceof Error ? e.message : "Refresh failed — check the backend connection.");
+      if (isGithubAuthorizationError(e)) {
+        setGithub((prev) => ({
+          ...prev,
+          loading: false,
+          loaded: true,
+          unauthorized: true,
+          needsReauth: prev.loaded && !prev.unauthorized,
+          groups: [],
+          error: "",
+          stale: false,
+        }));
+        return;
+      }
+      setGithub((prev) => ({
+        ...prev,
+        loading: false,
+        loaded: prev.loaded,
+        error: githubErrorMessage(e),
+        stale: prev.groups.length > 0,
+      }));
     }
   }, []);
+
+  const loadGithubConfig = useCallback(async () => {
+    try {
+      setGithubConfig(await api.githubConfig());
+    } catch {
+      // Optional public configuration: the connection card still works
+      // without it (it just cannot offer an install link).
+    }
+  }, []);
+
+  const loadAll = useCallback(async () => {
+    const githubRefresh = refreshGithub();
+    const [t, q] = await Promise.allSettled([api.tasks(), api.queueHealth()]);
+    await githubRefresh;
+    if (
+      [t, q].some(
+        (r) =>
+          r.status === "rejected" &&
+          isApiError(r.reason) &&
+          r.reason.status === 401,
+      )
+    ) {
+      setUser(null);
+      return;
+    }
+    if (t.status === "fulfilled") {
+      setTasks(Array.isArray(t.value) ? t.value : []);
+    } else {
+      setMsg(t.reason instanceof Error ? t.reason.message : "Refresh failed — check the backend connection.");
+    }
+    if (q.status === "fulfilled") {
+      setQueue(q.value);
+    } else {
+      setQueue({ ok: false });
+    }
+  }, [refreshGithub]);
 
   useEffect(() => {
     let live = true;
     api.me().then((u) => {
       if (live) {
         setUser(u);
+        loadGithubConfig();
         loadAll();
       }
     }).catch(() => {
@@ -186,13 +298,51 @@ export default function App() {
     return () => {
       live = false;
     };
-  }, [loadAll]);
+  }, [loadAll, loadGithubConfig]);
 
   useEffect(() => {
     if (!user) return;
     const h = setInterval(loadAll, 8000);
     return () => clearInterval(h);
   }, [loadAll, user]);
+
+  // The OAuth callback is a full-page redirect back into the app. Process its
+  // result once after the FixHub session resolves, refresh GitHub data, and
+  // strip the query parameters so a reload cannot replay the notification.
+  useEffect(() => {
+    if (!user || callbackHandled.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const view = params.get("view");
+    if (view === "settings") setNav("Settings");
+    else if (view === "repositories") setNav("Repositories");
+    const result = params.get("github_connect");
+    if (!result) return;
+    callbackHandled.current = true;
+    const ok = result === "done";
+    setGithubNotice(
+      ok
+        ? {
+            tone: "success",
+            message: "GitHub connected. Repository access is up to date.",
+          }
+        : {
+            tone: "error",
+            message:
+              "GitHub authorization didn’t complete. Nothing changed — try again when you’re ready.",
+          },
+    );
+    if (!ok && view !== "settings") setNav("Repositories");
+    if (ok && view !== "settings") setNav("Repositories");
+    params.delete("github_connect");
+    params.delete("view");
+    const query = params.toString();
+    window.history.replaceState(
+      {},
+      "",
+      `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`,
+    );
+    if (ok) void refreshGithub(true);
+  }, [user, refreshGithub]);
 
   const openFile = (path: string) => {
     setCenter("code");
@@ -235,20 +385,45 @@ export default function App() {
   };
 
   const connectRepo = async (fullName: string, installationId: string) => {
+    if (connectingRef.current.has(fullName)) return;
+    connectingRef.current.add(fullName);
+    setConnecting((prev) => ({ ...prev, [fullName]: true }));
+    setMsg("");
     try {
       await api.connect(fullName, installationId);
       setMsg(`${fullName} connected`);
-      loadAll();
-    } catch (e) { setMsg(e instanceof Error ? e.message : "connect failed"); }
-  };
-
-  const connect = async () => {
-    if (!connFull.trim() || !connInst.trim()) {
-      setMsg("owner/repo + installation id required");
-      return;
+      await refreshGithub(true);
+    } catch (e) {
+      if (isApiError(e) && e.status === 401) {
+        setUser(null);
+        return;
+      }
+      if (isGithubAuthorizationError(e)) {
+        setGithub((prev) => ({
+          ...prev,
+          loading: false,
+          loaded: true,
+          unauthorized: true,
+          needsReauth: prev.loaded && !prev.unauthorized,
+          groups: [],
+          error: "",
+          stale: false,
+        }));
+        setGithubNotice({
+          tone: "error",
+          message: "GitHub authorization is required before connecting a repository.",
+        });
+      } else {
+        setMsg(githubErrorMessage(e));
+      }
+    } finally {
+      connectingRef.current.delete(fullName);
+      setConnecting((prev) => {
+        const next = { ...prev };
+        delete next[fullName];
+        return next;
+      });
     }
-    await connectRepo(connFull.trim(), connInst.trim());
-    setConnFull(""); setConnInst("");
   };
 
   const logout = async () => {
@@ -259,7 +434,11 @@ export default function App() {
     }
     setUser(null);
     setTasks([]);
-    setInstalled([]);
+    setGithub(initialGithubState);
+    setGithubConfig(null);
+    setGithubNotice(null);
+    setConnecting({});
+    connectingRef.current.clear();
     setTaskId(null);
   };
 
@@ -287,7 +466,7 @@ export default function App() {
   if (!user) {
     return (
       <div className="app-shell">
-        <AuthView onAuth={(u) => { setUser(u); loadAll(); }} />
+        <AuthView onAuth={(u) => { setUser(u); loadGithubConfig(); loadAll(); }} />
       </div>
     );
   }
@@ -392,43 +571,92 @@ export default function App() {
 
           {nav === "Issues" && (
             <>
-              <SectionLabel action={<span className="muted">{installed.reduce((n, g) => n + g.repos.filter((r) => r.connected).length, 0)}</span>}>Open issues</SectionLabel>
+              <SectionLabel action={<span className="muted">{connectedRepos}</span>}>Open issues</SectionLabel>
               <div className="repo-list">
-                {installed.map((g) => {
+                {github.groups.map((g) => {
                   const connected = g.repos.filter((r) => r.connected);
                   if (connected.length === 0) return null;
-                  return <RepoBlock key={g.installation_id} account={g.account} installationId={g.installation_id} repos={connected} expandedRepo={expandedRepo} issuesCache={issuesCache} fixing={fixing} onToggle={toggleRepo} onFix={fixIssue} onConnect={connectRepo} onBrowse={(repo, ref) => setBrowse({ repo, ref })} />;
+                  return <RepoBlock key={g.installation_id} account={g.account} repos={connected} expandedRepo={expandedRepo} issuesCache={issuesCache} fixing={fixing} connecting={connecting} onToggle={toggleRepo} onFix={fixIssue} onConnect={connectRepo} onBrowse={(repo, ref) => setBrowse({ repo, ref })} />;
                 })}
-                {installed.every((g) => g.repos.every((r) => !r.connected)) && <div className="empty-state">Connect a repository to browse issues.</div>}
+                {connectedRepos === 0 && (
+                  <div className="empty-state">
+                    {githubStatus === "unauthorized" || githubStatus === "reauth"
+                      ? "Connect GitHub to browse issues."
+                      : "Connect a repository to browse issues."}
+                  </div>
+                )}
               </div>
             </>
           )}
 
           {(nav === "Overview" || nav === "Repositories") && (
             <>
-              <SectionLabel action={<span className="muted">{installed.reduce((n,g) => n + g.repos.length, 0)}</span>}>Repositories</SectionLabel>
-              <div className="repo-list">
-                {installed.map((g) => (
-                  <RepoBlock key={g.installation_id} account={g.account} installationId={g.installation_id} repos={g.repos} expandedRepo={expandedRepo} issuesCache={issuesCache} fixing={fixing} onToggle={toggleRepo} onFix={fixIssue} onConnect={connectRepo} onBrowse={(repo, ref) => setBrowse({ repo, ref })} />
-                ))}
-                {installed.length === 0 && <div className="empty-state">No GitHub installations found.</div>}
-              </div>
+              <SectionLabel action={<span className="muted">{accessibleRepos}</span>}>Repositories</SectionLabel>
 
-              <div className="connect-form">
-                <Input value={connFull} onChange={(e) => setConnFull(e.target.value)} placeholder="owner/repo" />
-                <Input value={connInst} onChange={(e) => setConnInst(e.target.value)} placeholder="installation id" />
-                <Button variant="outline" onClick={connect}>Connect repository</Button>
-              </div>
+              {nav === "Repositories" && (
+                <>
+                  {githubNotice && (
+                    <GithubNotice
+                      notice={githubNotice}
+                      retryHref={oauthHref}
+                      onDismiss={() => setGithubNotice(null)}
+                    />
+                  )}
+                  <GithubConnectionCard
+                    state={github}
+                    config={githubConfig}
+                    oauthHref={oauthHref}
+                    onRefresh={() => { void refreshGithub(true); }}
+                    refreshing={github.loading}
+                  />
+                </>
+              )}
+
+              {githubStatus === "ready" && (
+                <div className="repo-list">
+                  {github.groups.map((g) => (
+                    <RepoBlock key={g.installation_id} account={g.account} repos={g.repos} expandedRepo={expandedRepo} issuesCache={issuesCache} fixing={fixing} connecting={connecting} onToggle={toggleRepo} onFix={fixIssue} onConnect={connectRepo} onBrowse={(repo, ref) => setBrowse({ repo, ref })} />
+                  ))}
+                </div>
+              )}
+
+              {nav === "Overview" && githubStatus !== "ready" && (
+                <button
+                  type="button"
+                  className="empty-state github-overview-hint"
+                  onClick={() => setNav("Repositories")}
+                >
+                  {overviewGithubHint(githubStatus)}
+                </button>
+              )}
             </>
           )}
 
           {nav === "Settings" && (
             <>
-              <SectionLabel>Connection</SectionLabel>              <Card className="settings-card">
+              <SectionLabel>GitHub</SectionLabel>
+              {githubNotice && (
+                <GithubNotice
+                  notice={githubNotice}
+                  retryHref={oauthHref}
+                  onDismiss={() => setGithubNotice(null)}
+                />
+              )}
+              <GithubConnectionCard
+                state={github}
+                config={githubConfig}
+                oauthHref={oauthHref}
+                onRefresh={() => { void refreshGithub(true); }}
+                refreshing={github.loading}
+                privacyNote
+              />
+
+              <SectionLabel>Connection</SectionLabel>
+              <Card className="settings-card">
                 <div className="kv-row"><span>Backend</span><span className="muted">{window.location.origin}</span></div>
                 <div className="kv-row"><span>Worker</span><span className={workerOnline ? "kv-ok" : "kv-bad"}>{workerOnline ? `connected${queue.count != null ? ` · ${queue.count} queued` : ""}${queue.db_queued_stale ? ` · ${queue.db_queued_stale} stale` : ""}` : queue.ok ? "redis up, no worker" : "offline"}</span></div>
                 <div className="kv-row"><span>Tasks</span><span className="muted">{tasks.length}</span></div>
-                <div className="kv-row"><span>Repositories</span><span className="muted">{installed.reduce((n, g) => n + g.repos.length, 0)}</span></div>
+                <div className="kv-row"><span>Repositories</span><span className="muted">{connectedRepos} connected · {accessibleRepos} available</span></div>
               </Card>
               <div className="empty-state">Queue and workspace status reflect the connected backend.</div>
               <LlmSettings />

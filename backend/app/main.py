@@ -676,6 +676,18 @@ def connect_repository(
     return {"id": repo.id, "github_full_name": repo.github_full_name, "connected": True}
 
 
+@app.get("/api/github/config")
+def github_public_config(user: User = Depends(get_current_user)) -> dict:
+    """Safe-to-expose GitHub App settings for the connection UI.
+
+    Contains only the public install URL, OAuth availability, and the
+    app-relative start URL. Never client secrets, private keys, or tokens.
+    """
+    from app.github import install as _install
+
+    return _install.public_config()
+
+
 @app.get("/api/github/installations")
 def list_installations(
     user: User = Depends(get_current_user), db: Session = Depends(_db)

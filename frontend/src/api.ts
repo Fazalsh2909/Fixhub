@@ -1,18 +1,65 @@
-const j = async (r: Response) => {
-  const data = await r.json().catch(() => ({}));
-  if (r.status === 401) {
-    const err = new Error((data as { detail?: string; error?: string }).detail || "Not authenticated");
-    (err as { status?: number }).status = 401;
-    throw err;
+import type { InstallationGroup } from "./types";
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly data: Record<string, unknown>;
+
+  constructor(message: string, status: number, data: Record<string, unknown> = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.data = data;
   }
-  if (!r.ok) throw new Error((data as { detail?: string; error?: string }).detail || (data as { error?: string }).error || `HTTP ${r.status}`);
-  return data;
+
+  /** True when the backend says a GitHub user authorization is required. */
+  get authorizationRequired(): boolean {
+    return this.data.github_authorization_required === true;
+  }
+
+  /** Server-provided OAuth start path, when present. */
+  get startUrl(): string {
+    return typeof this.data.start_url === "string" ? this.data.start_url : "";
+  }
+}
+
+export function isApiError(error: unknown): error is ApiError {
+  return error instanceof ApiError;
+}
+
+const j = async <T = any>(r: Response): Promise<T> => {
+  const raw: unknown = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const data =
+      raw && typeof raw === "object" && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>)
+        : {};
+    const detail =
+      (typeof data.detail === "string" && data.detail) ||
+      (typeof data.error === "string" && data.error) ||
+      (r.status === 401 ? "Not authenticated" : `HTTP ${r.status}`);
+    throw new ApiError(detail, r.status, data);
+  }
+  return raw as T;
 };
 
 // Same-origin requests carry the HttpOnly session cookie (credentials:include).
 // No tokens are ever stored in localStorage or returned to JS.
-const F = (input: string, init: RequestInit = {}) =>
-  fetch(input, { credentials: "include", ...init });
+const F = async (input: string, init: RequestInit = {}) => {
+  try {
+    return await fetch(input, { credentials: "include", ...init });
+  } catch {
+    // Network/transport failure is not proof that GitHub is disconnected.
+    throw new ApiError(
+      "Couldn’t reach the FixHub backend. Check your connection and try again.",
+      0,
+    );
+  }
+};
+
+/** Browser-navigation target for the existing OAuth start endpoint. */
+export function githubStartUrl(nextPath = "/"): string {
+  return `/api/github/install/start?next=${encodeURIComponent(nextPath)}`;
+}
 
 const postJSON = (input: string, body: unknown) =>
   F(input, {
@@ -48,6 +95,18 @@ export interface LlmCredential {
   updated_at: string;
 }
 
+export interface GithubConfig {
+  install_url: string;
+  oauth_enabled: boolean;
+  start_url: string;
+}
+
+export interface ConnectedRepository {
+  id: number;
+  github_full_name: string;
+  connected: boolean;
+}
+
 export const api = {
   // Auth
   signup: (email: string, password: string, display_name = "") =>
@@ -66,8 +125,9 @@ export const api = {
   deleteLlmCredential: (provider: string) =>
     F(`/api/llm/credentials/${encodeURIComponent(provider)}`, { method: "DELETE" }).then(j),
   repos: () => F("/api/repositories").then(j),
-  installedRepos: () => F("/api/github/repos").then(j),
-  connect: (github_full_name: string, installation_id: string) =>
+  githubConfig: (): Promise<GithubConfig> => F("/api/github/config").then(j),
+  installedRepos: (): Promise<InstallationGroup[]> => F("/api/github/repos").then(j),
+  connect: (github_full_name: string, installation_id: string): Promise<ConnectedRepository> =>
     postJSON("/api/repositories/connect", { github_full_name, installation_id }),
   issues: (repo: string) => F(`/api/github/issues?repo=${encodeURIComponent(repo)}`).then(j),
   repoContents: (repo: string, path = ".", ref = "") =>

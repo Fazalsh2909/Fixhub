@@ -60,9 +60,11 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -85,6 +87,48 @@ STATE_COOKIE = "fixhub_gh_state"
 STATE_TTL_S = 600
 TOKEN_FRESH_MARGIN_S = 90  # refresh slightly before GitHub's own expiry
 INSTALL_START_URL = "/api/github/install/start"
+
+
+def _safe_install_url(value: str) -> str:
+    """Only absolute https URLs are exposed to the browser (no javascript:)."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+    ):
+        return ""
+    return value
+
+
+def app_install_url() -> str:
+    """Public GitHub App install URL, or "" when it is not configured.
+
+    The slug is operator-supplied (never guessed here). An explicit install
+    URL wins; otherwise the canonical GitHub.com install page is derived.
+    Both settings are public values and are the only GitHub App config sent
+    to the browser (no client id/secret, key, or token).
+    """
+    explicit = (settings.GITHUB_APP_INSTALL_URL or "").strip()
+    if explicit:
+        return _safe_install_url(explicit)
+    slug = (settings.GITHUB_APP_SLUG or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", slug):
+        return ""
+    return f"https://github.com/apps/{slug}/installations/new"
+
+
+def public_config() -> dict:
+    """Safe-to-expose GitHub connection settings for the web UI."""
+    return {
+        "install_url": app_install_url(),
+        "oauth_enabled": _oauth_enabled(),
+        "start_url": INSTALL_START_URL,
+    }
 
 
 # --- state cookie helpers ----------------------------------------------------
@@ -195,6 +239,21 @@ def _clear_state_cookie(response: Response) -> None:
         samesite=settings.AUTH_COOKIE_SAMESITE,
         path="/",
     )
+
+
+def _callback_error(request: Request, *, status_code: int, content: dict):
+    """Retire OAuth state; show the app's error state for browser navigations.
+
+    The callback is reached by a top-level browser navigation. Returning raw
+    JSON there leaves the user on an API page with no retry. API clients
+    (Accept without text/html) keep the original status + JSON unchanged.
+    """
+    if "text/html" in (request.headers.get("accept") or "").lower():
+        response = RedirectResponse("/?github_connect=error", status_code=302)
+    else:
+        response = JSONResponse(status_code=status_code, content=content)
+    _clear_state_cookie(response)
+    return response
 
 
 # --- server-enforced one-time state nonces (Redis) ----------------------------
@@ -356,7 +415,8 @@ def install_callback(
         if settings.ENV == "prod":
             # Fail SAFE, not silently weaker: deployed environments must
             # never authorize when one-time enforcement is unavailable.
-            response = JSONResponse(
+            return _callback_error(
+                request,
                 status_code=503,
                 content={
                     "detail": (
@@ -365,13 +425,12 @@ def install_callback(
                     )
                 },
             )
-            _clear_state_cookie(response)
-            return response
         # Dev/test degrade to the stateless guarantees (expiring HMAC state,
         # session binding, cookie deletion, GitHub's single-use code).
     next_path = _safe_next(str(cookie_data.get("p") or "/"))
     if not _oauth_enabled():
-        response = JSONResponse(
+        return _callback_error(
+            request,
             status_code=400,
             content={
                 "detail": (
@@ -380,8 +439,6 @@ def install_callback(
                 )
             },
         )
-        _clear_state_cookie(response)
-        return response
     try:
         from app.github import client as _gh
 
@@ -396,14 +453,13 @@ def install_callback(
         if not ident.get("id"):
             raise ValueError("github returned no user identity")
     except Exception as exc:
-        response = JSONResponse(
+        # Every failure path must retire the state cookie: a stale signed
+        # state must not survive a failed exchange to be retried later.
+        return _callback_error(
+            request,
             status_code=502,
             content={"error": f"github connect failed: {str(exc)[:300]}"},
         )
-        # Every failure path must retire the state cookie: a stale signed
-        # state must not survive a failed exchange to be retried later.
-        _clear_state_cookie(response)
-        return response
     _persist_authorization(db, user, ident, token_payload)
     # A fresh OAuth grant is the user re-proving access: drop any cached
     # live-permission decision so everything is re-asked against GitHub.

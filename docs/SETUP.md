@@ -69,15 +69,22 @@ Without Redis, use inline runs: `POST /api/tasks/{id}/run?sync=true`.
 1. Create a GitHub App in your account/org settings.
 2. Permissions (from `README.md` + webhook/client usage): Contents read/write, Issues read, Pull requests read/write, Actions read, Checks read.
 3. Webhook URL: `https://<your-public-host>/webhooks/github` (use a tunnel such as ngrok for local testing). Generate a webhook secret.
-4. Install the app on your test repo (`owner/repo`). Note the installation ID (numeric, visible in the install URL or via `GET /api/github/installations`).
-5. Configure `backend/.env` (see below) and restart the stack.
-6. Connect the repo so FixHub stores the installation mapping (required — without it runs stop at `BLOCKED: no clone source`):
-   - IDE Repositories panel → Connect button, or
-   - `POST /api/repositories/connect` with `{github_full_name: "owner/repo", installation_id: "…"}`, or
-   - SQL: `UPDATE repositories SET installation_id='<install-id>' WHERE github_full_name='owner/repo';`
-7. Verify: `GET /api/github/repos` lists the installation, `GET /api/github/issues?repo=owner/repo` lists open issues, `GET /api/queue/health` shows `{ok: True}`.
+4. Install the app on the account or repositories you want FixHub to access.
+5. Configure `backend/.env` (see below), including `GITHUB_APP_CLIENT_ID` /
+   `GITHUB_APP_CLIENT_SECRET` for the in-app "Connect GitHub" flow. Set
+   `GITHUB_APP_SLUG` (the `<slug>` in `https://github.com/apps/<slug>`) so the
+   UI can offer an "Install GitHub App" action; alternatively set a full
+   `GITHUB_APP_INSTALL_URL`. Both are public values, never secrets.
+6. Restart the stack, sign in to FixHub, then open **Repositories** or
+   **Settings** and use **Connect GitHub** → **Install GitHub App** (when
+   needed) → **Connect** next to each repository. FixHub verifies every
+   installation and repository against GitHub server-side; no installation
+   IDs are typed into the UI.
+7. Verify: `GET /api/github/repos` lists the installations, `GET /api/github/issues?repo=owner/repo` lists open issues, `GET /api/queue/health` shows `{ok: True}`.
 
-For forks of OSS repos outside your installations, the IDE manual owner/repo + installation-ID form remains available.
+For scripted/administrator setup, `POST /api/repositories/connect` with
+`{github_full_name: "owner/repo", installation_id: "…"}` still works and keeps
+the same server-side ownership checks.
 
 ## Configuration (`backend/.env.example` + `backend/app/config.py`)
 
@@ -108,6 +115,10 @@ For forks of OSS repos outside your installations, the IDE manual owner/repo + i
 | `GITHUB_APP_ID` | empty | GitHub App ID (not installation ID). |
 | `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_PATH` | empty / `./fixhub-app.pem` | Prefer the mounted file; never paste multiline PEM into issues/logs. |
 | `GITHUB_WEBHOOK_SECRET` | empty | Must match the GitHub App webhook secret. |
+| `GITHUB_APP_CLIENT_ID` / `GITHUB_APP_CLIENT_SECRET` | empty | GitHub App user-authorization (OAuth) credentials from the App settings page. Required for “Connect GitHub”. The secret stays server-side. |
+| `GITHUB_APP_REDIRECT_URI` | empty | Optional explicit OAuth callback URL; empty = first callback URL registered on the App. |
+| `GITHUB_APP_SLUG` | empty | Public App slug (the `<slug>` in `https://github.com/apps/<slug>`) used by the UI’s “Install GitHub App” action. |
+| `GITHUB_APP_INSTALL_URL` | empty | Optional full `https://` install URL; overrides `GITHUB_APP_SLUG`. Public, never a secret. |
 | `GITHUB_API_URL` | `https://api.github.com` | Override for GHES. |
 | `REDIS_URL` | `redis://localhost:6379/0` locally, `redis://redis:6379/0` in Docker | Queue connection. |
 | `QUEUE_NAME` | `fixhub` | RQ queue name. |

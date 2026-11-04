@@ -190,6 +190,12 @@ class Settings(BaseSettings):
     # Optional explicit callback URL; empty = use the first Callback URL
     # registered on the App's settings page (redirect_uri omitted everywhere).
     GITHUB_APP_REDIRECT_URI: str = ""
+    # Public App install page (safe to expose; never a secret). The slug is
+    # the path segment in https://github.com/apps/<slug>. Empty = the UI has
+    # no self-service "Install GitHub App" action. GITHUB_APP_INSTALL_URL
+    # overrides the derived URL and must be https.
+    GITHUB_APP_SLUG: str = ""
+    GITHUB_APP_INSTALL_URL: str = ""
 
     # Queue (RQ/Redis). Webhooks enqueue; `worker` service runs jobs.
     REDIS_URL: str = "redis://localhost:6379/0"
