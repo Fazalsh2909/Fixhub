@@ -15,6 +15,8 @@ interface Tab {
 
 interface Props {
   taskId: number | null;
+  /** Called after a successful save so the Explorer can refresh its changes. */
+  onSaved?: (path: string) => void;
 }
 
 function langOf(path: string): string {
@@ -32,7 +34,7 @@ function langOf(path: string): string {
   return "plaintext";
 }
 
-export default function EditorTabs({ taskId }: Props) {
+export default function EditorTabs({ taskId, onSaved }: Props) {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [msg, setMsg] = useState("");
@@ -86,7 +88,7 @@ export default function EditorTabs({ taskId }: Props) {
     }
   }, [tabs]);
 
-  // Expose openFile to DirTree via window event (keeps App wiring trivial).
+  // Expose openFile to the Explorer via window event (keeps App wiring trivial).
   useEffect(() => {
     const h = (ev: Event) => openFile((ev as CustomEvent<string>).detail);
     window.addEventListener("fixhub:open-file", h);
@@ -111,6 +113,7 @@ export default function EditorTabs({ taskId }: Props) {
       await api.saveFile(taskId, tab.path, tab.content);
       setTabs((ts) => ts.map((t) => (t.key === key ? { ...t, dirty: false, saving: false } : t)));
       setMsg(`Saved ${tab.path}`);
+      onSaved?.(tab.path);
     } catch (e) {
       setTabs((ts) => ts.map((t) => (t.key === key ? { ...t, saving: false } : t)));
       setMsg(e instanceof Error ? e.message : "save failed");

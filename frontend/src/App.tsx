@@ -4,7 +4,6 @@ import AuthView from "./components/AuthView";
 import LlmSettings from "./components/LlmSettings";
 import ChatPanel from "./components/ChatPanel";
 import DiffView from "./components/DiffView";
-import DirTree from "./components/DirTree";
 import EditorTabs from "./components/EditorTabs";
 import {
   ArrowRight,
@@ -29,6 +28,7 @@ import {
 import RepoExplorer from "./components/RepoExplorer";
 import ReviewPanel from "./components/ReviewPanel";
 import ActivityFeed from "./components/ActivityFeed";
+import TaskExplorer from "./components/TaskExplorer";
 import {
   GithubConnectionCard,
   GithubNotice,
@@ -46,7 +46,7 @@ import {
   type GithubState,
   type GithubStatus,
 } from "./github";
-import type { InstalledRepo, Issue, TaskSummary } from "./types";
+import type { ChangeEntry, InstalledRepo, Issue, TaskSummary } from "./types";
 import "./styles.css";
 
 type CenterTab = "code" | "diff";
@@ -164,6 +164,12 @@ export default function App() {
   }>({ ok: false });
   const [center, setCenter] = useState<CenterTab>("code");
   const [diffKey, setDiffKey] = useState(0);
+  const [explorerKey, setExplorerKey] = useState(0);
+  // A changed-file selection belongs to one task; it drives the central Diff tab.
+  const [selectedChange, setSelectedChange] = useState<{
+    entry: ChangeEntry;
+    source: "workspace" | "published";
+  } | null>(null);
   const [expandedRepo, setExpandedRepo] = useState("");
   const [issuesCache, setIssuesCache] = useState<Record<string, Issue[]>>({});
   const [fixing, setFixing] = useState<number | null>(null);
@@ -363,6 +369,10 @@ export default function App() {
       live = false;
     };
   }, [loadAll, loadGithubConfig]);
+
+  useEffect(() => {
+    setSelectedChange(null);
+  }, [taskId]);
 
   useEffect(() => {
     if (!user) return;
@@ -619,7 +629,18 @@ export default function App() {
               <RepoExplorer repo={browse.repo} gitRef={browse.ref} contextLabel={`${browse.repo}@${browse.ref || "default"}`} onOpenFile={(p) => openRepoFile(browse.repo, browse.ref, p)} />
             ) : task ? (
               <>
-                <DirTree taskId={taskId} onOpenFile={openFile} onExpired={() => taskId != null && setExpiredWs((m) => ({ ...m, [taskId]: true }))} />
+                <TaskExplorer
+                  taskId={taskId}
+                  taskStatus={task.status}
+                  refreshToken={explorerKey}
+                  selectedPath={selectedChange?.entry.path ?? null}
+                  onOpenFile={openFile}
+                  onSelectChange={(entry, source) => {
+                    setSelectedChange({ entry, source });
+                    setCenter("diff");
+                  }}
+                  onExpired={() => taskId != null && setExpiredWs((m) => ({ ...m, [taskId]: true }))}
+                />
                 {expiredWs[task.id] && task.branch && (
                   <>
                     <SectionLabel action={<span className="muted">GitHub</span>}>Published changes</SectionLabel>
@@ -731,14 +752,25 @@ export default function App() {
           <div className="workspace-toolbar">
             <div className="segmented">
               <button className={center === "code" ? "active" : ""} onClick={() => setCenter("code")}>Code</button>
-              <button className={center === "diff" ? "active" : ""} onClick={() => setCenter("diff")}>Diff <span className="shortcut">Proof</span></button>
+              <button className={center === "diff" ? "active" : ""} onClick={() => { setSelectedChange(null); setCenter("diff"); }}>Diff <span className="shortcut">Proof</span></button>
             </div>
             {task && <div className="branch-chip"><GitBranch size={14} /> <code>{task.branch || "branch pending"}</code></div>}
             <div className="toolbar-spacer" />
             {task?.pr_url && <Button variant="outline" aria-label={`Open pull request #${task.pr_number} on GitHub`} onClick={() => window.open(task.pr_url!, "_blank")}>Open PR <ArrowUpRight size={14} /></Button>}
           </div>
           <div className="code-surface">
-            {center === "code" ? <EditorTabs taskId={taskId} /> : <DiffView taskId={taskId} refreshKey={diffKey} />}
+            {center === "code" ? <EditorTabs
+              taskId={taskId}
+              onSaved={() => {
+                setExplorerKey((k) => k + 1);
+                setDiffKey((k) => k + 1);
+              }}
+            /> : <DiffView
+              taskId={taskId}
+              refreshKey={diffKey}
+              file={selectedChange}
+              onClearFile={() => setSelectedChange(null)}
+            />}
           </div>
         </main>
 

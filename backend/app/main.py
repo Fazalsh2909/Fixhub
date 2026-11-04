@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from sqlalchemy.orm import Session
 
 from app.api.auth import router as auth_router
@@ -886,6 +886,42 @@ def read_repo_file(
         )
 
 
+def _published_pr_context(task, user, db):
+    """Installation token + per-file PR metadata for an expired workspace.
+
+    Raises HTTPException for the endpoint-level 404/400 cases; GitHub failures
+    bubble up so callers can map them to a 502.
+    """
+    from fastapi import HTTPException
+
+    from app.github import app_auth as _app_auth
+    from app.github import client as _gh
+
+    if not task.pr_number:
+        raise HTTPException(status_code=404, detail="task has no pull request yet")
+    row = (
+        db.query(Repository).filter(Repository.github_full_name == task.repository).first()
+    )
+    if not row or not row.installation_id:
+        raise HTTPException(status_code=400, detail=f"{task.repository} is not connected")
+    from app.github import install as _install
+
+    if not _install.installation_verified_for_user(row, db, user):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{task.repository} needs GitHub re-verification "
+                f"(connect your FixHub account via {_install.INSTALL_START_URL})"
+            ),
+        )
+    token = _app_auth.installation_token(row.installation_id)
+    files = _gh.pull_file_changes(
+        token=token, full_name=task.repository, number=task.pr_number
+    )
+    diff = _gh.pull_diff(token=token, full_name=task.repository, number=task.pr_number)
+    return files, diff
+
+
 @app.get("/api/tasks/{task_id}/published-diff")
 def task_published_diff(
     task_id: int, user: User = Depends(get_current_user), db: Session = Depends(_db)
@@ -899,44 +935,78 @@ def task_published_diff(
     from fastapi import HTTPException
     from fastapi.responses import JSONResponse
 
-    from app.github import app_auth as _app_auth
-    from app.github import client as _gh
+    from app.repo import changes as _changes
 
     t = require_owned_task(task_id, user, db)
-    if not t.pr_number:
-        raise HTTPException(status_code=404, detail="task has no pull request yet")
-    row = (
-        db.query(Repository).filter(Repository.github_full_name == t.repository).first()
-    )
-    if not row or not row.installation_id:
-        raise HTTPException(status_code=400, detail=f"{t.repository} is not connected")
-    from app.github import install as _install
-
-    if not _install.installation_verified_for_user(row, db, user):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"{t.repository} needs GitHub re-verification "
-                f"(connect your FixHub account via {_install.INSTALL_START_URL})"
-            ),
-        )
     try:
-        token = _app_auth.installation_token(row.installation_id)
-        files = _gh.pull_files(token=token, full_name=t.repository, number=t.pr_number)
-        dd = _gh.pull_diff(token=token, full_name=t.repository, number=t.pr_number)
+        files, dd = _published_pr_context(t, user, db)
+    except HTTPException:
+        raise
     except Exception as exc:
         return JSONResponse(
             status_code=502, content={"error": f"github api failed: {exc}"[:300]}
         )
+    info = _changes.from_github_files(files)
     return {
         "branch": t.branch or "",
         "status": "published",
-        "files": files,
+        "files": [c["path"] for c in info["changes"]],
         "stat": "",
         "diff": dd["diff"],
         "truncated": dd["truncated"],
+        "changes": info["changes"],
+        "counts": info["counts"],
+        "source": "published",
         "pr_number": t.pr_number,
         "pr_url": t.pr_url or "",
+    }
+
+
+@app.get("/api/tasks/{task_id}/published-diff/file")
+def task_published_diff_file(
+    task_id: int,
+    path: str = Query(default=""),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(_db),
+) -> dict:
+    """One file's patch from the task's published pull request."""
+    from fastapi import HTTPException
+    from fastapi.responses import JSONResponse
+
+    from app.repo import changes as _changes
+
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    if _changes.is_excluded(path):
+        raise HTTPException(status_code=403, detail="access to sensitive file is blocked")
+    t = require_owned_task(task_id, user, db)
+    try:
+        files, _diff = _published_pr_context(t, user, db)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        return JSONResponse(
+            status_code=502, content={"error": f"github api failed: {exc}"[:300]}
+        )
+    entry = next((f for f in files if f.get("path") == path), None)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"file is not part of the pull request: {path[:200]}"
+        )
+    text = _changes.patch_text(entry)
+    return {
+        "path": entry.get("path") or path,
+        "status": _changes.normalize_github_status(str(entry.get("status") or "")),
+        "previous_path": entry.get("previous_path"),
+        "diff": text,
+        "binary": False,
+        "truncated": False,
+        "available": bool(text),
+        "message": "" if text else (
+            "GitHub did not provide a text patch for this file (binary or too large)."
+        ),
+        "source": "published",
+        "pr_number": t.pr_number,
     }
 
 

@@ -125,7 +125,10 @@ def test_published_diff_returns_diffinfo_shape(db, monkeypatch):
                 branch="fixhub-fixes/ci-abc-task-1", pr_number=11, pr_url="http://pr/11",
                 owner_id=u.id))
     db.commit()
-    monkeypatch.setattr(_gh, "pull_files", lambda **k: ["a.py"])
+    monkeypatch.setattr(_gh, "pull_file_changes", lambda **k: [
+        {"path": "a.py", "status": "modified", "previous_path": None,
+         "patch": "@@ -1 +1 @@", "has_patch": True},
+    ])
     monkeypatch.setattr(_gh, "pull_diff", lambda **k: {"diff": "diff --git a/a.py", "truncated": False})
     c = TestClient(app)
     tid = c.get("/api/tasks", cookies=cookies).json()[0]["id"]

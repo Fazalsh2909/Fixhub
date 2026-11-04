@@ -1,4 +1,4 @@
-import type { InstallationGroup } from "./types";
+import type { ChangesInfo, FileDiffInfo, InstallationGroup } from "./types";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -151,6 +151,12 @@ export const api = {
       body: JSON.stringify({ path, content }),
     }).then(j),
   diff: (id: number) => F(`/api/tasks/${id}/diff`).then(j),
+  changes: (id: number): Promise<ChangesInfo> =>
+    F(`/api/tasks/${id}/changes`).then(j),
+  fileDiff: (id: number, path: string): Promise<FileDiffInfo> =>
+    F(`/api/tasks/${id}/diff/file?path=${encodeURIComponent(path)}`).then(j),
+  publishedFileDiff: (id: number, path: string): Promise<FileDiffInfo> =>
+    F(`/api/tasks/${id}/published-diff/file?path=${encodeURIComponent(path)}`).then(j),
   events: (id: number, after = 0) => F(`/api/tasks/${id}/events?after=${after}`).then(j),
   chat: (id: number, message: string) =>
     F(`/api/tasks/${id}/chat`, {

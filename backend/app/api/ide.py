@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, require_csrf
 from app.db.models import Task, TaskEvent, User
+from app.repo import changes as _changes
 from app.repo import workspace as _ws
 
 router = APIRouter()
@@ -106,6 +107,9 @@ def list_files(task_id: int, path: str = Query(default="."),
     out = []
     for name in entries[:1000]:
         if name == ".git":
+            continue
+        rel = name if path in ("", ".") else f"{path.rstrip('/')}/{name}"
+        if _changes.is_excluded(rel):
             continue
         p = os.path.join(full, name)
         try:
@@ -212,6 +216,54 @@ def task_diff(task_id: int, user: User = Depends(get_current_user),
         "stat": _git("diff", "--stat", cap=4000),
         "diff": _git("diff", cap=60000),
     }
+
+
+@router.get("/api/tasks/{task_id}/changes")
+def task_changes(task_id: int, user: User = Depends(get_current_user),
+                 db: Session = Depends(_db)) -> dict:
+    """Structured, Git-accurate change metadata for the Explorer.
+
+    `files`/`stat`/`diff` on /diff stay unchanged; this endpoint stays cheap
+    enough to refresh while the agent is editing files.
+    """
+    t = _task_or_404(db, task_id, user)
+    ws = _workspace_or_410(t)
+    try:
+        info = _changes.git_changes(ws)
+    except _changes.GitStateError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:300])
+    return {
+        "branch": t.branch or "",
+        "status": t.status,
+        "source": "workspace",
+        **info,
+    }
+
+
+@router.get("/api/tasks/{task_id}/diff/file")
+def task_file_diff(
+    task_id: int,
+    path: str = Query(default=""),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(_db),
+) -> dict:
+    """Unified diff for ONE changed file (never the whole task diff)."""
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    if _is_sensitive(path):
+        raise HTTPException(status_code=403, detail="access to sensitive file is blocked")
+    t = _task_or_404(db, task_id, user)
+    ws = _workspace_or_410(t)
+    _resolve(ws, path)  # jail check; 400 on absolute/traversal paths
+    try:
+        result = _changes.file_diff(ws, path)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"no workspace changes for: {path[:200]}")
+    except _changes.GitStateError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)[:300])
+    result["branch"] = t.branch or ""
+    result["source"] = "workspace"
+    return result
 
 
 @router.get("/api/tasks/{task_id}/events")

@@ -337,3 +337,49 @@ svg.lucide { flex:none; }
   .agent-panel { overflow:visible; }
   .activity { min-height:320px; }
 }
+
+/* Task Explorer: VS Code-style tree + Changes */
+.task-explorer { display:flex; flex-direction:column; min-height:0; }
+.explorer-tabs { display:flex; align-items:center; gap:2px; border-bottom:1px solid var(--border); margin:0 -2px 6px; }
+.explorer-tabs [role="tab"] { border:0; background:transparent; color:var(--muted-foreground); font-size:11px; padding:6px 7px; cursor:pointer; border-bottom:1px solid transparent; display:flex; align-items:center; gap:5px; }
+.explorer-tabs [role="tab"]:hover { color:var(--foreground); }
+.explorer-tabs [role="tab"].active { color:var(--foreground); border-bottom-color:var(--foreground); }
+.tab-count { color:var(--muted-foreground); font-size:10px; font-variant-numeric:tabular-nums; background:var(--surface-elevated); border-radius:8px; padding:0 5px; }
+.explorer-refresh { margin-left:auto; border:0; background:transparent; color:var(--muted-foreground); width:24px; height:24px; display:grid; place-items:center; cursor:pointer; border-radius:var(--radius-sm); }
+.explorer-refresh:hover { color:var(--foreground); background:var(--surface-elevated); }
+.file-tree { max-height: min(46vh, 420px); overflow:auto; padding-bottom:2px; }
+.tree-row { width:100%; border:0; background:transparent; color:var(--muted-foreground); display:flex; align-items:center; gap:5px; text-align:left; padding:3px 6px; border-radius:var(--radius-sm); cursor:pointer; font-size:12px; min-height:24px; }
+.tree-row:hover { background:var(--surface-elevated); color:var(--foreground); }
+.tree-row.selected { background:var(--surface-elevated); color:var(--foreground); }
+.tree-row svg { flex:none; }
+.tree-chevron { transition: transform .12s ease; color:var(--tertiary); }
+.tree-chevron.open { transform: rotate(90deg); }
+.tree-chevron-spacer { width:12px; flex:none; }
+.tree-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
+.tree-dir-count { color:var(--tertiary); font-size:10px; font-variant-numeric:tabular-nums; }
+.tree-status { color:var(--muted-foreground); font-size:11px; padding:3px 6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tree-error { color:var(--destructive); }
+.change-letter { font-family:ui-monospace,"JetBrains Mono",monospace; font-size:10px; font-weight:700; line-height:1; flex:none; width:14px; text-align:center; }
+.st-modified { color:var(--warning); }
+.st-added { color:var(--success); }
+.st-deleted { color:var(--destructive); }
+.st-renamed { color:var(--info); }
+.changes-view { display:flex; flex-direction:column; gap:2px; max-height:min(46vh, 440px); overflow:auto; }
+.changes-summary { display:flex; justify-content:space-between; gap:8px; font-size:11px; color:var(--muted-foreground); padding:2px 4px 6px; }
+.changes-group-head { width:100%; border:0; background:transparent; color:var(--muted-foreground); display:flex; align-items:center; gap:5px; padding:4px; cursor:pointer; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+.changes-group-head:hover { color:var(--foreground); }
+.changes-group-label { flex:1; text-align:left; }
+.changes-group-count { color:var(--tertiary); font-variant-numeric:tabular-nums; }
+.changes-group-body { display:flex; flex-direction:column; }
+.change-row { width:100%; border:0; background:transparent; color:var(--muted-foreground); display:flex; align-items:flex-start; gap:7px; text-align:left; padding:4px 6px; cursor:pointer; border-radius:var(--radius-sm); font-size:12px; }
+.change-row:hover { background:var(--surface-elevated); color:var(--foreground); }
+.change-row.selected { background:var(--surface-elevated); color:var(--foreground); }
+.change-path-wrap { display:flex; flex-direction:column; gap:1px; min-width:0; }
+.change-path { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.change-previous { color:var(--tertiary); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.explorer-empty { color:var(--muted-foreground); font-size:12px; padding:8px 5px; line-height:1.6; }
+.explorer-source { color:var(--tertiary); font-size:11px; margin-top:3px; }
+.explorer-unavailable { color:var(--muted-foreground); font-size:12px; padding:8px 5px; line-height:1.6; }
+.diff-file-path { color:var(--foreground); font-size:12px; overflow:hidden; text-overflow:ellipsis; max-width:60ch; }
+.diff-meta .diff-all { width:auto; height:24px; padding:0 8px; font-size:11px; display:inline-flex; align-items:center; gap:4px; }
+.diff-note { color:var(--warning); font-size:11px; margin-bottom:6px; }

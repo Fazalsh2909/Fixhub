@@ -54,6 +54,46 @@ export interface TaskEvent {
   at: string;
 }
 
+export type ChangeStatus = "modified" | "added" | "deleted" | "renamed";
+
+export interface ChangeEntry {
+  path: string;
+  status: ChangeStatus;
+  previous_path: string | null;
+}
+
+export interface ChangeCounts {
+  modified: number;
+  added: number;
+  deleted: number;
+  renamed: number;
+  total: number;
+}
+
+export interface ChangesInfo {
+  changes: ChangeEntry[];
+  counts: ChangeCounts;
+  branch?: string;
+  status?: string;
+  source?: "workspace" | "published";
+  pr_number?: number | null;
+  pr_url?: string;
+}
+
+export interface FileDiffInfo {
+  path: string;
+  status: ChangeStatus;
+  previous_path: string | null;
+  diff: string;
+  binary: boolean;
+  truncated: boolean;
+  available?: boolean;
+  message?: string;
+  branch?: string;
+  source?: "workspace" | "published";
+  pr_number?: number | null;
+}
+
 export interface DiffInfo {
   branch: string;
   status: string;
@@ -63,6 +103,9 @@ export interface DiffInfo {
   truncated?: boolean;
   pr_number?: number | null;
   pr_url?: string;
+  changes?: ChangeEntry[];
+  counts?: ChangeCounts;
+  source?: "workspace" | "published";
 }
 
 export interface Verification {

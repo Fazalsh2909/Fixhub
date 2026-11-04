@@ -276,6 +276,35 @@ def pull_files(*, token: str, full_name: str, number: int, limit: int = 100) -> 
     return [f.get("filename", "") for f in resp.json() if f.get("filename")][:limit]
 
 
+def pull_file_changes(*, token: str, full_name: str, number: int,
+                       limit: int = 100) -> list[dict]:
+    """Per-file PR metadata: path, status, previous path, patch availability.
+
+    GitHub omits `patch` for binary files and very large diffs, so callers must
+    handle `has_patch=False` rather than assuming text. Raises on API failure.
+    """
+    url = f"{settings.GITHUB_API_URL}/repos/{full_name}/pulls/{number}/files"
+    resp = httpx.get(url, headers=_headers(token),
+                     params={"per_page": min(max(limit, 1), 100)}, timeout=30)
+    resp.raise_for_status()
+    out = []
+    for f in resp.json():
+        name = f.get("filename") or ""
+        if not name:
+            continue
+        patch = f.get("patch")
+        out.append({
+            "path": name,
+            "status": f.get("status") or "modified",
+            "previous_path": f.get("previous_filename") or None,
+            "additions": f.get("additions", 0) or 0,
+            "deletions": f.get("deletions", 0) or 0,
+            "has_patch": isinstance(patch, str) and bool(patch.strip()),
+            "patch": patch if isinstance(patch, str) else "",
+        })
+    return out[:limit]
+
+
 def sha_check_conclusion(*, token: str, full_name: str, sha: str) -> str:
     """Aggregate check conclusion for a commit: success|failure|pending|unknown.
 
