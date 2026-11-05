@@ -35,6 +35,8 @@ import {
   type GithubNoticeState,
 } from "./components/GitHubConnection";
 import { Button, Card, IconButton, SectionLabel, Status, TaskStatus } from "./components/ui";
+import { ShinyButton } from "./components/ShinyButton";
+import { useSpotlightTracking } from "./spotlight";
 import {
   connectedCount,
   deriveGithubStatus,
@@ -183,6 +185,10 @@ export default function App() {
   // Phase 2 auth state: unknown until /auth/me resolves.
   const [user, setUser] = useState<AuthUser | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
+
+  // One delegated pointer listener powers the spotlight on every
+  // [data-spotlight] surface (cards, panels, the auth card).
+  useSpotlightTracking();
 
   const task = tasks.find((t) => t.id === taskId) || null;
   const githubStatus = deriveGithubStatus(github);
@@ -624,7 +630,7 @@ export default function App() {
           )}
 
           <SectionLabel action={<span className="muted">{browse ? `${browse.repo}@${browse.ref || "default"}` : task ? `task #${task.id}` : ""}</span>}>Explorer</SectionLabel>
-          <div className="tree-card">
+          <div className="tree-card" data-spotlight="">
             {browse ? (
               <RepoExplorer repo={browse.repo} gitRef={browse.ref} contextLabel={`${browse.repo}@${browse.ref || "default"}`} onOpenFile={(p) => openRepoFile(browse.repo, browse.ref, p)} />
             ) : task ? (
@@ -825,10 +831,19 @@ export default function App() {
             </>
           ) : (
             <div className="agent-empty">
-              <div className="agent-mark"><Bot size={24} /></div>
+              <div className="agent-core" aria-hidden="true">
+                <span className="agent-core-ring" />
+                <span className="agent-core-ring ring-2" />
+                <span className="agent-core-spark spark-a" />
+                <span className="agent-core-spark spark-b" />
+                <div className="agent-mark"><Bot size={24} /></div>
+              </div>
               <h3>Ready when you are</h3>
               <p>Select a task or trigger a GitHub issue. FixHub will inspect the repository, implement the fix, validate it and open a PR.</p>
-              <Button variant="primary" onClick={() => setNav("Repositories")}>Browse repositories</Button>
+              <ShinyButton onClick={() => setNav("Repositories")}>
+                Browse repositories
+                <ArrowRight size={14} aria-hidden="true" />
+              </ShinyButton>
             </div>
           )}
         </aside>
