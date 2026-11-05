@@ -98,6 +98,18 @@ class Settings(BaseSettings):
 
     # Agent tool bounds
     TOOL_OUTPUT_MAX_BYTES: int = 20_000
+
+    # Social login (Google + GitHub login)
+    # These are read-only OAuth flows; tokens are never stored on the server.
+    GOOGLE_OAUTH_CLIENT_ID: str = ""
+    GOOGLE_OAUTH_CLIENT_SECRET: str = ""
+    GOOGLE_OAUTH_REDIRECT_URI: str = ""
+    GITHUB_LOGIN_CLIENT_ID: str = ""
+    GITHUB_LOGIN_CLIENT_SECRET: str = ""
+    GITHUB_LOGIN_REDIRECT_URI: str = ""
+    # Google OIDC issuer for verify_oauth2_token
+    GOOGLE_OAUTH_ISSUER: str = ""
+    GOOGLE_OAUTH_AUDIENCES: str = ""
     # Default per-command wall time. Package installs routinely exceed 60s on
     # constrained networks; the agent loop's runtime/iteration caps (not this)
     # are what bound total runaway cost.

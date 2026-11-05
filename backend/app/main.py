@@ -6,6 +6,7 @@ from fastapi import Depends, FastAPI, Query, Request
 from sqlalchemy.orm import Session
 
 from app.api.auth import router as auth_router
+from app.api.auth_social import router as auth_social_router
 from app.api.deps import (
     get_current_user,
     require_admin,
@@ -23,6 +24,7 @@ from app.github.webhook import router as github_router
 
 app = FastAPI(title=settings.APP_NAME)
 app.include_router(auth_router)
+app.include_router(auth_social_router)
 app.include_router(llm_keys_router)
 app.include_router(github_router)
 app.include_router(github_install_router)

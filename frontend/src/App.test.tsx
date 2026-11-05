@@ -16,7 +16,6 @@ const USER = {
 };
 
 const INSTALL_URL = "https://github.com/apps/fixhub/installations/new";
-
 type Handler = (init?: RequestInit, url?: URL) => Response | Promise<Response>;
 type Routes = Record<string, Handler>;
 
@@ -68,6 +67,11 @@ function baseRoutes(
     "GET /api/github/repos": repos,
     "GET /api/llm/providers": () => json([]),
     "GET /api/llm/credentials": () => json([]),
+    "GET /api/auth/providers": () =>
+      json({
+        google: { enabled: true },
+        github: { enabled: true },
+      }),
     "POST /api/auth/logout": () => json({ ok: true }),
     ...overrides,
   };
@@ -104,14 +108,11 @@ describe("GitHub connection", () => {
   it("shows Connect GitHub when GitHub is not authorized", async () => {
     await renderAuthed(
       baseRoutes(() =>
-        json(
-          {
-            error: "connect your GitHub account first",
-            github_authorization_required: true,
-            start_url: "/api/github/install/start",
-          },
-          400,
-        ),
+        json({
+          error: "connect your GitHub account first",
+          github_authorization_required: true,
+          start_url: "/api/github/install/start",
+        }, 400),
       ),
     );
     await openRepositories();
@@ -128,14 +129,11 @@ describe("GitHub connection", () => {
   it("shows a persistent Connect GitHub action in the header", async () => {
     await renderAuthed(
       baseRoutes(() =>
-        json(
-          {
-            error: "connect your GitHub account first",
-            github_authorization_required: true,
-            start_url: "/api/github/install/start",
-          },
-          400,
-        ),
+        json({
+          error: "connect your GitHub account first",
+          github_authorization_required: true,
+          start_url: "/api/github/install/start",
+        }, 400),
       ),
     );
 
@@ -152,14 +150,11 @@ describe("GitHub connection", () => {
     await renderAuthed(
       baseRoutes(
         () =>
-          json(
-            {
-              error: "connect your GitHub account first",
-              github_authorization_required: true,
-              start_url: "/api/github/install/start",
-            },
-            400,
-          ),
+          json({
+            error: "connect your GitHub account first",
+            github_authorization_required: true,
+            start_url: "/api/github/install/start",
+          }, 400),
         {
           "GET /api/github/config": () =>
             json({
@@ -253,8 +248,7 @@ describe("GitHub connection", () => {
     await waitFor(() =>
       expect(
         net.calls.filter(
-          (call) =>
-            call.method === "GET" && call.url === "/api/github/repos",
+          (call) => call.method === "GET" && call.url === "/api/github/repos",
         ).length,
       ).toBeGreaterThanOrEqual(2),
     );
@@ -342,9 +336,7 @@ describe("GitHub connection", () => {
     });
     expect(
       net.calls.some(
-        (call) =>
-          call.method === "POST" &&
-          call.url === "/api/repositories/connect",
+        (call) => call.method === "POST" && call.url === "/api/repositories/connect",
       ),
     ).toBe(true);
 

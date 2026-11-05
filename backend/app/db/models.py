@@ -275,6 +275,31 @@ class LoginAttempt(Base):
     )
 
 
+
+
+class AuthIdentity(Base):
+    """Social login identity linking provider accounts to FixHub users."""
+
+    __tablename__ = "auth_identities"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider_subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    provider_email: Mapped[str] = mapped_column(String(255))
+    provider_display_name: Mapped[str] = mapped_column(String(128))
+    provider_avatar_url: Mapped[str] = mapped_column(String(512))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_subject", name="uq_auth_identity_provider_subject"),
+    )
+
 class GitHubConnection(Base):
     """Phase 2: mapping of FixHub user -> GitHub App installation.
 

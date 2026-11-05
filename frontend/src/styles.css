@@ -248,6 +248,12 @@ svg.lucide { flex:none; }
 .auth-card label { display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--muted); }
 .auth-error { color:#b3261e; font-size:13px; margin:0; }
 
+/* Social auth provider buttons */
+.auth-providers { display:flex; flex-direction:column; gap:12px; margin-top:16px; }
+.auth-providers .auth-google-btn, .auth-providers .auth-github-btn { width:100%; }
+.auth-divider { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; text-align:center; }
+.auth-divider::before, .auth-divider::after { content:""; flex:1; border-bottom:1px solid var(--border); }
+
 .llm-actions { display:flex; gap:8px; flex-wrap:wrap; }
 .llm-ok { color:var(--ink); font-size:13px; margin:0; }
 

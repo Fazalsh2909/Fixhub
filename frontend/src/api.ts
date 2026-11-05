@@ -172,4 +172,8 @@ export const api = {
     }).then(j),
   verification: (id: number) => F(`/api/tasks/${id}/verification`).then(j),
   eventSource: (id: number, after = 0) => new EventSource(`/api/tasks/${id}/chat/stream?after=${after}`),
+  // Social auth
+  googleLoginUrl: (nextPath = "/") => `/api/auth/google/start?next=${encodeURIComponent(nextPath)}`,
+  githubLoginUrl: (nextPath = "/") => `/api/auth/github/start?next=${encodeURIComponent(nextPath)}`,
+  authProviders: () => F("/api/auth/providers").then(j),
 };
