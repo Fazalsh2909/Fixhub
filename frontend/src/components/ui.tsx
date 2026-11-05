@@ -1,5 +1,6 @@
 import { Ban, Check, CircleDashed, Clock, Eye, LoaderCircle, TriangleAlert, X, type LucideIcon } from "lucide-react";
 import type { ButtonHTMLAttributes, HTMLAttributes, InputHTMLAttributes, ReactNode } from "react";
+import { useScrollReveal } from "./ScrollReveal";
 
 export function Button({ variant="default", size="sm", className="", children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "default"|"ghost"|"outline"|"primary"|"danger"; size?: "sm"|"md"|"icon" }) {
   return <button className={`ui-btn ui-btn-${variant} ui-btn-${size} ${className}`} {...props}>{children}</button>;
@@ -44,8 +45,18 @@ export function TaskStatus({ status }: { status?: string | null }) {
   return <Status tone={meta.tone} icon={meta.Icon} spin={meta.spin}>{meta.label}</Status>;
 }
 
-export function Card({ className="", children, ...props }: HTMLAttributes<HTMLDivElement>) {
-  return <div className={`ui-card ${className}`} {...props}>{children}</div>;
+export function Card({ className="", reveal=false, revealDelay=0, style, children, ...props }: HTMLAttributes<HTMLDivElement> & { reveal?: boolean; revealDelay?: number }) {
+  const effect = useScrollReveal<HTMLDivElement>(reveal, revealDelay);
+  return (
+    <div
+      {...props}
+      ref={effect.ref}
+      className={`ui-card ${className} ${effect.className}`.trim()}
+      style={{ ...style, ...effect.style }}
+    >
+      {children}
+    </div>
+  );
 }
 export function Input({ className="", ...props }: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={`ui-input ${className}`} {...props} />;

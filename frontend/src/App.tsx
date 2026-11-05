@@ -35,6 +35,7 @@ import {
   type GithubNoticeState,
 } from "./components/GitHubConnection";
 import { Button, Card, IconButton, SectionLabel, Status, TaskStatus } from "./components/ui";
+import { Reveal } from "./components/ScrollReveal";
 import {
   connectedCount,
   deriveGithubStatus,
@@ -74,11 +75,15 @@ function RepoBlock({ account, repos, expandedRepo, issuesCache, fixing, connecti
         <span className="account-name">{account || "GitHub account"}</span>
         <span>{connected}/{repos.length} connected</span>
       </div>
-      {repos.map((r) => {
+      {repos.map((r, index) => {
         const expanded = expandedRepo === r.github_full_name;
         const isConnecting = connecting[r.github_full_name] === true;
         return (
-        <div key={r.github_full_name} className="repo-item">
+        <Reveal
+          key={r.github_full_name}
+          className="repo-item"
+          delay={Math.min(index * 35, 210)}
+        >
           <div className={`repo-row ${expanded ? "selected" : ""}`}>
           <button
             type="button"
@@ -119,7 +124,7 @@ function RepoBlock({ account, repos, expandedRepo, issuesCache, fixing, connecti
               {r.github_full_name in issuesCache && issuesCache[r.github_full_name].length === 0 && <div className="empty-state">No open issues.</div>}
             </div>
           )}
-        </div>
+        </Reveal>
         );
       })}
     </div>
@@ -596,7 +601,7 @@ export default function App() {
           </div>
 
           {(nav === "Overview" || nav === "Tasks") && (
-            <Card className="ready-card">
+            <Card className="ready-card" reveal>
               <TaskStatus status={task?.status} />
               <strong>{task ? taskTitle(task) : "Ready to fix"}</strong>
               {!task && <div className="ready-hint">No task selected — pick one from the list below.</div>}
@@ -608,15 +613,23 @@ export default function App() {
             <>
               <SectionLabel action={<span className="muted">{tasks.length}</span>}>Recent tasks</SectionLabel>
               <div className="task-list compact">
-                {(nav === "Tasks" ? tasks : tasks.slice(0, 8)).map((t) => (
-                  <button key={t.id} className={`task-item ${t.id === taskId ? "selected" : ""}`} aria-current={t.id === taskId ? true : undefined} onClick={() => { setTaskId(t.id); setBrowse(null); }}>
+                {(nav === "Tasks" ? tasks : tasks.slice(0, 8)).map((t, index) => (
+                  <Reveal
+                    as="button"
+                    type="button"
+                    key={t.id}
+                    delay={Math.min(index * 35, 210)}
+                    className={`task-item ${t.id === taskId ? "selected" : ""}`}
+                    aria-current={t.id === taskId ? true : undefined}
+                    onClick={() => { setTaskId(t.id); setBrowse(null); }}
+                  >
                     <span className="task-id">#{t.id}</span>
                     <span className="task-main">
                       <span className="task-title">{taskTitle(t)}</span>
                       <span className="task-repo">{t.repository}</span>
                     </span>
                     <TaskStatus status={t.status} />
-                  </button>
+                  </Reveal>
                 ))}
                 {tasks.length === 0 && <div className="empty-state">No tasks yet.</div>}
               </div>
@@ -624,7 +637,7 @@ export default function App() {
           )}
 
           <SectionLabel action={<span className="muted">{browse ? `${browse.repo}@${browse.ref || "default"}` : task ? `task #${task.id}` : ""}</span>}>Explorer</SectionLabel>
-          <div className="tree-card">
+          <Reveal className="tree-card">
             {browse ? (
               <RepoExplorer repo={browse.repo} gitRef={browse.ref} contextLabel={`${browse.repo}@${browse.ref || "default"}`} onOpenFile={(p) => openRepoFile(browse.repo, browse.ref, p)} />
             ) : task ? (
@@ -651,7 +664,7 @@ export default function App() {
             ) : (
               <div className="pane-hint">Select a task or click a repository to browse files.</div>
             )}
-          </div>
+          </Reveal>
 
           {nav === "Issues" && (
             <>
@@ -736,7 +749,7 @@ export default function App() {
               />
 
               <SectionLabel>Connection</SectionLabel>
-              <Card className="settings-card">
+              <Card className="settings-card" reveal>
                 <div className="kv-row"><span>Backend</span><span className="muted">{window.location.origin}</span></div>
                 <div className="kv-row"><span>Worker</span><span className={workerOnline ? "kv-ok" : "kv-bad"}>{workerOnline ? `connected${queue.count != null ? ` · ${queue.count} queued` : ""}${queue.db_queued_stale ? ` · ${queue.db_queued_stale} stale` : ""}` : queue.ok ? "redis up, no worker" : "offline"}</span></div>
                 <div className="kv-row"><span>Tasks</span><span className="muted">{tasks.length}</span></div>
@@ -782,15 +795,15 @@ export default function App() {
 
           {task ? (
             <>
-              <Card className="issue-card">
+              <Card className="issue-card" reveal>
                 <div className="issue-kind">{taskKindLabel(task)}</div>
                 <h3>{taskTitle(task)}</h3>
                 <div className="issue-branch"><GitBranch size={13} /> {task.branch || "branch pending"}</div>
               </Card>
 
-              <div className="activity-shell">
+              <Reveal className="activity-shell" delay={60}>
                 <ActivityFeed taskId={taskId} status={task.status} error={task.error} />
-              </div>
+              </Reveal>
 
               <div className="agent-dock">
                 <div className="segmented agent-dock-tabs" role="tablist" aria-label="Review and notes">
@@ -824,12 +837,12 @@ export default function App() {
               </div>
             </>
           ) : (
-            <div className="agent-empty">
+            <Reveal className="agent-empty">
               <div className="agent-mark"><Bot size={24} /></div>
               <h3>Ready when you are</h3>
               <p>Select a task or trigger a GitHub issue. FixHub will inspect the repository, implement the fix, validate it and open a PR.</p>
               <Button variant="primary" onClick={() => setNav("Repositories")}>Browse repositories</Button>
-            </div>
+            </Reveal>
           )}
         </aside>
       </div>

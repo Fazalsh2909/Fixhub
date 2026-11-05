@@ -110,7 +110,7 @@ export function GithubConnectionCard({
   );
 
   return (
-    <Card className="github-card" aria-label="GitHub connection">
+    <Card className="github-card" aria-label="GitHub connection" reveal>
       <div className="github-card-head">
         <span className="github-mark" aria-hidden="true">
           <GitBranch size={16} />

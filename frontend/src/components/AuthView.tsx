@@ -112,7 +112,7 @@ export default function AuthView({ onAuth }: { onAuth: (u: AuthUser) => void }) 
 
   return (
     <div className="auth-shell">
-      <Card className="auth-card">
+      <Card className="auth-card" reveal>
         <div className="brand">
           <div className="brand-mark">F</div>
           <div><strong>FixHub</strong><span>Autonomous engineering</span></div>

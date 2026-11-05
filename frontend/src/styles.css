@@ -2,11 +2,11 @@
   color-scheme: dark;
 
   /* Surfaces */
-  --background: #0E0F11;
-  --surface: #141518;
-  --surface-elevated: #1A1C20;
-  --surface-hover: #1D1F23;
-  --surface-sunken: #0A0B0D;
+  --background: #0B0B0C;
+  --surface: #131315;
+  --surface-elevated: #19191C;
+  --surface-hover: #1E1E21;
+  --surface-sunken: #0B0B0C;
 
   /* Borders */
   --border: rgba(255, 255, 255, .08);
@@ -102,10 +102,10 @@ svg.lucide { flex: none; }
   border-radius: var(--radius-md);
   display: grid;
   place-items: center;
-  background: #24402F;
+  background: #C6F432;
   font-weight: 700;
   font-size: 13px;
-  color: #CFE3D4;
+  color: #0B0B0C;
 }
 .brand strong { display: block; font-size: var(--text-md); letter-spacing: -.01em; line-height: 1.25; }
 .brand span { display: block; color: var(--tertiary); font-size: 10.5px; margin-top: 2px; }
@@ -967,6 +967,23 @@ svg.lucide { flex: none; }
 .diff-meta .diff-all { width: auto; height: 24px; padding: 0 7px; font-size: 10.5px; display: inline-flex; align-items: center; gap: var(--space-1); }
 .diff-note { color: var(--warning); font-size: 10.5px; }
 
+/* ---------------------------------------------------------- scroll reveal */
+
+.reveal {
+  opacity: 0;
+  transform: translate3d(0, 16px, 0);
+  transition:
+    opacity .65s cubic-bezier(.22, 1, .36, 1),
+    transform .65s cubic-bezier(.22, 1, .36, 1);
+  transition-delay: var(--reveal-delay, 0ms);
+  will-change: opacity, transform;
+}
+.reveal.is-revealed {
+  opacity: 1;
+  transform: translate3d(0, 0, 0);
+  will-change: auto;
+}
+
 /* Keyboard focus inside scroll regions should not be clipped. */
 .task-item:focus-visible,
 .tree-row:focus-visible,
@@ -1015,6 +1032,11 @@ svg.lucide { flex: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .reveal {
+    opacity: 1 !important;
+    transform: none !important;
+    transition: none !important;
+  }
   *, *::before, *::after {
     animation-duration: .01ms !important;
     animation-iteration-count: 1 !important;

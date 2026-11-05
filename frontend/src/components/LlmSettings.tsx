@@ -91,7 +91,7 @@ export default function LlmSettings() {
   return (
     <>
       <SectionLabel>AI Provider</SectionLabel>
-      <Card className="settings-card">
+      <Card className="settings-card" reveal>
         <label>Provider
           <select
             className="ui-input"
@@ -154,7 +154,7 @@ export default function LlmSettings() {
         <div className="empty-state">No provider keys yet — agent tasks need one. Add it above.</div>
       )}
       {creds.map((c) => (
-        <Card key={c.provider} className="settings-card">
+        <Card key={c.provider} className="settings-card" reveal>
           <div className="kv-row"><span>{c.provider}</span>
             <Status tone={c.status === "verified" ? "success" : c.status === "error" ? "destructive" : "neutral"}>
               {c.status === "verified" ? "Connected" : c.status}
