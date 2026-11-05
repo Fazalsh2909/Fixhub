@@ -238,7 +238,7 @@ export default function ActivityFeed({ taskId, status, error }: Props) {
       : "No activity yet — the agent's first step appears here.";
 
   return (
-    <section className="activity" aria-label="Agent activity" data-spotlight="">
+    <section className="activity" aria-label="Agent activity">
       <div className="activity-current" data-tone={current.tone} role="status" aria-live="polite">
         <span className="activity-current-icon">
           <CurrentIcon size={15} className={current.running ? "spin" : undefined} />

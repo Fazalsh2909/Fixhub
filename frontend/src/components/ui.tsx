@@ -45,7 +45,7 @@ export function TaskStatus({ status }: { status?: string | null }) {
 }
 
 export function Card({ className="", children, ...props }: HTMLAttributes<HTMLDivElement>) {
-  return <div className={`ui-card ${className}`} {...props} data-spotlight="">{children}</div>;
+  return <div className={`ui-card ${className}`} {...props}>{children}</div>;
 }
 export function Input({ className="", ...props }: InputHTMLAttributes<HTMLInputElement>) {
   return <input className={`ui-input ${className}`} {...props} />;
