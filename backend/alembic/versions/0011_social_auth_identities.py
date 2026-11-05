@@ -21,11 +21,33 @@ def upgrade() -> None:
         sa.Column("user_id", sa.Integer(), nullable=False),
         sa.Column("provider", sa.String(64), nullable=False),
         sa.Column("provider_subject", sa.String(255), nullable=False),
-        sa.Column("provider_email", sa.String(255)),
-        sa.Column("provider_display_name", sa.String(128)),
-        sa.Column("provider_avatar_url", sa.String(512)),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now")),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "provider_email", sa.String(255), nullable=False, server_default=""
+        ),
+        sa.Column(
+            "provider_display_name",
+            sa.String(128),
+            nullable=False,
+            server_default="",
+        ),
+        sa.Column(
+            "provider_avatar_url",
+            sa.String(512),
+            nullable=False,
+            server_default="",
+        ),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            nullable=False,
+            server_default=sa.text("now()"),
+        ),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"]),
         sa.PrimaryKeyConstraint("id"),
     )
