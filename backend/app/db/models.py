@@ -286,9 +286,9 @@ class AuthIdentity(Base):
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     provider_subject: Mapped[str] = mapped_column(String(255), nullable=False)
-    provider_email: Mapped[str] = mapped_column(String(255))
-    provider_display_name: Mapped[str] = mapped_column(String(128))
-    provider_avatar_url: Mapped[str] = mapped_column(String(512))
+    provider_email: Mapped[str] = mapped_column(String(255), default="")
+    provider_display_name: Mapped[str] = mapped_column(String(128), default="")
+    provider_avatar_url: Mapped[str] = mapped_column(String(512), default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow
     )

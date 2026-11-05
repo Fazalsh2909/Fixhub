@@ -1,6 +1,27 @@
 import { useEffect, useState } from "react";
+import { Shield, ShieldCheck } from "lucide-react";
 import { api, type AuthUser } from "../api";
 import { Button, Card, Input } from "./ui";
+
+const AUTH_ERROR_MESSAGES: Record<string, string> = {
+  access_denied: "Sign-in was cancelled. You can try again whenever you're ready.",
+  state: "That sign-in link expired or was already used. Please try again.",
+  provider: "The provider couldn't complete sign-in. Please try again.",
+  email:
+    "The provider didn't return a verified email address, so sign-in can't continue.",
+  disabled: "This account is disabled. Contact the administrator.",
+};
+
+function initialProviderError(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("auth_error") || "";
+    return AUTH_ERROR_MESSAGES[code] || "";
+  } catch {
+    return "";
+  }
+}
 
 export default function AuthView({ onAuth }: { onAuth: (u: AuthUser) => void }) {
   const [mode, setMode] = useState<"login" | "signup">("login");
@@ -9,8 +30,7 @@ export default function AuthView({ onAuth }: { onAuth: (u: AuthUser) => void }) 
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [providerError, setProviderError] = useState<string | null>(null);
-  const [socialBusy, setSocialBusy] = useState<Record<string, boolean>>({});
+  const [providerError, setProviderError] = useState(initialProviderError);
   const [providers, setProviders] = useState<{ google: boolean; github: boolean }>({
     google: false,
     github: false,
@@ -26,7 +46,7 @@ export default function AuthView({ onAuth }: { onAuth: (u: AuthUser) => void }) 
         })
       )
       .catch(() => {
-        // Backend unreachable — do not block email/password login
+        // Backend unreachable — do not block email/password login.
         setProviders({ google: false, github: false });
       })
       .finally(() => setProvidersLoading(false));
@@ -53,32 +73,6 @@ export default function AuthView({ onAuth }: { onAuth: (u: AuthUser) => void }) 
     }
   };
 
-  const handleGoogleStart = async () => {
-    if (!providers.google) return;
-    setSocialBusy((prev) => ({ ...prev, google: true }));
-    try {
-      await api.googleLoginUrl();
-      setProviderError(null);
-    } catch (e: any) {
-      setProviderError(e instanceof Error ? e.message : "Google sign-in unavailable.");
-    } finally {
-      setSocialBusy((prev) => ({ ...prev, google: false }));
-    }
-  };
-
-  const handleGitHubStart = async () => {
-    if (!providers.github) return;
-    setSocialBusy((prev) => ({ ...prev, github: true }));
-    try {
-      await api.githubLoginUrl();
-      setProviderError(null);
-    } catch (e: any) {
-      setProviderError(e instanceof Error ? e.message : "GitHub sign-in unavailable.");
-    } finally {
-      setSocialBusy((prev) => ({ ...prev, github: false }));
-    }
-  };
-
   return (
     <div className="auth-shell">
       <Card className="auth-card">
@@ -88,47 +82,33 @@ export default function AuthView({ onAuth }: { onAuth: (u: AuthUser) => void }) 
         </div>
         <div className="auth-providers" role="group" aria-label="Sign in with">
           {providersLoading ? (
-            <span className="providers-loading" aria-live="polite">Checking providers…</span>
+            <span className="auth-loading" aria-live="polite">Checking providers…</span>
           ) : (
             <>
               {providers.google && (
-                <Button
-                  key="google"
-                  type="button"
-                  variant="outline"
-                  disabled={socialBusy.google}
-                  onClick={handleGoogleStart}
-                  aria-label={
-                    socialBusy.google
-                      ? "Signing in with Google…"
-                      : "Continue with Google"
-                  }
+                <a
+                  className="ui-btn ui-btn-outline ui-btn-sm auth-google-btn"
+                  href={api.googleLoginUrl("/")}
+                  aria-label="Continue with Google"
                 >
-                  <span aria-hidden="true" data-lucide="shield" className="w-4 h-4" />
+                  <Shield size={14} aria-hidden="true" />
                   Continue with Google
-                </Button>
+                </a>
               )}
               {providers.github && (
-                <Button
-                  key="github"
-                  type="button"
-                  variant="outline"
-                  disabled={socialBusy.github}
-                  onClick={handleGitHubStart}
-                  aria-label={
-                    socialBusy.github
-                      ? "Signing in with GitHub…"
-                      : "Continue with GitHub"
-                  }
+                <a
+                  className="ui-btn ui-btn-outline ui-btn-sm auth-github-btn"
+                  href={api.githubLoginUrl("/")}
+                  aria-label="Continue with GitHub"
                 >
-                  <span aria-hidden="true" data-lucide="shield-check" className="w-4 h-4" />
+                  <ShieldCheck size={14} aria-hidden="true" />
                   Continue with GitHub
-                </Button>
+                </a>
               )}
             </>
           )}
         </div>
-        <hr className="divider" role="separator" aria-label="or continue with email" />
+        <div className="auth-divider">or continue with email</div>
         <div className="auth-tabs" role="tablist" aria-label="Authentication">
           <button
             role="tab"
@@ -195,6 +175,7 @@ export default function AuthView({ onAuth }: { onAuth: (u: AuthUser) => void }) 
             />
           </label>
           {providerError && <p className="auth-error" role="alert">{providerError}</p>}
+          {error && <p className="auth-error" role="alert">{error}</p>}
           <Button type="submit" variant="primary" size="md" disabled={busy}>
             {busy ? "Please wait…" : mode === "login" ? "Log in" : "Create account"}
           </Button>

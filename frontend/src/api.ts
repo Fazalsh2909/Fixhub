@@ -75,6 +75,11 @@ export interface AuthUser {
   avatar_url: string;
 }
 
+export interface AuthProviders {
+  google: { enabled: boolean };
+  github: { enabled: boolean };
+}
+
 export interface LlmProvider {
   name: string;
   label: string;
@@ -175,5 +180,5 @@ export const api = {
   // Social auth
   googleLoginUrl: (nextPath = "/") => `/api/auth/google/start?next=${encodeURIComponent(nextPath)}`,
   githubLoginUrl: (nextPath = "/") => `/api/auth/github/start?next=${encodeURIComponent(nextPath)}`,
-  authProviders: () => F("/api/auth/providers").then(j),
+  authProviders: (): Promise<AuthProviders> => F("/api/auth/providers").then(j),
 };

@@ -107,9 +107,9 @@ class Settings(BaseSettings):
     GITHUB_LOGIN_CLIENT_ID: str = ""
     GITHUB_LOGIN_CLIENT_SECRET: str = ""
     GITHUB_LOGIN_REDIRECT_URI: str = ""
-    # Google OIDC issuer for verify_oauth2_token
-    GOOGLE_OAUTH_ISSUER: str = ""
-    GOOGLE_OAUTH_AUDIENCES: str = ""
+    # Google ID-token issuer. Google documents both spellings; the verifier
+    # accepts either, and an explicit override wins.
+    GOOGLE_OAUTH_ISSUER: str = "https://accounts.google.com"
     # Default per-command wall time. Package installs routinely exceed 60s on
     # constrained networks; the agent loop's runtime/iteration caps (not this)
     # are what bound total runaway cost.
