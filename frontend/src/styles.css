@@ -973,8 +973,8 @@ svg.lucide { flex: none; }
   opacity: 0;
   transform: translate3d(0, var(--reveal-offset, 16px), 0);
   transition:
-    opacity .65s cubic-bezier(.22, 1, .36, 1),
-    transform .65s cubic-bezier(.22, 1, .36, 1);
+    opacity .8s cubic-bezier(.22, 1, .36, 1),
+    transform .8s cubic-bezier(.22, 1, .36, 1);
   transition-delay: var(--reveal-delay, 0ms);
   will-change: opacity, transform;
 }
@@ -1045,6 +1045,10 @@ svg.lucide { flex: none; }
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
     scroll-behavior: auto !important;
+  }
+  /* Reveal is paceful enough to keep even under reduced motion. */
+  .reveal {
+    transition-duration: .4s !important;
   }
   .spin { animation: none; }
   .tree-chevron { transition: none; }
