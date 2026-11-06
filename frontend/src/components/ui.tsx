@@ -45,8 +45,20 @@ export function TaskStatus({ status }: { status?: string | null }) {
   return <Status tone={meta.tone} icon={meta.Icon} spin={meta.spin}>{meta.label}</Status>;
 }
 
-export function Card({ className="", reveal=false, revealDelay=0, replayKey, style, children, ...props }: HTMLAttributes<HTMLDivElement> & { reveal?: boolean; revealDelay?: number; replayKey?: unknown }) {
-  const effect = useScrollReveal<HTMLDivElement>(reveal, revealDelay, undefined, replayKey);
+export function Card({
+  className = "",
+  reveal = false,
+  revealDelay = 0,
+  replayKey,
+  style,
+  children,
+  ...props
+}: HTMLAttributes<HTMLDivElement> & {
+  reveal?: boolean;
+  revealDelay?: number;
+  replayKey?: unknown;
+}) {
+  const effect = useScrollReveal<HTMLDivElement>(reveal, revealDelay, 16, replayKey);
   return (
     <div
       {...props}

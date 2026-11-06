@@ -1036,12 +1036,10 @@ svg.lucide { flex: none; }
   .auth-card { padding: 22px var(--space-5); }
 }
 
+/* Scroll reveal is intentionally NOT disabled under reduced motion.
+   Keep the gentle one-shot animation; content that never intersects (e.g.
+   observer failure) is still revealed by the component, not by CSS. */
 @media (prefers-reduced-motion: reduce) {
-  .reveal {
-    opacity: 1 !important;
-    transform: none !important;
-    transition: none !important;
-  }
   *, *::before, *::after {
     animation-duration: .01ms !important;
     animation-iteration-count: 1 !important;
