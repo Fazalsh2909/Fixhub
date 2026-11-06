@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { TaskEvent } from "../types";
+import { Reveal } from "./ScrollReveal";
 
 interface Props {
   taskId: number | null;
@@ -53,11 +54,15 @@ export default function ChatPanel({ taskId }: Props) {
   return (
     <div className="chat">
       <div className="chat-list">
-        {events.map((e) => (
-          <div key={e.id} className={`chat-msg ${e.type === "CHAT_MSG" ? "user" : "agent"}`}>
+        {events.map((e, index) => (
+          <Reveal
+            key={e.id}
+            className={`chat-msg ${e.type === "CHAT_MSG" ? "user" : "agent"}`}
+            delay={Math.min(index * 30, 180)}
+          >
             <small>{e.type === "CHAT_MSG" ? "you" : "fixhub"}</small>
             <div>{textOf(e)}</div>
-          </div>
+          </Reveal>
         ))}
         {events.length === 0 && <div className="pane-hint">Notes to the agent / review log.</div>}
       </div>

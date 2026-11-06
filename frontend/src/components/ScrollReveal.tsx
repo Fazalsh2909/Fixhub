@@ -36,6 +36,7 @@ export interface ScrollRevealHandle<T extends HTMLElement> {
 export function useScrollReveal<T extends HTMLElement = HTMLElement>(
   enabled = true,
   delay = 0,
+  offset = 16,
 ): ScrollRevealHandle<T> {
   const ref = useRef<T>(null);
   const [animate] = useState(() => motionAllowed(enabled));
@@ -71,16 +72,20 @@ export function useScrollReveal<T extends HTMLElement = HTMLElement>(
     ref,
     className: animate ? `reveal${revealed ? " is-revealed" : ""}` : "",
     style: animate
-      ? ({ "--reveal-delay": `${Math.max(0, delay)}ms` } as CSSProperties)
+      ? ({
+          "--reveal-delay": `${Math.max(0, delay)}ms`,
+          "--reveal-offset": `${Math.max(0, offset)}px`,
+        } as CSSProperties)
       : undefined,
   };
 }
 
-type RevealTag = "div" | "section" | "article" | "li" | "span" | "button";
+type RevealTag = "div" | "section" | "article" | "main" | "li" | "span" | "button";
 
 export type RevealProps = HTMLAttributes<HTMLElement> & {
   as?: RevealTag;
   delay?: number;
+  offset?: number;
   children?: ReactNode;
   type?: "button" | "submit" | "reset";
 };
@@ -90,12 +95,13 @@ export type RevealProps = HTMLAttributes<HTMLElement> & {
 export function Reveal({
   as = "div",
   delay = 0,
+  offset = 16,
   className = "",
   style,
   children,
   ...props
 }: RevealProps) {
-  const reveal = useScrollReveal<HTMLElement>(true, delay);
+  const reveal = useScrollReveal<HTMLElement>(true, delay, offset);
   return createElement(
     as,
     {

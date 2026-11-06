@@ -43,14 +43,23 @@ describe("Reveal", () => {
 
   it("starts hidden and reveals once the element intersects", () => {
     vi.stubGlobal("IntersectionObserver", MockIntersectionObserver);
-    render(<Reveal data-testid="probe" delay={90}>content</Reveal>);
+    render(<Reveal data-testid="probe" delay={90} offset={0}>content</Reveal>);
     const probe = screen.getByTestId("probe");
     expect(probe.className).toContain("reveal");
     expect(probe.className).not.toContain("is-revealed");
     expect(probe.style.getPropertyValue("--reveal-delay")).toBe("90ms");
+    expect(probe.style.getPropertyValue("--reveal-offset")).toBe("0px");
 
     act(() => MockIntersectionObserver.instances[0].trigger(true));
     expect(probe.className).toContain("is-revealed");
+  });
+
+  it("renders the requested landmark element without a wrapper", () => {
+    vi.stubGlobal("IntersectionObserver", MockIntersectionObserver);
+    render(<Reveal as="main" aria-label="workspace">content</Reveal>);
+    const main = screen.getByRole("main", { name: "workspace" });
+    expect(main.tagName).toBe("MAIN");
+    expect(main.textContent).toBe("content");
   });
 
   it("keeps content visible when reduced motion is requested", () => {

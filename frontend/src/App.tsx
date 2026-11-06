@@ -109,8 +109,9 @@ function RepoBlock({ account, repos, expandedRepo, issuesCache, fixing, connecti
           </div>
           {expanded && (
             <div className="issue-list">
-              {(issuesCache[r.github_full_name] || []).map((i) => (
-                <div key={i.number} className="issue-item"><span>#{i.number} {i.title}</span>
+              {(issuesCache[r.github_full_name] || []).map((i, issueIndex) => (
+                <Reveal key={i.number} className="issue-item" delay={Math.min(issueIndex * 30, 180)}>
+                  <span>#{i.number} {i.title}</span>
                   <Button
                     size="icon"
                     variant="ghost"
@@ -119,7 +120,7 @@ function RepoBlock({ account, repos, expandedRepo, issuesCache, fixing, connecti
                     title={fixing === i.number ? "Starting…" : `Fix #${i.number}`}
                     onClick={() => onFix(r.github_full_name, i.number)}
                   >{fixing === i.number ? "…" : <ArrowRight size={15} />}</Button>
-                </div>
+                </Reveal>
               ))}
               {r.github_full_name in issuesCache && issuesCache[r.github_full_name].length === 0 && <div className="empty-state">No open issues.</div>}
             </div>
@@ -761,7 +762,7 @@ export default function App() {
           )}
         </aside>
 
-        <main className="main-workspace">
+        <Reveal as="main" className="main-workspace" offset={0}>
           <div className="workspace-toolbar">
             <div className="segmented">
               <button className={center === "code" ? "active" : ""} onClick={() => setCenter("code")}>Code</button>
@@ -785,7 +786,7 @@ export default function App() {
               onClearFile={() => setSelectedChange(null)}
             />}
           </div>
-        </main>
+        </Reveal>
 
         <aside className="agent-panel">
           <div className="agent-head">

@@ -30,6 +30,7 @@ import {
   type ActivityTone,
 } from "../activity";
 import { useTaskEvents } from "../hooks/useTaskEvents";
+import { Reveal } from "./ScrollReveal";
 
 interface Props {
   taskId: number | null;
@@ -60,7 +61,7 @@ const TONE_ICONS: Record<ActivityTone, LucideIcon> = {
   info: CircleDot,
 };
 
-function ActivityRow({ activity, current }: { activity: Activity; current: boolean }) {
+function ActivityRow({ activity, current, delay = 0 }: { activity: Activity; current: boolean; delay?: number }) {
   const [open, setOpen] = useState(false);
   const Icon = KIND_ICONS[activity.kind] || CircleDot;
   const ToneIcon = TONE_ICONS[activity.tone] || CircleDot;
@@ -69,10 +70,12 @@ function ActivityRow({ activity, current }: { activity: Activity; current: boole
   const argEntries = Object.entries(details.args);
 
   return (
-    <article
+    <Reveal
+      as="article"
       className={`activity-item${current ? " current" : ""}`}
       data-tone={activity.tone}
       data-kind={activity.kind}
+      delay={delay}
     >
       <span className="activity-icon" aria-hidden="true">
         <Icon size={14} />
@@ -193,7 +196,7 @@ function ActivityRow({ activity, current }: { activity: Activity; current: boole
           </div>
         )}
       </div>
-    </article>
+    </Reveal>
   );
 }
 
@@ -268,6 +271,7 @@ export default function ActivityFeed({ taskId, status, error }: Props) {
               key={activity.key}
               activity={activity}
               current={current.running && index === activities.length - 1}
+              delay={Math.min(index * 30, 180)}
             />
           ))
         )}

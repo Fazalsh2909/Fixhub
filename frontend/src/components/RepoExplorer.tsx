@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { File, Folder, RefreshCw } from "lucide-react";
+import { Reveal } from "./ScrollReveal";
 
 interface Props {
   repo: string;
@@ -57,12 +58,14 @@ export default function RepoExplorer({ repo, gitRef, contextLabel, onOpenFile }:
           <Folder size={15} /><span>..</span>
         </button>
       )}
-      {entries.map((e) => {
+      {entries.map((e, index) => {
         const full = path === "." ? e.name : `${path}/${e.name}`;
         return (
-          <button
+          <Reveal
+            as="button"
             key={full}
             className="dirtree-row"
+            delay={Math.min(index * 25, 150)}
             onClick={() => {
               if (e.type === "dir") {
                 setPath(full);
@@ -76,7 +79,7 @@ export default function RepoExplorer({ repo, gitRef, contextLabel, onOpenFile }:
             {e.type === "dir" ? <Folder size={15} /> : <File size={15} />}
             <span>{e.name}</span>
             {e.type === "file" && e.size > 1024 && <small>{(e.size / 1024).toFixed(1)}k</small>}
-          </button>
+          </Reveal>
         );
       })}
       {entries.length === 0 && !error && <div className="pane-hint">(empty directory)</div>}

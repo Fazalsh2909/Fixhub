@@ -20,6 +20,7 @@ import {
   FolderOpen,
   Image,
 } from "lucide-react";
+import { Reveal } from "./ScrollReveal";
 
 interface Props {
   taskId: number | null;
@@ -177,7 +178,8 @@ export default function FileTree({
         const changedCount = dirCounts[full] || 0;
         return (
           <Fragment key={full}>
-            <button
+            <Reveal
+              as="button"
               type="button"
               role="treeitem"
               className="tree-row"
@@ -186,6 +188,7 @@ export default function FileTree({
               aria-label={`${open ? "Collapse" : "Expand"} folder ${full}`}
               title={full}
               onClick={() => toggle(full)}
+              delay={Math.min(depth * 35, 140)}
             >
               <ChevronRight
                 size={12}
@@ -198,14 +201,15 @@ export default function FileTree({
                   {changedCount}
                 </span>
               )}
-            </button>
+            </Reveal>
             {open && <div role="group">{renderDir(full, depth + 1)}</div>}
           </Fragment>
         );
       }
       const change = changed.get(full);
       return (
-        <button
+        <Reveal
+          as="button"
           key={full}
           type="button"
           role="treeitem"
@@ -215,6 +219,7 @@ export default function FileTree({
           aria-label={`Open file ${full}`}
           aria-current={selectedPath === full ? "true" : undefined}
           onClick={() => onOpenFile(full)}
+          delay={Math.min(depth * 35, 140)}
         >
           <span className="tree-chevron-spacer" />
           <FileIcon path={full} />
@@ -224,7 +229,7 @@ export default function FileTree({
               {changeLetter(change.status)}
             </span>
           )}
-        </button>
+        </Reveal>
       );
     });
   };
