@@ -112,7 +112,10 @@ export default function AuthView({ onAuth }: { onAuth: (u: AuthUser) => void }) 
 
   return (
     <div className="auth-shell">
-      <Card className="auth-card" reveal>
+      {/* `mode` replays the reveal when switching Log in / Sign up, matching
+          the app's tab-switch behavior and making the effect visible before
+          the first sign-in. */}
+      <Card className="auth-card" reveal replayKey={mode}>
         <div className="brand">
           <div className="brand-mark">F</div>
           <div><strong>FixHub</strong><span>Autonomous engineering</span></div>
