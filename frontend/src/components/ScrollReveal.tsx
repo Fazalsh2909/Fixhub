@@ -117,7 +117,7 @@ export function useScrollReveal<T extends HTMLElement = HTMLElement>(
   const ref = useRef<T>(null);
   const reducedMotion = useReducedMotion();
   const [animate] = useState(() => animateEnabled(enabled));
-  const [observerReady, setObserverReady] = useState(false);
+  const [observerFailed, setObserverFailed] = useState(false);
   const [revealed, setRevealed] = useState(() => !animate);
   const [instant, setInstant] = useState(false);
   const [cycleKey, setCycleKey] = useState(replayKey);
@@ -128,6 +128,7 @@ export function useScrollReveal<T extends HTMLElement = HTMLElement>(
     setCycleKey(replayKey);
     setInstant(true);
     setRevealed(false);
+    setObserverFailed(false);
   }
 
   // Hide instantly, then restore the transition. The reflow makes the browser
@@ -165,14 +166,15 @@ export function useScrollReveal<T extends HTMLElement = HTMLElement>(
           rootMargin: "0px 0px -6% 0px",
         },
       );
-      setObserverReady(true);
     } catch {
       // Observer construction failed (unusual environment, security
       // restriction, etc.). Reveal immediately so content is never hidden.
+      setObserverFailed(true);
       setRevealed(true);
       return;
     }
     if (!observer) {
+      setObserverFailed(true);
       setRevealed(true);
       return;
     }
@@ -183,7 +185,7 @@ export function useScrollReveal<T extends HTMLElement = HTMLElement>(
     };
   }, [animate, replayKey]);
 
-  const hasAnimation = animate && observerReady;
+  const hasAnimation = animate && !observerFailed;
 
   return {
     ref,
