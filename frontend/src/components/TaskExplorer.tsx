@@ -14,6 +14,8 @@ interface Props {
   onExpired?: () => void;
   /** Bumped by the app (editor save) to refresh changes without a full reload. */
   refreshToken?: number;
+  /** Changing this value replays row reveals without remounting the tree. */
+  replayKey?: unknown;
 }
 
 type View = "files" | "changes";
@@ -29,6 +31,7 @@ export default function TaskExplorer({
   onSelectChange,
   onExpired,
   refreshToken = 0,
+  replayKey,
 }: Props) {
   const [view, setView] = useState<View>("files");
   const [info, setInfo] = useState<ChangesInfo | null>(null);
@@ -196,6 +199,7 @@ export default function TaskExplorer({
             selectedPath={selectedPath}
             onOpenFile={onOpenFile}
             onExpired={() => onExpiredRef.current?.()}
+            replayKey={replayKey}
           />
         )
       ) : (

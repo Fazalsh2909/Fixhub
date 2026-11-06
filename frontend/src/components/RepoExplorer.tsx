@@ -8,6 +8,8 @@ interface Props {
   gitRef: string;
   contextLabel: string;
   onOpenFile: (path: string) => void;
+  /** Changing this value replays row reveals without reloading the directory. */
+  replayKey?: unknown;
 }
 
 interface DirEntry {
@@ -21,7 +23,7 @@ interface DirEntry {
  *  Used for repository context and for expired task workspaces (published branch).
  *  Clicking a file opens it in the center Code section via onOpenFile.
  *  Never writes: no save, no terminal, no agent actions. */
-export default function RepoExplorer({ repo, gitRef, contextLabel, onOpenFile }: Props) {
+export default function RepoExplorer({ repo, gitRef, contextLabel, onOpenFile, replayKey }: Props) {
   const [path, setPath] = useState(".");
   const [entries, setEntries] = useState<DirEntry[]>([]);
   const [error, setError] = useState("");
@@ -66,6 +68,7 @@ export default function RepoExplorer({ repo, gitRef, contextLabel, onOpenFile }:
             key={full}
             className="dirtree-row"
             delay={Math.min(index * 25, 150)}
+            replayKey={replayKey}
             onClick={() => {
               if (e.type === "dir") {
                 setPath(full);

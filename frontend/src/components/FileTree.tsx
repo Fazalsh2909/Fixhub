@@ -30,6 +30,8 @@ interface Props {
   selectedPath?: string | null;
   onOpenFile: (path: string) => void;
   onExpired?: () => void;
+  /** Changing this value replays row reveals without collapsing the tree. */
+  replayKey?: unknown;
 }
 
 function FileIcon({ path }: { path: string }) {
@@ -55,6 +57,7 @@ export default function FileTree({
   selectedPath,
   onOpenFile,
   onExpired,
+  replayKey,
 }: Props) {
   const [cache, setCache] = useState<Record<string, FileEntry[]>>({});
   const [expanded, setExpanded] = useState<string[]>([]);
@@ -189,6 +192,7 @@ export default function FileTree({
               title={full}
               onClick={() => toggle(full)}
               delay={Math.min(depth * 35, 140)}
+              replayKey={replayKey}
             >
               <ChevronRight
                 size={12}
@@ -220,6 +224,7 @@ export default function FileTree({
           aria-current={selectedPath === full ? "true" : undefined}
           onClick={() => onOpenFile(full)}
           delay={Math.min(depth * 35, 140)}
+          replayKey={replayKey}
         >
           <span className="tree-chevron-spacer" />
           <FileIcon path={full} />

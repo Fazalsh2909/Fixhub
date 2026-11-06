@@ -983,6 +983,11 @@ svg.lucide { flex: none; }
   transform: translate3d(0, 0, 0);
   will-change: auto;
 }
+/* Used for one frame when a reveal is replayed (e.g. tab switch) so hiding the
+   element does not animate backwards before it is observed again. */
+.reveal.is-instant {
+  transition: none;
+}
 
 /* Keyboard focus inside scroll regions should not be clipped. */
 .task-item:focus-visible,

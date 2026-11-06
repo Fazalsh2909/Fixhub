@@ -62,6 +62,27 @@ describe("Reveal", () => {
     expect(main.textContent).toBe("content");
   });
 
+  it("replays the cycle on a new replayKey without remounting the element", () => {
+    vi.stubGlobal("IntersectionObserver", MockIntersectionObserver);
+    const { rerender } = render(
+      <Reveal data-testid="probe" replayKey="Overview">content</Reveal>,
+    );
+    const probe = screen.getByTestId("probe");
+    act(() => MockIntersectionObserver.instances[0].trigger(true));
+    expect(probe.className).toContain("is-revealed");
+
+    rerender(<Reveal data-testid="probe" replayKey="Tasks">content</Reveal>);
+
+    // Same node, hidden again, transition re-armed, and observing anew.
+    expect(screen.getByTestId("probe")).toBe(probe);
+    expect(probe.className).not.toContain("is-revealed");
+    expect(probe.className).not.toContain("is-instant");
+    expect(MockIntersectionObserver.instances).toHaveLength(2);
+
+    act(() => MockIntersectionObserver.instances[1].trigger(true));
+    expect(probe.className).toContain("is-revealed");
+  });
+
   it("keeps content visible when reduced motion is requested", () => {
     vi.stubGlobal("IntersectionObserver", MockIntersectionObserver);
     vi.stubGlobal("matchMedia", (query: string) => ({

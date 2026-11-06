@@ -65,9 +65,11 @@ interface RepoBlockProps {
   onFix: (repo: string, num: number) => void;
   onConnect: (fullName: string, installationId: string) => void;
   onBrowse: (repo: string, ref: string) => void;
+  /** Replays row reveals when the active nav view changes. */
+  replayKey?: unknown;
 }
 
-function RepoBlock({ account, repos, expandedRepo, issuesCache, fixing, connecting, onToggle, onFix, onConnect, onBrowse }: RepoBlockProps) {
+function RepoBlock({ account, repos, expandedRepo, issuesCache, fixing, connecting, onToggle, onFix, onConnect, onBrowse, replayKey }: RepoBlockProps) {
   const connected = repos.filter((r) => r.connected).length;
   return (
     <div>
@@ -83,6 +85,7 @@ function RepoBlock({ account, repos, expandedRepo, issuesCache, fixing, connecti
           key={r.github_full_name}
           className="repo-item"
           delay={Math.min(index * 35, 210)}
+          replayKey={replayKey}
         >
           <div className={`repo-row ${expanded ? "selected" : ""}`}>
           <button
@@ -110,7 +113,7 @@ function RepoBlock({ account, repos, expandedRepo, issuesCache, fixing, connecti
           {expanded && (
             <div className="issue-list">
               {(issuesCache[r.github_full_name] || []).map((i, issueIndex) => (
-                <Reveal key={i.number} className="issue-item" delay={Math.min(issueIndex * 30, 180)}>
+                <Reveal key={i.number} className="issue-item" delay={Math.min(issueIndex * 30, 180)} replayKey={replayKey}>
                   <span>#{i.number} {i.title}</span>
                   <Button
                     size="icon"
@@ -602,7 +605,7 @@ export default function App() {
           </div>
 
           {(nav === "Overview" || nav === "Tasks") && (
-            <Card className="ready-card" reveal>
+            <Card className="ready-card" reveal replayKey={nav}>
               <TaskStatus status={task?.status} />
               <strong>{task ? taskTitle(task) : "Ready to fix"}</strong>
               {!task && <div className="ready-hint">No task selected — pick one from the list below.</div>}
@@ -620,6 +623,7 @@ export default function App() {
                     type="button"
                     key={t.id}
                     delay={Math.min(index * 35, 210)}
+                    replayKey={nav}
                     className={`task-item ${t.id === taskId ? "selected" : ""}`}
                     aria-current={t.id === taskId ? true : undefined}
                     onClick={() => { setTaskId(t.id); setBrowse(null); }}
@@ -640,13 +644,14 @@ export default function App() {
           <SectionLabel action={<span className="muted">{browse ? `${browse.repo}@${browse.ref || "default"}` : task ? `task #${task.id}` : ""}</span>}>Explorer</SectionLabel>
           <Reveal className="tree-card">
             {browse ? (
-              <RepoExplorer repo={browse.repo} gitRef={browse.ref} contextLabel={`${browse.repo}@${browse.ref || "default"}`} onOpenFile={(p) => openRepoFile(browse.repo, browse.ref, p)} />
+              <RepoExplorer repo={browse.repo} gitRef={browse.ref} contextLabel={`${browse.repo}@${browse.ref || "default"}`} onOpenFile={(p) => openRepoFile(browse.repo, browse.ref, p)} replayKey={nav} />
             ) : task ? (
               <>
                 <TaskExplorer
                   taskId={taskId}
                   taskStatus={task.status}
                   refreshToken={explorerKey}
+                  replayKey={nav}
                   selectedPath={selectedChange?.entry.path ?? null}
                   onOpenFile={openFile}
                   onSelectChange={(entry, source) => {
@@ -658,7 +663,7 @@ export default function App() {
                 {expiredWs[task.id] && task.branch && (
                   <>
                     <SectionLabel action={<span className="muted">GitHub</span>}>Published changes</SectionLabel>
-                    <RepoExplorer repo={task.repository} gitRef={task.branch} contextLabel={`${task.branch}`} onOpenFile={(p) => openRepoFile(task.repository, task.branch, p)} />
+                    <RepoExplorer repo={task.repository} gitRef={task.branch} contextLabel={`${task.branch}`} onOpenFile={(p) => openRepoFile(task.repository, task.branch, p)} replayKey={nav} />
                   </>
                 )}
               </>
@@ -674,7 +679,7 @@ export default function App() {
                 {github.groups.map((g) => {
                   const connected = g.repos.filter((r) => r.connected);
                   if (connected.length === 0) return null;
-                  return <RepoBlock key={g.installation_id} account={g.account} repos={connected} expandedRepo={expandedRepo} issuesCache={issuesCache} fixing={fixing} connecting={connecting} onToggle={toggleRepo} onFix={fixIssue} onConnect={connectRepo} onBrowse={(repo, ref) => setBrowse({ repo, ref })} />;
+                  return <RepoBlock key={g.installation_id} account={g.account} repos={connected} expandedRepo={expandedRepo} issuesCache={issuesCache} fixing={fixing} connecting={connecting} onToggle={toggleRepo} onFix={fixIssue} onConnect={connectRepo} onBrowse={(repo, ref) => setBrowse({ repo, ref })} replayKey={nav} />;
                 })}
                 {connectedRepos === 0 && (
                   <div className="empty-state">
@@ -713,7 +718,7 @@ export default function App() {
               {githubStatus === "ready" && (
                 <div className="repo-list">
                   {github.groups.map((g) => (
-                    <RepoBlock key={g.installation_id} account={g.account} repos={g.repos} expandedRepo={expandedRepo} issuesCache={issuesCache} fixing={fixing} connecting={connecting} onToggle={toggleRepo} onFix={fixIssue} onConnect={connectRepo} onBrowse={(repo, ref) => setBrowse({ repo, ref })} />
+                    <RepoBlock key={g.installation_id} account={g.account} repos={g.repos} expandedRepo={expandedRepo} issuesCache={issuesCache} fixing={fixing} connecting={connecting} onToggle={toggleRepo} onFix={fixIssue} onConnect={connectRepo} onBrowse={(repo, ref) => setBrowse({ repo, ref })} replayKey={nav} />
                   ))}
                 </div>
               )}
